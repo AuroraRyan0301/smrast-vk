@@ -47,6 +47,8 @@ Datacenter Hopper GPUs (**NVIDIA H20 / H100**) and **AMD MI300X** disable or lac
 
 ## Architecture (`v0.6.0`)
 
+> Deep-dive architecture, engineering lessons, driver/SPIR-V pitfalls, and the `v0.7+` Multi-Draw Uber-Binning blueprint are documented in **[docs/ARCHITECTURE_AND_NOTES.md](docs/ARCHITECTURE_AND_NOTES.md)**.
+
 ```
 Unmodified Vulkan 1.3 App / DX12 Engine (vkd3d-proton 3.1.0) / DX11 Engine (DXVK 3.1.1)
         │  VK_ICD_FILENAMES=smrast_icd.json
