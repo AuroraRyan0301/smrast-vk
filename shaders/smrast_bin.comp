@@ -1,6 +1,8 @@
 #version 460
-// smrast_bin.comp — SmRast-VK v0.2:
+// smrast_bin.comp — SmRast-VK v0.5:
 //   - Hybrid CUDARaster (16x16 Coarse Tile Binning) + CuRast (<=64 px Micro-Triangle 64-bit Atomic Fast-Path)
+//   - Hardware-Exact Top-Left Fill-Rule Tie-Breaking + 4-bit Subpixel Snapping (zero shared-edge seams!)
+//   - Hardware-Accurate Depth Bias (constant + slope-scaled + clamp) & Depth Clamp (shadow pancake mode)
 //   - Exact Sutherland-Hodgman Near-Plane (z >= 0) Triangle Clipping (1->1 or 1->2 clipped triangles)
 //   - TRIANGLE_LIST / TRIANGLE_STRIP / TRIANGLE_FAN + Single-Dispatch GPU Instancing
 // Runs 100% on VK_QUEUE_COMPUTE_BIT (H20 78 SMs / H100 / MI300X — zero hardware rasterizer or ROP!)
@@ -14,7 +16,7 @@ struct TriSetup {
     vec4 v1;     // sx, sy, ndc_z, inv_w
     vec4 v2;     // sx, sy, ndc_z, inv_w
     vec4 area;   // inv_area, minx, miny, maxx
-    uvec4 idx;   // i0, i1, i2, maxy
+    uvec4 idx;   // i0, i1, i2, maxy | (is_front << 31)
 };
 
 layout(std430, set = 0, binding = 0) buffer ClipVertBuf       { vec4 clip_verts[]; };
@@ -25,14 +27,15 @@ layout(std430, set = 0, binding = 4) buffer VisBuf            { uint64_t vis_px[
 layout(std430, set = 0, binding = 5) readonly buffer DepthBuf { float depth_px[]; };
 
 layout(push_constant) uniform BinParams {
-    uint tri_count;         // total tris = tris_per_inst * instance_count
+    uint tri_count;         // total tris = tris_per_inst * instance_count (0xFFFFFFFF = indirect)
     uint vert_stride_vec4;  // 1 + max_varyings
     uint width;
     uint height;
     uint tiles_x;
     uint tiles_y;
     uint max_tris_per_tile;
-    uint flags;             // bit0=cull_back, bit1=cull_front, bit2=front_cw, bit3=depth_test, bits4..6=depth_op, bits8..9=topo
+    uint flags;             // bit0=cull_back, bit1=cull_front, bit2=front_cw, bit3=depth_test,
+                            // bits4..6=depth_op, bits8..9=topo, bit10=depth_clamp, bit11=depth_bias
     float vp_x;
     float vp_y;
     float vp_w;
@@ -47,6 +50,10 @@ layout(push_constant) uniform BinParams {
     uint verts_per_inst;
     uint extra_vert_base;
     uint extra_tri_base;
+    float depth_bias_const;
+    float depth_bias_slope;
+    float depth_bias_clamp;
+    uint pad0;
 } pc;
 
 bool depth_pass(float d, float ref_d, uint op) {
@@ -58,6 +65,22 @@ bool depth_pass(float d, float ref_d, uint op) {
     if (op == 5u) return d != ref_d;  // NOT_EQUAL
     if (op == 6u) return d >= ref_d;  // GREATER_OR_EQUAL
     return true;                      // ALWAYS
+}
+
+// Top-left edge rule in Y-down screen space (with normalized area > 0 winding)
+bool is_top_left(vec2 d) {
+    return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0);
+}
+
+// Bit-exact shared-edge evaluation: canonical endpoint ordering guarantees edge_eval(a,b) == -edge_eval(b,a)
+float edge_eval(vec2 a, vec2 b, float fx, float fy) {
+    if (a.y < b.y || (a.y == b.y && a.x < b.x)) {
+        vec2 d = b - a;
+        return d.x * (fy - a.y) - d.y * (fx - a.x);
+    } else {
+        vec2 d = a - b;
+        return -(d.x * (fy - b.y) - d.y * (fx - b.x));
+    }
 }
 
 // Interpolate all clip-space vertex attributes between vertex ia and ib at factor t, write to dst_idx
@@ -73,30 +96,33 @@ void emit_interp_vert(uint dst_idx, uint ia, uint ib, float t) {
 void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2) {
     if (c0.w <= 1e-6 || c1.w <= 1e-6 || c2.w <= 1e-6) return;
 
-    // Frustum guard rejection
+    bool depth_clamp = (pc.flags & 1024u) != 0u;
+
+    // Frustum guard rejection (skip far-plane reject when depthClampEnable is active!)
     if ((c0.x < -c0.w && c1.x < -c1.w && c2.x < -c2.w) ||
         (c0.x >  c0.w && c1.x >  c1.w && c2.x >  c2.w) ||
         (c0.y < -c0.w && c1.y < -c1.w && c2.y < -c2.w) ||
         (c0.y >  c0.w && c1.y >  c1.w && c2.y >  c2.w) ||
-        (c0.z >  c0.w && c1.z >  c1.w && c2.z >  c2.w)) return;
+        (!depth_clamp && c0.z > c0.w && c1.z > c1.w && c2.z > c2.w)) return;
 
     float invw0 = 1.0 / c0.w;
     float invw1 = 1.0 / c1.w;
     float invw2 = 1.0 / c2.w;
 
-    vec2 s0 = vec2(pc.vp_x + (c0.x * invw0 * 0.5 + 0.5) * pc.vp_w,
-                   pc.vp_y + (c0.y * invw0 * 0.5 + 0.5) * pc.vp_h);
-    vec2 s1 = vec2(pc.vp_x + (c1.x * invw1 * 0.5 + 0.5) * pc.vp_w,
-                   pc.vp_y + (c1.y * invw1 * 0.5 + 0.5) * pc.vp_h);
-    vec2 s2 = vec2(pc.vp_x + (c2.x * invw2 * 0.5 + 0.5) * pc.vp_w,
-                   pc.vp_y + (c2.y * invw2 * 0.5 + 0.5) * pc.vp_h);
+    // 4-bit (1/16 px) subpixel vertex snapping guarantees watertight shared-edge agreement!
+    vec2 s0 = round(vec2(pc.vp_x + (c0.x * invw0 * 0.5 + 0.5) * pc.vp_w,
+                         pc.vp_y + (c0.y * invw0 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
+    vec2 s1 = round(vec2(pc.vp_x + (c1.x * invw1 * 0.5 + 0.5) * pc.vp_w,
+                         pc.vp_y + (c1.y * invw1 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
+    vec2 s2 = round(vec2(pc.vp_x + (c2.x * invw2 * 0.5 + 0.5) * pc.vp_w,
+                         pc.vp_y + (c2.y * invw2 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
 
     float z0 = pc.vp_min_d + (c0.z * invw0) * (pc.vp_max_d - pc.vp_min_d);
     float z1 = pc.vp_min_d + (c1.z * invw1) * (pc.vp_max_d - pc.vp_min_d);
     float z2 = pc.vp_min_d + (c2.z * invw2) * (pc.vp_max_d - pc.vp_min_d);
 
     float area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x);
-    if (abs(area) < 1e-5) return;
+    if (abs(area) < 1e-6) return;
 
     bool front_cw = (pc.flags & 4u) != 0u;
     bool is_front = front_cw ? (area > 0.0) : (area < 0.0);
@@ -121,6 +147,20 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
 
     float inv_area = 1.0 / area;
 
+    // Hardware-accurate Depth Bias (polygon offset) for shadow maps & decals!
+    if ((pc.flags & 2048u) != 0u) {
+        float dzdx = (-(s2.y - s1.y) * z0 - (s0.y - s2.y) * z1 - (s1.y - s0.y) * z2) * inv_area;
+        float dzdy = ( (s2.x - s1.x) * z0 + (s0.x - s2.x) * z1 + (s1.x - s0.x) * z2) * inv_area;
+        float max_slope = max(abs(dzdx), abs(dzdy));
+        // r = 2^-24 (standard minimum resolvable D24/D32F unit)
+        float bias = pc.depth_bias_const * 5.9604645e-8 + pc.depth_bias_slope * max_slope;
+        if (pc.depth_bias_clamp > 0.0) bias = min(bias, pc.depth_bias_clamp);
+        else if (pc.depth_bias_clamp < 0.0) bias = max(bias, pc.depth_bias_clamp);
+        z0 += bias;
+        z1 += bias;
+        z2 += bias;
+    }
+
     TriSetup ts;
     ts.v0   = vec4(s0, z0, invw0);
     ts.v1   = vec4(s1, z1, invw1);
@@ -137,14 +177,17 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
         bool dtest = (pc.flags & 8u) != 0u;
         uint dop = (pc.flags >> 4u) & 7u;
         bool greater_wins = (dop == 4u || dop == 6u);
+        bool tl0 = is_top_left(s2 - s1), tl1 = is_top_left(s0 - s2), tl2 = is_top_left(s1 - s0);
         for (int py = miny; py <= maxy; ++py) {
             float fy = float(py) + 0.5;
             for (int px = minx; px <= maxx; ++px) {
                 float fx = float(px) + 0.5;
-                float e0 = (s2.x - s1.x) * (fy - s1.y) - (s2.y - s1.y) * (fx - s1.x);
-                float e1 = (s0.x - s2.x) * (fy - s2.y) - (s0.y - s2.y) * (fx - s2.x);
-                float e2 = (s1.x - s0.x) * (fy - s0.y) - (s1.y - s0.y) * (fx - s0.x);
-                if (e0 < 0.0 || e1 < 0.0 || e2 < 0.0) continue;
+                float e0 = edge_eval(s1, s2, fx, fy);
+                float e1 = edge_eval(s2, s0, fx, fy);
+                float e2 = edge_eval(s0, s1, fx, fy);
+                if ((tl0 ? (e0 < 0.0) : (e0 <= 0.0)) ||
+                    (tl1 ? (e1 < 0.0) : (e1 <= 0.0)) ||
+                    (tl2 ? (e2 < 0.0) : (e2 <= 0.0))) continue;
                 float l0 = e0 * inv_area;
                 float l1 = e1 * inv_area;
                 float l2 = 1.0 - l0 - l1;
@@ -218,11 +261,11 @@ void main() {
     vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
     vec4 c2 = clip_verts[i2 * pc.vert_stride_vec4];
 
-    // Near-plane clipping against z >= 0 (Vulkan NDC [0, 1]) & w > 1e-5
-    // Signed distance from near plane: d = c.z (inside iff c.z >= 0 && c.w > 1e-5)
-    bool in0 = (c0.z >= 0.0 && c0.w > 1e-5);
-    bool in1 = (c1.z >= 0.0 && c1.w > 1e-5);
-    bool in2 = (c2.z >= 0.0 && c2.w > 1e-5);
+    bool depth_clamp = (pc.flags & 1024u) != 0u;
+    // Near-plane clipping: if depthClampEnable=true, clip only against w > 1e-5 so shadow casters behind near plane clamp cleanly!
+    bool in0 = depth_clamp ? (c0.w > 1e-5) : (c0.z >= 0.0 && c0.w > 1e-5);
+    bool in1 = depth_clamp ? (c1.w > 1e-5) : (c1.z >= 0.0 && c1.w > 1e-5);
+    bool in2 = depth_clamp ? (c2.w > 1e-5) : (c2.z >= 0.0 && c2.w > 1e-5);
 
     if (in0 && in1 && in2) {
         process_tri(tid, i0, i1, i2, c0, c1, c2);
@@ -230,7 +273,7 @@ void main() {
     }
     if (!in0 && !in1 && !in2) return;
 
-    // Sutherland-Hodgman clip against z = 0 (preserves exact winding!)
+    // Sutherland-Hodgman clip against z = 0 (or w = 1e-4 under depthClampEnable)
     uint v_in[4];
     vec4 p_in[4];
     uint in_ids[3] = uint[3](i0, i1, i2);
@@ -248,15 +291,16 @@ void main() {
             n_out++;
         }
         if (a_in != b_in) {
-            float da = in_pos[e].z;
-            float db = in_pos[ne].z;
+            float da = depth_clamp ? (in_pos[e].w - 1e-4) : in_pos[e].z;
+            float db = depth_clamp ? (in_pos[ne].w - 1e-4) : in_pos[ne].z;
             float t = clamp(da / (da - db), 0.0, 1.0);
             uint vslot = atomicAdd(tile_counts[meta_idx], 1u);
             if (vslot >= 900000u) return;
             uint nv = pc.extra_vert_base + vslot;
             emit_interp_vert(nv, in_ids[e], in_ids[ne], t);
             vec4 np = mix(in_pos[e], in_pos[ne], t);
-            np.z = max(np.z, 0.0);
+            if (depth_clamp) np.w = max(np.w, 1e-4);
+            else             np.z = max(np.z, 0.0);
             clip_verts[nv * pc.vert_stride_vec4] = np;
             v_in[n_out] = nv;
             p_in[n_out] = np;

@@ -59,13 +59,37 @@ bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img) {
 }
 
 bool sm_ensure_image_stencil_buf(SmDevice* dev, SmImage* img) {
-    if (!img || img->stencil_buf != VK_NULL_HANDLE) return true;
-    VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * 4u;
-    if (sz < 256) sz = 256;
-    return create_buf(dev, sz,
-                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                      img->stencil_buf, img->stencil_mem);
+    if (!img) return false;
+    if (img->stencil_buf == VK_NULL_HANDLE) {
+        VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * 4u;
+        if (sz < 256) sz = 256;
+        if (!create_buf(dev, sz,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        img->stencil_buf, img->stencil_mem)) return false;
+    }
+    // Allocate companion R32_UINT shadow VkImage for hardware-sampled VK_IMAGE_ASPECT_STENCIL_BIT SRVs!
+    if (img->real_stencil_img == VK_NULL_HANDLE && img->extent.width > 0 && img->extent.height > 0) {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32_UINT,
+                              {img->extent.width, img->extent.height, 1},
+                              std::max(1u, img->mip_levels), std::max(1u, img->array_layers),
+                              VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, VK_IMAGE_LAYOUT_UNDEFINED};
+        if (dev->fn.CreateImage(dev->real_dev, &ici, nullptr, &img->real_stencil_img) == VK_SUCCESS) {
+            VkMemoryRequirements mr{};
+            dev->fn.GetImageMemoryRequirements(dev->real_dev, img->real_stencil_img, &mr);
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, mr.size,
+                                     sm_find_mem_type(dev->pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            if (dev->fn.AllocateMemory(dev->real_dev, &mai, nullptr, &img->real_stencil_mem) == VK_SUCCESS) {
+                dev->fn.BindImageMemory(dev->real_dev, img->real_stencil_img, img->real_stencil_mem, 0);
+            } else {
+                dev->fn.DestroyImage(dev->real_dev, img->real_stencil_img, nullptr);
+                img->real_stencil_img = VK_NULL_HANDLE;
+            }
+        }
+    }
+    return true;
 }
 
 bool sm_ensure_geom_capacity(SmDevice* dev, uint32_t need_verts, uint32_t need_tris) {

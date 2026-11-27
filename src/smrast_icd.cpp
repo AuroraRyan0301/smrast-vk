@@ -995,10 +995,11 @@ static VKAPI_ATTR void VKAPI_CALL sm_DestroyImage(VkDevice d, VkImage i, const V
         auto& v = dev->storage_images;
         v.erase(std::remove(v.begin(), v.end(), si), v.end());
     }
-    if (si->attach_buf)  { dev->fn.DestroyBuffer(dev->real_dev, si->attach_buf, nullptr);  dev->fn.FreeMemory(dev->real_dev, si->attach_mem, nullptr); }
-    if (si->stencil_buf) { dev->fn.DestroyBuffer(dev->real_dev, si->stencil_buf, nullptr); dev->fn.FreeMemory(dev->real_dev, si->stencil_mem, nullptr); }
-    if (si->host_buf)    { dev->fn.DestroyBuffer(dev->real_dev, si->host_buf, nullptr);    dev->fn.FreeMemory(dev->real_dev, si->host_mem, nullptr); }
-    if (si->real_img)    dev->fn.DestroyImage(dev->real_dev, si->real_img, nullptr);
+    if (si->attach_buf)       { dev->fn.DestroyBuffer(dev->real_dev, si->attach_buf, nullptr);  dev->fn.FreeMemory(dev->real_dev, si->attach_mem, nullptr); }
+    if (si->stencil_buf)      { dev->fn.DestroyBuffer(dev->real_dev, si->stencil_buf, nullptr); dev->fn.FreeMemory(dev->real_dev, si->stencil_mem, nullptr); }
+    if (si->real_stencil_img) { dev->fn.DestroyImage(dev->real_dev, si->real_stencil_img, nullptr); dev->fn.FreeMemory(dev->real_dev, si->real_stencil_mem, nullptr); }
+    if (si->host_buf)         { dev->fn.DestroyBuffer(dev->real_dev, si->host_buf, nullptr);    dev->fn.FreeMemory(dev->real_dev, si->host_mem, nullptr); }
+    if (si->real_img)         dev->fn.DestroyImage(dev->real_dev, si->real_img, nullptr);
     delete si;
 }
 static VKAPI_ATTR void VKAPI_CALL sm_GetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements* mr) {
@@ -1016,7 +1017,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateImageView(VkDevice d, const VkIma
     auto* si = from_h<SmImage>(ci->image);
     VkImageViewCreateInfo ivci = *ci;
     ivci.image = si->real_img;
-    if (si->is_depth) {
+    bool is_stn_view = false;
+    if (si->has_stencil &&
+        (ci->subresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+        !(ci->subresourceRange.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        // Sampled Stencil Aspect SRV -> route to companion R32_UINT shadow VkImage (preserves ivci.components swizzle!)
+        sm_ensure_image_stencil_buf(dev, si);
+        if (si->real_stencil_img != VK_NULL_HANDLE) {
+            ivci.image = si->real_stencil_img;
+            ivci.format = VK_FORMAT_R32_UINT;
+            ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ivci.pNext = nullptr;
+            is_stn_view = true;
+        }
+    } else if (si->is_depth) {
         ivci.format = VK_FORMAT_R32_SFLOAT;
         ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         ivci.pNext = nullptr;
@@ -1026,7 +1040,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateImageView(VkDevice d, const VkIma
     if (r != VK_SUCCESS) return r;
     auto* sv = new SmImageView{rv, si, ci->format,
                                ci->subresourceRange.baseMipLevel, ci->subresourceRange.levelCount,
-                               ci->subresourceRange.baseArrayLayer, ci->subresourceRange.layerCount};
+                               ci->subresourceRange.baseArrayLayer, ci->subresourceRange.layerCount,
+                               is_stn_view};
     *out = to_h<VkImageView>(sv);
     return VK_SUCCESS;
 }
@@ -1281,11 +1296,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
                                           gci.pVertexInputState->pVertexBindingDescriptions + gci.pVertexInputState->vertexBindingDescriptionCount);
             sp->vtx_input.attrs.assign(gci.pVertexInputState->pVertexAttributeDescriptions,
                                        gci.pVertexInputState->pVertexAttributeDescriptions + gci.pVertexInputState->vertexAttributeDescriptionCount);
+            for (const auto* n = reinterpret_cast<const VkBaseInStructure*>(gci.pVertexInputState->pNext); n; n = n->pNext) {
+                if (n->sType == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) {
+                    const auto* dci = reinterpret_cast<const VkPipelineVertexInputDivisorStateCreateInfoEXT*>(n);
+                    for (uint32_t di = 0; di < dci->vertexBindingDivisorCount && dci->pVertexBindingDivisors; ++di) {
+                        uint32_t b = dci->pVertexBindingDivisors[di].binding;
+                        if (b < SM_MAX_VTX_BINDINGS) sp->vtx_input.divisors[b] = dci->pVertexBindingDivisors[di].divisor;
+                    }
+                }
+            }
         }
         if (gci.pInputAssemblyState) sp->topology = gci.pInputAssemblyState->topology;
         if (gci.pRasterizationState) {
-            sp->cull_mode  = gci.pRasterizationState->cullMode;
-            sp->front_face = gci.pRasterizationState->frontFace;
+            sp->cull_mode          = gci.pRasterizationState->cullMode;
+            sp->front_face         = gci.pRasterizationState->frontFace;
+            sp->depth_clamp        = (gci.pRasterizationState->depthClampEnable == VK_TRUE);
+            sp->rasterizer_discard = (gci.pRasterizationState->rasterizerDiscardEnable == VK_TRUE);
+            sp->depth_bias_enable  = (gci.pRasterizationState->depthBiasEnable == VK_TRUE);
+            sp->depth_bias_const   = gci.pRasterizationState->depthBiasConstantFactor;
+            sp->depth_bias_clamp   = gci.pRasterizationState->depthBiasClamp;
+            sp->depth_bias_slope   = gci.pRasterizationState->depthBiasSlopeFactor;
         }
         if (gci.pDepthStencilState) {
             sp->depth_test    = (gci.pDepthStencilState->depthTestEnable == VK_TRUE);
@@ -1521,6 +1551,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BeginCommandBuffer(VkCommandBuffer cb, 
     scb->has_dyn_depth_test = false;
     scb->has_dyn_depth_write = false;
     scb->has_dyn_depth_op = false;
+    scb->has_dyn_depth_bias = false;
+    scb->has_dyn_depth_bias_en = false;
+    scb->has_dyn_rast_discard = false;
     scb->has_dyn_blend_const = false;
     scb->has_dyn_stencil_test = false;
     for (int f = 0; f < 2; ++f) {
@@ -1532,6 +1565,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BeginCommandBuffer(VkCommandBuffer cb, 
     scb->gfx_set_mask = 0;
     memset(scb->gfx_dyn_counts, 0, sizeof(scb->gfx_dyn_counts));
     memset(scb->has_dyn_vtx_stride, 0, sizeof(scb->has_dyn_vtx_stride));
+    memset(scb->vtx_bufs, 0, sizeof(scb->vtx_bufs));
+    memset(scb->vtx_offsets, 0, sizeof(scb->vtx_offsets));
+    scb->idx_buf = nullptr;
+    scb->idx_offset = 0;
     scb->push_size = 0;
     scb->comp_set_mask = 0;
     memset(scb->comp_dyn_counts, 0, sizeof(scb->comp_dyn_counts));
@@ -2114,7 +2151,8 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
     if (dep_img) {
         sm_ensure_image_attach_buf(dev, dep_img);
         if (dep_img->has_stencil) sm_ensure_image_stencil_buf(dev, dep_img);
-        if (clear_mask & 256u) dep_img->attach_dirty = true;
+        if (clear_mask & 256u)  dep_img->attach_dirty = true;
+        if (clear_mask & 1024u) dep_img->stencil_dirty = true;
     }
 
     uint32_t cslot = 0;
@@ -2208,6 +2246,59 @@ static void sm_sync_attach_to_image(SmCommandBuffer* scb, SmImage* img, VkImageL
                                0, 0, nullptr, 0, nullptr, 1, &bar);
 }
 
+static void sm_sync_image_to_stencil(SmCommandBuffer* scb, SmImage* img, VkImageLayout cur_layout, uint32_t mip = 0, uint32_t layer = 0) {
+    if (!img || !img->has_stencil || img->extent.width == 0 || img->extent.height == 0) return;
+    sm_ensure_image_stencil_buf(scb->dev, img);
+    if (!img->real_stencil_img || !img->stencil_buf) return;
+    auto* dev = scb->dev;
+    uint32_t mw = std::max(1u, img->extent.width >> mip);
+    uint32_t mh = std::max(1u, img->extent.height >> mip);
+    VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        sanitize_layout(cur_layout), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img->real_stencil_img,
+        {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1}};
+    dev->fn.CmdPipelineBarrier(scb->real_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &bar);
+    VkBufferImageCopy bic{};
+    bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+    bic.imageExtent = {mw, mh, 1};
+    dev->fn.CmdCopyImageToBuffer(scb->real_cb, img->real_stencil_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img->stencil_buf, 1, &bic);
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; bar.newLayout = sanitize_layout(cur_layout);
+    dev->fn.CmdPipelineBarrier(scb->real_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &bar);
+    emit_compute_barrier(scb);
+    img->stencil_dirty = true;
+    img->stencil_mip = (int32_t)mip;
+    img->stencil_layer = (int32_t)layer;
+}
+
+static void sm_sync_stencil_to_image(SmCommandBuffer* scb, SmImage* img, VkImageLayout target_layout, uint32_t mip = 0, uint32_t layer = 0) {
+    if (!img || !img->has_stencil || !img->stencil_buf) return;
+    sm_ensure_image_stencil_buf(scb->dev, img);
+    if (!img->real_stencil_img) return;
+    auto* dev = scb->dev;
+    uint32_t mw = std::max(1u, img->extent.width >> mip);
+    uint32_t mh = std::max(1u, img->extent.height >> mip);
+    emit_compute_barrier(scb);
+    VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img->real_stencil_img,
+        {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1}};
+    dev->fn.CmdPipelineBarrier(scb->real_cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &bar);
+    VkBufferImageCopy bic{};
+    bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1};
+    bic.imageExtent = {mw, mh, 1};
+    dev->fn.CmdCopyBufferToImage(scb->real_cb, img->stencil_buf, img->real_stencil_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; bar.newLayout = sanitize_layout(target_layout);
+    dev->fn.CmdPipelineBarrier(scb->real_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &bar);
+}
+
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRenderPass(
         VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, VkSubpassContents) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
@@ -2266,9 +2357,17 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRenderPass(VkCommandBuffer cb) {
             }
         }
         if (scb->cur_rp->depth_attach_idx >= 0 && scb->cur_rp->depth_attach_idx < (int)scb->cur_fb->attachments.size()) {
-            SmImage* dep = scb->cur_fb->attachments[scb->cur_rp->depth_attach_idx]->image;
-            if (dep && (dep->usage & VK_IMAGE_USAGE_SAMPLED_BIT))
-                sm_sync_attach_to_image(scb, dep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            SmImageView* dv = scb->cur_fb->attachments[scb->cur_rp->depth_attach_idx];
+            SmImage* dep = dv ? dv->image : nullptr;
+            uint32_t dmip = dv ? dv->base_mip : 0u;
+            uint32_t dlay = dv ? dv->base_layer : 0u;
+            if (dep && ((dep->usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
+                        dep->array_layers > 1 || dep->mip_levels > 1)) {
+                sm_sync_attach_to_image(scb, dep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dmip, dlay);
+            }
+            if (dep && dep->has_stencil && dep->stencil_buf && dep->real_stencil_img) {
+                sm_sync_stencil_to_image(scb, dep, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dmip, dlay);
+            }
         }
     }
     scb->in_render_pass = false;
@@ -2399,10 +2498,23 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRendering(VkCommandBuffer cb, const
                 got_dim = true;
             }
         }
-        if (scb->dyn_dep_img) scb->dyn_dep_img->has_stencil = true;
-        if (ri->pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-            clear_mask |= 1024u;
-            clear_stencil = ri->pStencilAttachment->clearValue.depthStencil.stencil & 0xFFu;
+        if (scb->dyn_dep_img) {
+            scb->dyn_dep_img->has_stencil = true;
+            bool sub_changed = (scb->dyn_dep_img->stencil_mip != (int32_t)iv->base_mip ||
+                                scb->dyn_dep_img->stencil_layer != (int32_t)iv->base_layer);
+            if (ri->pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                clear_mask |= 1024u;
+                clear_stencil = ri->pStencilAttachment->clearValue.depthStencil.stencil & 0xFFu;
+                scb->dyn_dep_img->stencil_mip = (int32_t)iv->base_mip;
+                scb->dyn_dep_img->stencil_layer = (int32_t)iv->base_layer;
+            } else if (ri->pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+                       (!scb->dyn_dep_img->stencil_dirty || sub_changed) &&
+                       scb->dyn_dep_img->real_stencil_img) {
+                sm_sync_image_to_stencil(scb, scb->dyn_dep_img, ri->pStencilAttachment->imageLayout, iv->base_mip, iv->base_layer);
+            } else {
+                scb->dyn_dep_img->stencil_mip = (int32_t)iv->base_mip;
+                scb->dyn_dep_img->stencil_layer = (int32_t)iv->base_layer;
+            }
         }
     }
     if (scb->dyn_w == 0) scb->dyn_w = 1;
@@ -2453,12 +2565,16 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRendering(VkCommandBuffer cb) {
                 }
             }
         }
-        if (scb->dyn_dep_img &&
-            ((scb->dyn_dep_img->usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
-             scb->dyn_dep_img->array_layers > 1 || scb->dyn_dep_img->mip_levels > 1)) {
+        if (scb->dyn_dep_img) {
             uint32_t dmip = scb->dyn_dep_view ? scb->dyn_dep_view->base_mip : 0u;
             uint32_t dlay = scb->dyn_dep_view ? scb->dyn_dep_view->base_layer : 0u;
-            sm_sync_attach_to_image(scb, scb->dyn_dep_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dmip, dlay);
+            if ((scb->dyn_dep_img->usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
+                scb->dyn_dep_img->array_layers > 1 || scb->dyn_dep_img->mip_levels > 1) {
+                sm_sync_attach_to_image(scb, scb->dyn_dep_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dmip, dlay);
+            }
+            if (scb->dyn_dep_img->has_stencil && scb->dyn_dep_img->stencil_buf && scb->dyn_dep_img->real_stencil_img) {
+                sm_sync_stencil_to_image(scb, scb->dyn_dep_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dmip, dlay);
+            }
         }
     }
     scb->in_dyn_rendering = false;
@@ -2492,6 +2608,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     auto* pipe = scb->cur_gfx_pipe;
     bool is_indirect = (indirect_buf != nullptr);
     if (!pipe || !pipe->vs_comp_pipe) return;
+    bool eff_rast_discard = scb->has_dyn_rast_discard ? scb->dyn_rast_discard : pipe->rasterizer_discard;
+    if (eff_rast_discard) return;
     if (!is_indirect && (vert_or_idx_count < 3 || instance_count == 0)) return;
 
     SmImage* col_imgs[SM_MAX_MRT] = {nullptr};
@@ -2564,6 +2682,12 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     bool eff_dwrite          = scb->has_dyn_depth_write ? scb->dyn_depth_write : pipe->depth_write;
     VkCompareOp eff_dop      = scb->has_dyn_depth_op ? scb->dyn_depth_op : pipe->depth_op;
     bool eff_stest           = scb->has_dyn_stencil_test ? scb->dyn_stencil_test : pipe->stencil_test;
+    bool eff_dbias_en        = scb->has_dyn_depth_bias_en ? scb->dyn_depth_bias_en : pipe->depth_bias_enable;
+    float eff_dbias_const    = scb->has_dyn_depth_bias ? scb->dyn_depth_bias_const : pipe->depth_bias_const;
+    float eff_dbias_clamp    = scb->has_dyn_depth_bias ? scb->dyn_depth_bias_clamp : pipe->depth_bias_clamp;
+    float eff_dbias_slope    = scb->has_dyn_depth_bias ? scb->dyn_depth_bias_slope : pipe->depth_bias_slope;
+    if (eff_stest && dep_img && dep_img->has_stencil) dep_img->stencil_dirty = true;
+    if (eff_dwrite && dep_img) dep_img->attach_dirty = true;
     VkStencilOpState eff_sf  = pipe->stencil_front;
     VkStencilOpState eff_sb  = pipe->stencil_back;
     if (scb->has_dyn_stencil_op[0])    { eff_sf.failOp = scb->dyn_stencil_fail[0]; eff_sf.passOp = scb->dyn_stencil_pass[0]; eff_sf.depthFailOp = scb->dyn_stencil_dfail[0]; eff_sf.compareOp = scb->dyn_stencil_cmp[0]; }
@@ -2657,17 +2781,23 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             fs_ubo->rt_write_mask[r] = pipe->color_write_mask[r] & 0xFu;
         }
 
+        uint32_t used_vb_mask = 0;
+        for (const auto& bd : pipe->vtx_input.bindings)
+            if (bd.binding < SM_MAX_VTX_BINDINGS) used_vb_mask |= (1u << bd.binding);
+        auto get_vb = [&](uint32_t b) -> VkBuffer {
+            return ((used_vb_mask & (1u << b)) && scb->vtx_bufs[b]) ? scb->vtx_bufs[b]->real_buf : dev->rast.dummy_buf;
+        };
         VkDescriptorBufferInfo vbi[11] = {
             {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE},
             {(indexed && scb->idx_buf) ? scb->idx_buf->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[0] ? scb->vtx_bufs[0]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[1] ? scb->vtx_bufs[1]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[2] ? scb->vtx_bufs[2]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[3] ? scb->vtx_bufs[3]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[4] ? scb->vtx_bufs[4]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[5] ? scb->vtx_bufs[5]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[6] ? scb->vtx_bufs[6]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {scb->vtx_bufs[7] ? scb->vtx_bufs[7]->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
+            {get_vb(0), 0, VK_WHOLE_SIZE},
+            {get_vb(1), 0, VK_WHOLE_SIZE},
+            {get_vb(2), 0, VK_WHOLE_SIZE},
+            {get_vb(3), 0, VK_WHOLE_SIZE},
+            {get_vb(4), 0, VK_WHOLE_SIZE},
+            {get_vb(5), 0, VK_WHOLE_SIZE},
+            {get_vb(6), 0, VK_WHOLE_SIZE},
+            {get_vb(7), 0, VK_WHOLE_SIZE},
             {dev->rast.vs_ubo_buf, slot * sizeof(SmVsParamsUBO), sizeof(SmVsParamsUBO)},
         };
         VkWriteDescriptorSet vws[11];
@@ -2794,15 +2924,20 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     if (eff_dtest && dep_img != nullptr)   rflags |= 8u;
     rflags |= (((uint32_t)eff_dop & 7u) << 4u);
     rflags |= ((topo_code & 3u) << 8u);
+    if (pipe->depth_clamp)                 rflags |= 1024u;
+    if (eff_dbias_en)                      rflags |= 2048u;
 
     struct {
         uint32_t tri_count, vstride, w, h, tx, ty, max_tpt, flags;
         float vp_x, vp_y, vp_w, vp_h, vp_min_d, vp_max_d;
         int32_t sx0, sy0, sx1, sy1;
         uint32_t tris_per_inst, verts_per_inst, extra_vert_base, extra_tri_base;
+        float depth_bias_const, depth_bias_slope, depth_bias_clamp;
+        uint32_t pad0;
     } bpc = { is_indirect ? 0xFFFFFFFFu : total_tris, SM_VERT_STRIDE_VEC4, W, H, tx, ty, SM_MAX_TRIS_PER_TILE, rflags,
               vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc_x0, sc_y0, sc_x1, sc_y1,
-              tris_per_inst, verts_per_inst, extra_v_base, extra_t_base };
+              tris_per_inst, verts_per_inst, extra_v_base, extra_t_base,
+              eff_dbias_const, eff_dbias_slope, eff_dbias_clamp, 0u };
 
     dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pipe);
     dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pl, 0, 1, &dev->rast.bin_ds[slot], 0, nullptr);
@@ -3197,6 +3332,20 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdCopyImage(VkCommandBuffer cb, VkImage s,
     SM_TRACE("CopyImage(s=%ux%u f=%d sc=%d ad=%d -> d=%ux%u f=%d sc=%d)",
              si->extent.width, si->extent.height, (int)si->format, (int)si->is_swapchain, (int)si->attach_dirty,
              di->extent.width, di->extent.height, (int)di->format, (int)di->is_swapchain);
+    bool copy_stencil = (si->has_stencil && di->has_stencil && n > 0 && r &&
+                         (r[0].srcSubresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT));
+    bool copy_depth_or_color = (!si->has_stencil || n == 0 || !r ||
+                                (r[0].srcSubresource.aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT)));
+    if (copy_stencil && si->stencil_buf && si->extent.width == di->extent.width && si->extent.height == di->extent.height) {
+        sm_ensure_image_stencil_buf(scb->dev, di);
+        if (di->stencil_buf) {
+            VkBufferCopy sbc{0, 0, (VkDeviceSize)si->extent.width * si->extent.height * 4u};
+            scb->dev->fn.CmdCopyBuffer(scb->real_cb, si->stencil_buf, di->stencil_buf, 1, &sbc);
+            di->stencil_dirty = true;
+            sm_sync_stencil_to_image(scb, di, dl, r[0].dstSubresource.mipLevel, r[0].dstSubresource.baseArrayLayer);
+        }
+    }
+    if (!copy_depth_or_color) return;
     if (si->attach_dirty && si->attach_buf && di->attach_buf && si->format == di->format &&
         si->extent.width == di->extent.width && si->extent.height == di->extent.height) {
         uint32_t bpp = si->is_depth ? 4u : sm_format_bpp(si->format);
@@ -3207,8 +3356,13 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdCopyImage(VkCommandBuffer cb, VkImage s,
         return;
     }
     if (si->real_img && di->real_img) {
+        std::vector<VkImageCopy> mr(r, r + n);
+        for (auto& c : mr) {
+            if (si->is_depth) c.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            if (di->is_depth) c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        }
         scb->dev->fn.CmdCopyImage(scb->real_cb, si->real_img, sanitize_layout(sl),
-                                  di->real_img, sanitize_layout(dl), n, r);
+                                  di->real_img, sanitize_layout(dl), n, mr.data());
     }
     if (di->attach_buf && di->real_img) {
         sm_sync_image_to_attach(scb, di, dl);
@@ -3267,9 +3421,13 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearDepthStencilImage(VkCommandBuffer c
     sm_ensure_image_attach_buf(scb->dev, img);
     uint32_t dbits = 0; memcpy(&dbits, &ds->depth, 4);
     scb->dev->fn.CmdFillBuffer(scb->real_cb, img->attach_buf, 0, (VkDeviceSize)img->extent.width * img->extent.height * 4, dbits);
+    img->attach_dirty = true; img->attach_mip = 0; img->attach_layer = 0;
+    sm_sync_attach_to_image(scb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0);
     if (img->has_stencil) {
         sm_ensure_image_stencil_buf(scb->dev, img);
         scb->dev->fn.CmdFillBuffer(scb->real_cb, img->stencil_buf, 0, (VkDeviceSize)img->extent.width * img->extent.height * 4, ds->stencil & 0xFFu);
+        img->stencil_dirty = true; img->stencil_mip = 0; img->stencil_layer = 0;
+        sm_sync_stencil_to_image(scb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0);
     }
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBlitImage(
@@ -3400,8 +3558,12 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilOp(VkCommandBuffer cb, VkStenc
     if (mask & VK_STENCIL_FACE_FRONT_BIT) { scb->has_dyn_stencil_op[0] = true; scb->dyn_stencil_fail[0] = failOp; scb->dyn_stencil_pass[0] = passOp; scb->dyn_stencil_dfail[0] = depthFailOp; scb->dyn_stencil_cmp[0] = cmpOp; }
     if (mask & VK_STENCIL_FACE_BACK_BIT)  { scb->has_dyn_stencil_op[1] = true; scb->dyn_stencil_fail[1] = failOp; scb->dyn_stencil_pass[1] = passOp; scb->dyn_stencil_dfail[1] = depthFailOp; scb->dyn_stencil_cmp[1] = cmpOp; }
 }
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetRasterizerDiscardEnable(VkCommandBuffer, VkBool32) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBiasEnable(VkCommandBuffer, VkBool32) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetRasterizerDiscardEnable(VkCommandBuffer cb, VkBool32 e) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_rast_discard = true; scb->dyn_rast_discard = (e != 0);
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBiasEnable(VkCommandBuffer cb, VkBool32 e) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_depth_bias_en = true; scb->dyn_depth_bias_en = (e != 0);
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetPrimitiveRestartEnable(VkCommandBuffer, VkBool32) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginConditionalRenderingEXT(VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdEndConditionalRenderingEXT(VkCommandBuffer) {}
@@ -3435,12 +3597,19 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdPipelineBarrier2(VkCommandBuffer cb, con
         const auto& b = di->pImageMemoryBarriers[i];
         auto* si = from_h<SmImage>(b.image);
         VkImageSubresourceRange sr = b.subresourceRange;
+        bool has_stn = si->has_stencil && si->real_stencil_img && (sr.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
         if (si->is_depth) sr.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        ibs.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VkImageMemoryBarrier imb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
                        sanitize_access_mask((VkAccessFlags)b.srcAccessMask),
                        sanitize_access_mask((VkAccessFlags)b.dstAccessMask),
                        sanitize_layout(b.oldLayout), sanitize_layout(b.newLayout),
-                       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, si->real_img, sr});
+                       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, si->real_img, sr};
+        ibs.push_back(imb);
+        if (has_stn) {
+            imb.image = si->real_stencil_img;
+            imb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            ibs.push_back(imb);
+        }
     }
     scb->dev->fn.CmdPipelineBarrier(scb->real_cb, srcS, dstS, di->dependencyFlags,
                                     (uint32_t)mbs.size(), mbs.data(),
@@ -3540,9 +3709,12 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdPipelineBarrier(
         b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     }
-    std::vector<VkImageMemoryBarrier> mib(ibs, ibs + ibc);
-    for (auto& b : mib) {
+    std::vector<VkImageMemoryBarrier> mib;
+    mib.reserve(ibc * 2);
+    for (uint32_t i = 0; i < ibc; ++i) {
+        VkImageMemoryBarrier b = ibs[i];
         auto* si = from_h<SmImage>(b.image);
+        bool has_stn = si->has_stencil && si->real_stencil_img && (b.subresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
         b.image = si->real_img;
         b.srcAccessMask = sanitize_access_mask(b.srcAccessMask);
         b.dstAccessMask = sanitize_access_mask(b.dstAccessMask);
@@ -3551,9 +3723,15 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdPipelineBarrier(
         b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         if (si->is_depth) b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        mib.push_back(b);
+        if (has_stn) {
+            b.image = si->real_stencil_img;
+            b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            mib.push_back(b);
+        }
     }
     scb->dev->fn.CmdPipelineBarrier(scb->real_cb, sanitize_stage_mask(srcS), sanitize_stage_mask(dstS), dep,
-                                    mbc, mmb.data(), bbc, mbb.data(), ibc, mib.data());
+                                    mbc, mmb.data(), bbc, mbb.data(), (uint32_t)mib.size(), mib.data());
 }
 
 // =============================================================================
@@ -3799,7 +3977,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BindImageMemory2(VkDevice d, uint32_t c
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetLineWidth(VkCommandBuffer, float) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBias(VkCommandBuffer, float, float, float) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBias(VkCommandBuffer cb, float c, float cl, float sl) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    scb->has_dyn_depth_bias = true;
+    scb->dyn_depth_bias_const = c;
+    scb->dyn_depth_bias_clamp = cl;
+    scb->dyn_depth_bias_slope = sl;
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetBlendConstants(VkCommandBuffer cb, const float c[4]) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
     scb->has_dyn_blend_const = true;

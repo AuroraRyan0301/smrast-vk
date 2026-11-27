@@ -75,7 +75,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v4b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v5_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -439,7 +439,7 @@ static std::string swiz(uint32_t vecsize) {
     return "";
 }
 
-static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAttributeDescription* attr) {
+static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAttributeDescription* attr, uint32_t divisor) {
     std::ostringstream ss;
     uint32_t b = attr->binding;
     if (b >= SM_MAX_VTX_BINDINGS) b = 0;
@@ -447,8 +447,11 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
                                  : ("sm_vs.vtx_offsets_hi[" + std::to_string(b - 4) + "]");
     std::string vb_str = (b < 4) ? ("sm_vs.vtx_strides[" + std::to_string(b) + "]")
                                  : ("sm_vs.vtx_strides_hi[" + std::to_string(b - 4) + "]");
+    std::string inst_expr = (divisor == 0u) ? "sm_vs.instance_idx"
+                          : ((divisor > 1u) ? ("(sm_vs.instance_idx + inst_local / " + std::to_string(divisor) + "u)")
+                                            : "uint(sm_iidx)");
     ss << "    {\n";
-    ss << "        uint elem_i = ((sm_vs.vtx_inst_rate_mask & (1u << " << b << "u)) != 0u) ? uint(sm_iidx) : uint(sm_vidx);\n";
+    ss << "        uint elem_i = ((sm_vs.vtx_inst_rate_mask & (1u << " << b << "u)) != 0u) ? " << inst_expr << " : uint(sm_vidx);\n";
     ss << "        uint byte_off = " << vb_off << " + elem_i * " << vb_str << " + " << attr->offset << "u;\n";
     ss << "        uint w0 = byte_off >> 2u;\n";
     ss << "        uint bsh = (byte_off & 3u) << 3u;\n";
@@ -516,9 +519,15 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
             assign_f4("vec4(unpackSnorm2x16(" + load_u(0) + "), unpackSnorm2x16(" + load_u(1) + "))"); break;
         case VK_FORMAT_R8_UNORM:
             assign_f4("vec4(float((" + load_u_raw(0) + " >> bsh) & 255u) / 255.0, 0.0, 0.0, 1.0)"); break;
+        case VK_FORMAT_R8_SNORM:
+            ss << "        int s8 = bitfieldExtract(int(" << load_u_raw(0) << "), int(bsh), 8);\n";
+            assign_f4("vec4(max(float(s8) / 127.0, -1.0), 0.0, 0.0, 1.0)"); break;
         case VK_FORMAT_R8G8_UNORM:
             ss << "        uint p82 = (" << load_u(0) << ") & 0xFFFFu;\n";
             assign_f4("vec4(float(p82 & 255u) / 255.0, float((p82 >> 8u) & 255u) / 255.0, 0.0, 1.0)"); break;
+        case VK_FORMAT_R8G8_SNORM:
+            ss << "        int s82 = int(" << load_u(0) << ");\n";
+            assign_f4("vec4(max(float(bitfieldExtract(s82,0,8))/127.0,-1.0), max(float(bitfieldExtract(s82,8,8))/127.0,-1.0), 0.0, 1.0)"); break;
         case VK_FORMAT_R8G8B8A8_UNORM:
             assign_f4("unpackUnorm4x8(" + load_u(0) + ")"); break;
         case VK_FORMAT_B8G8R8A8_UNORM:
@@ -535,9 +544,14 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
             break;
         case VK_FORMAT_R8_UINT:
             assign_u4("uvec4((" + load_u_raw(0) + " >> bsh) & 255u, 0u, 0u, 1u)"); break;
+        case VK_FORMAT_R8_SINT:
+            assign_i4("ivec4(bitfieldExtract(int(" + load_u_raw(0) + "), int(bsh), 8), 0, 0, 1)"); break;
         case VK_FORMAT_R8G8_UINT:
             ss << "        uint pu8 = " << load_u(0) << ";\n";
             assign_u4("uvec4(pu8 & 255u, (pu8 >> 8u) & 255u, 0u, 1u)"); break;
+        case VK_FORMAT_R8G8_SINT:
+            ss << "        int pi82 = int(" << load_u(0) << ");\n";
+            assign_i4("ivec4(bitfieldExtract(pi82,0,8), bitfieldExtract(pi82,8,8), 0, 1)"); break;
         case VK_FORMAT_R8G8B8A8_UINT:
             ss << "        uint pu8 = " << load_u(0) << ";\n";
             assign_u4("uvec4(pu8 & 255u, (pu8>>8u)&255u, (pu8>>16u)&255u, (pu8>>24u)&255u)"); break;
@@ -546,6 +560,8 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
             assign_i4("ivec4(bitfieldExtract(pi8,0,8), bitfieldExtract(pi8,8,8), bitfieldExtract(pi8,16,8), bitfieldExtract(pi8,24,8))"); break;
         case VK_FORMAT_R16_UINT:
             assign_u4("uvec4((" + load_u_raw(0) + " >> bsh) & 65535u, 0u, 0u, 1u)"); break;
+        case VK_FORMAT_R16_SINT:
+            assign_i4("ivec4(bitfieldExtract(int(" + load_u_raw(0) + "), int(bsh), 16), 0, 0, 1)"); break;
         case VK_FORMAT_R16G16_UINT:
             ss << "        uint pu16 = " << load_u(0) << ";\n";
             assign_u4("uvec4(pu16 & 65535u, pu16 >> 16u, 0u, 1u)"); break;
@@ -688,7 +704,10 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
         for (const auto& a : vtx_in.attrs) {
             if (a.location == io.location) { found = &a; break; }
         }
-        if (found) ss << emit_attr_unpack(io, found);
+        if (found) {
+            uint32_t div = (found->binding < SM_MAX_VTX_BINDINGS) ? vtx_in.divisors[found->binding] : 1u;
+            ss << emit_attr_unpack(io, found, div);
+        }
     }
 
     ss << "    sm_user_vs_main();\n";

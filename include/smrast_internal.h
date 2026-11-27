@@ -264,10 +264,15 @@ struct SmImage {
     bool attach_dirty = false;
     int32_t attach_mip = -1;
     int32_t attach_layer = -1;
+    bool stencil_dirty = false;
+    int32_t stencil_mip = -1;
+    int32_t stencil_layer = -1;
     VkBuffer attach_buf = VK_NULL_HANDLE;
     VkDeviceMemory attach_mem = VK_NULL_HANDLE;
     VkBuffer stencil_buf = VK_NULL_HANDLE;
     VkDeviceMemory stencil_mem = VK_NULL_HANDLE;
+    VkImage real_stencil_img = VK_NULL_HANDLE;
+    VkDeviceMemory real_stencil_mem = VK_NULL_HANDLE;
     VkBuffer host_buf = VK_NULL_HANDLE;
     VkDeviceMemory host_mem = VK_NULL_HANDLE;
     void* host_ptr = nullptr;
@@ -281,6 +286,7 @@ struct SmImageView {
     uint32_t level_count = 1;
     uint32_t base_layer = 0;
     uint32_t layer_count = 1;
+    bool is_stencil_view = false;
 };
 
 struct SmRenderPass {
@@ -309,6 +315,7 @@ struct SmPipelineLayout {
 struct SmVertexInputState {
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attrs;
+    uint32_t divisors[SM_MAX_VTX_BINDINGS] = {1, 1, 1, 1, 1, 1, 1, 1};
 };
 
 struct SmPipeline {
@@ -323,6 +330,12 @@ struct SmPipeline {
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    bool depth_clamp = false;
+    bool rasterizer_discard = false;
+    bool depth_bias_enable = false;
+    float depth_bias_const = 0.0f;
+    float depth_bias_clamp = 0.0f;
+    float depth_bias_slope = 0.0f;
     bool depth_test = false;
     bool depth_write = false;
     VkCompareOp depth_op = VK_COMPARE_OP_LESS;
@@ -564,6 +577,9 @@ struct SmCommandBuffer {
     bool has_dyn_depth_test = false;  bool dyn_depth_test = false;
     bool has_dyn_depth_write = false; bool dyn_depth_write = false;
     bool has_dyn_depth_op = false;    VkCompareOp dyn_depth_op = VK_COMPARE_OP_LESS;
+    bool has_dyn_depth_bias = false;  float dyn_depth_bias_const = 0.f, dyn_depth_bias_clamp = 0.f, dyn_depth_bias_slope = 0.f;
+    bool has_dyn_depth_bias_en = false; bool dyn_depth_bias_en = false;
+    bool has_dyn_rast_discard = false;  bool dyn_rast_discard = false;
     bool has_dyn_blend_const = false; float dyn_blend_const[4] = {0.f, 0.f, 0.f, 0.f};
 
     bool has_dyn_stencil_test = false;       bool dyn_stencil_test = false;
