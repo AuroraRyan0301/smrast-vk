@@ -32,25 +32,28 @@ static void init_xcb_shm(SmSwapchain* sc, size_t bytes) {
     if (!q_rep) return;
     free(q_rep);
 
-    int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0666);
-    if (shmid < 0) return;
-    void* ptr = shmat(shmid, nullptr, 0);
-    if (ptr == (void*)-1) { shmctl(shmid, IPC_RMID, nullptr); return; }
-
-    xcb_shm_seg_t seg = xcb_generate_id(surf->xcb_conn);
-    auto att_c = xcb_shm_attach_checked(surf->xcb_conn, seg, (uint32_t)shmid, 0);
-    xcb_generic_error_t* err = xcb_request_check(surf->xcb_conn, att_c);
-    shmctl(shmid, IPC_RMID, nullptr);
-    if (err) {
-        free(err);
-        shmdt(ptr);
-        return;
+    for (int k = 0; k < 2; ++k) {
+        int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0666);
+        if (shmid < 0) goto fail_xcb;
+        void* ptr = shmat(shmid, nullptr, 0);
+        if (ptr == (void*)-1) { shmctl(shmid, IPC_RMID, nullptr); goto fail_xcb; }
+        xcb_shm_seg_t seg = xcb_generate_id(surf->xcb_conn);
+        auto att_c = xcb_shm_attach_checked(surf->xcb_conn, seg, (uint32_t)shmid, 0);
+        xcb_generic_error_t* err = xcb_request_check(surf->xcb_conn, att_c);
+        shmctl(shmid, IPC_RMID, nullptr);
+        if (err) { free(err); shmdt(ptr); goto fail_xcb; }
+        sc->shm_ids[k]  = shmid;
+        sc->shm_segs[k] = seg;
+        sc->shm_ptrs[k] = (uint8_t*)ptr;
     }
     sc->use_shm = true;
-    sc->shm_id = shmid;
-    sc->shm_seg = seg;
-    sc->shm_ptr = (uint8_t*)ptr;
     sc->shm_bytes = bytes;
+    return;
+fail_xcb:
+    for (int k = 0; k < 2; ++k) {
+        if (sc->shm_segs[k]) { xcb_shm_detach(surf->xcb_conn, sc->shm_segs[k]); sc->shm_segs[k] = 0; }
+        if (sc->shm_ptrs[k]) { shmdt(sc->shm_ptrs[k]); sc->shm_ptrs[k] = nullptr; }
+    }
 }
 
 static bool g_xshm_err_flag = false;
@@ -66,40 +69,60 @@ static void init_xlib_shm(SmSwapchain* sc, uint32_t w, uint32_t h) {
 
     int screen = DefaultScreen(dpy);
     Visual* vis = DefaultVisual(dpy, screen);
-    auto* shminfo = new XShmSegmentInfo();
-    memset(shminfo, 0, sizeof(*shminfo));
-    XImage* ximg = XShmCreateImage(dpy, vis, 24, ZPixmap, nullptr, shminfo, w, h);
-    if (!ximg) { delete shminfo; return; }
+    size_t bytes = 0;
+    for (int k = 0; k < 2; ++k) {
+        auto* shminfo = new XShmSegmentInfo();
+        memset(shminfo, 0, sizeof(*shminfo));
+        XImage* ximg = XShmCreateImage(dpy, vis, 24, ZPixmap, nullptr, shminfo, w, h);
+        if (!ximg) { delete shminfo; goto fail_xlib; }
+        bytes = (size_t)ximg->bytes_per_line * (size_t)ximg->height;
+        int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0666);
+        if (shmid < 0) { XDestroyImage(ximg); delete shminfo; goto fail_xlib; }
+        void* ptr = shmat(shmid, nullptr, 0);
+        if (ptr == (void*)-1) { shmctl(shmid, IPC_RMID, nullptr); XDestroyImage(ximg); delete shminfo; goto fail_xlib; }
+        shminfo->shmid = shmid;
+        shminfo->shmaddr = (char*)ptr;
+        shminfo->readOnly = False;
+        ximg->data = (char*)ptr;
 
-    size_t bytes = (size_t)ximg->bytes_per_line * (size_t)ximg->height;
-    int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0666);
-    if (shmid < 0) { XDestroyImage(ximg); delete shminfo; return; }
-    void* ptr = shmat(shmid, nullptr, 0);
-    if (ptr == (void*)-1) { shmctl(shmid, IPC_RMID, nullptr); XDestroyImage(ximg); delete shminfo; return; }
-    shminfo->shmid = shmid;
-    shminfo->shmaddr = (char*)ptr;
-    shminfo->readOnly = False;
-    ximg->data = (char*)ptr;
-
-    g_xshm_err_flag = false;
-    auto prev_err = XSetErrorHandler(xshm_err_handler);
-    Status st = XShmAttach(dpy, shminfo);
-    XSync(dpy, False);
-    XSetErrorHandler(prev_err);
-    shmctl(shmid, IPC_RMID, nullptr);
-    if (!st || g_xshm_err_flag) {
-        shmdt(ptr);
-        ximg->data = nullptr;
-        XDestroyImage(ximg);
-        delete shminfo;
-        return;
+        g_xshm_err_flag = false;
+        auto prev_err = XSetErrorHandler(xshm_err_handler);
+        Status st = XShmAttach(dpy, shminfo);
+        XSync(dpy, False);
+        XSetErrorHandler(prev_err);
+        shmctl(shmid, IPC_RMID, nullptr);
+        if (!st || g_xshm_err_flag) {
+            shmdt(ptr);
+            ximg->data = nullptr;
+            XDestroyImage(ximg);
+            delete shminfo;
+            goto fail_xlib;
+        }
+        sc->shm_ids[k] = shmid;
+        sc->shm_ptrs[k] = (uint8_t*)ptr;
+        sc->xlib_shm_imgs[k] = (void*)ximg;
+        sc->xlib_shminfos[k] = (void*)shminfo;
     }
     sc->use_shm = true;
-    sc->shm_id = shmid;
-    sc->shm_ptr = (uint8_t*)ptr;
     sc->shm_bytes = bytes;
-    sc->xlib_shm_img = (void*)ximg;
-    sc->xlib_shminfo = (void*)shminfo;
+    return;
+fail_xlib:
+    for (int k = 0; k < 2; ++k) {
+        if (sc->xlib_shminfos[k]) {
+            auto* si = (XShmSegmentInfo*)sc->xlib_shminfos[k];
+            XShmDetach(dpy, si);
+            XSync(dpy, False);
+            delete si;
+            sc->xlib_shminfos[k] = nullptr;
+        }
+        if (sc->xlib_shm_imgs[k]) {
+            XImage* xi = (XImage*)sc->xlib_shm_imgs[k];
+            xi->data = nullptr;
+            XDestroyImage(xi);
+            sc->xlib_shm_imgs[k] = nullptr;
+        }
+        if (sc->shm_ptrs[k]) { shmdt(sc->shm_ptrs[k]); sc->shm_ptrs[k] = nullptr; }
+    }
 }
 
 void sm_wsi_cleanup_swapchain(SmSwapchain* sc) {
@@ -107,9 +130,10 @@ void sm_wsi_cleanup_swapchain(SmSwapchain* sc) {
     SmSurface* surf = sc->surface;
     if (surf->is_xcb && surf->xcb_conn) {
         if (sc->use_shm) {
-            xcb_shm_detach(surf->xcb_conn, sc->shm_seg);
-            if (sc->shm_ptr) shmdt(sc->shm_ptr);
-            sc->shm_ptr = nullptr;
+            for (int k = 0; k < 2; ++k) {
+                if (sc->shm_segs[k]) { xcb_shm_detach(surf->xcb_conn, sc->shm_segs[k]); sc->shm_segs[k] = 0; }
+                if (sc->shm_ptrs[k]) { shmdt(sc->shm_ptrs[k]); sc->shm_ptrs[k] = nullptr; }
+            }
             sc->use_shm = false;
         }
         if (sc->xcb_gc) {
@@ -119,19 +143,23 @@ void sm_wsi_cleanup_swapchain(SmSwapchain* sc) {
         xcb_flush(surf->xcb_conn);
     } else if (!surf->is_xcb && surf->xlib_dpy) {
         Display* dpy = surf->xlib_dpy;
-        if (sc->use_shm && sc->xlib_shminfo) {
-            auto* shminfo = (XShmSegmentInfo*)sc->xlib_shminfo;
-            XShmDetach(dpy, shminfo);
-            XSync(dpy, False);
-            if (sc->xlib_shm_img) {
-                XImage* xi = (XImage*)sc->xlib_shm_img;
-                xi->data = nullptr;
-                XDestroyImage(xi);
-                sc->xlib_shm_img = nullptr;
+        if (sc->use_shm) {
+            for (int k = 0; k < 2; ++k) {
+                if (sc->xlib_shminfos[k]) {
+                    auto* shminfo = (XShmSegmentInfo*)sc->xlib_shminfos[k];
+                    XShmDetach(dpy, shminfo);
+                    XSync(dpy, False);
+                    delete shminfo;
+                    sc->xlib_shminfos[k] = nullptr;
+                }
+                if (sc->xlib_shm_imgs[k]) {
+                    XImage* xi = (XImage*)sc->xlib_shm_imgs[k];
+                    xi->data = nullptr;
+                    XDestroyImage(xi);
+                    sc->xlib_shm_imgs[k] = nullptr;
+                }
+                if (sc->shm_ptrs[k]) { shmdt(sc->shm_ptrs[k]); sc->shm_ptrs[k] = nullptr; }
             }
-            if (sc->shm_ptr) { shmdt(sc->shm_ptr); sc->shm_ptr = nullptr; }
-            delete shminfo;
-            sc->xlib_shminfo = nullptr;
             sc->use_shm = false;
         }
         if (sc->xlib_gc) {
@@ -181,6 +209,12 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     dev->fn.ResetCommandPool(dev->real_dev, sc->present_pools[cur], 0);
     dev->fn.BeginCommandBuffer(sc->present_cmds[cur], &bi);
+    VkMemoryBarrier pmb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_ACCESS_TRANSFER_READ_BIT};
+    dev->fn.CmdPipelineBarrier(sc->present_cmds[cur],
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pmb, 0, nullptr, 0, nullptr);
     if (img->attach_buf) {
         VkBufferCopy cp{0, 0, bytes};
         dev->fn.CmdCopyBuffer(sc->present_cmds[cur], img->attach_buf, img->host_buf, 1, &cp);
@@ -227,18 +261,23 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     bool need_swap = (sc->format == VK_FORMAT_R8G8B8A8_UNORM || sc->format == VK_FORMAT_R8G8B8A8_SRGB);
 
     SmSurface* surf = sc->surface;
+    uint32_t sidx = sc->shm_idx & 1u;
     if (surf->is_xcb && surf->xcb_conn) {
         if (!sc->shm_checked) init_xcb_shm(sc, bytes);
-        if (sc->use_shm && sc->shm_ptr && sc->shm_bytes >= bytes) {
+        if (sc->use_shm && sc->shm_ptrs[sidx] && sc->shm_bytes >= bytes) {
+            if (sc->shm_in_flight)
+                free(xcb_get_input_focus_reply(surf->xcb_conn, xcb_get_input_focus(surf->xcb_conn), nullptr));
             if (!need_swap) {
-                memcpy(sc->shm_ptr, src, bytes);
+                memcpy(sc->shm_ptrs[sidx], src, bytes);
             } else {
-                sm_copy_rgba_to_bgra_fast(sc->shm_ptr, src, bytes);
+                sm_copy_rgba_to_bgra_fast(sc->shm_ptrs[sidx], src, bytes);
             }
             xcb_shm_put_image(surf->xcb_conn, surf->xcb_win, sc->xcb_gc,
                               (uint16_t)w, (uint16_t)h, 0, 0, (uint16_t)w, (uint16_t)h,
-                              0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, sc->shm_seg, 0);
+                              0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, sc->shm_segs[sidx], 0);
             xcb_flush(surf->xcb_conn);
+            sc->shm_idx++;
+            sc->shm_in_flight = true;
         } else {
             std::vector<uint8_t> tmp;
             if (need_swap) {
@@ -259,15 +298,19 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
         }
     } else if (!surf->is_xcb && surf->xlib_dpy) {
         if (!sc->shm_checked) init_xlib_shm(sc, w, h);
-        if (sc->use_shm && sc->shm_ptr && sc->xlib_shm_img && sc->xlib_gc && sc->shm_bytes >= bytes) {
+        if (sc->use_shm && sc->shm_ptrs[sidx] && sc->xlib_shm_imgs[sidx] && sc->xlib_gc && sc->shm_bytes >= bytes) {
+            // Ping-pong sync BEFORE writing next SHM slot: hides previous frame's Xvfb blit 100% behind GPU compute!
+            if (sc->shm_in_flight) XSync(surf->xlib_dpy, False);
             if (!need_swap) {
-                memcpy(sc->shm_ptr, src, bytes);
+                memcpy(sc->shm_ptrs[sidx], src, bytes);
             } else {
-                sm_copy_rgba_to_bgra_fast(sc->shm_ptr, src, bytes);
+                sm_copy_rgba_to_bgra_fast(sc->shm_ptrs[sidx], src, bytes);
             }
-            XShmPutImage(surf->xlib_dpy, surf->xlib_win, (GC)sc->xlib_gc, (XImage*)sc->xlib_shm_img,
+            XShmPutImage(surf->xlib_dpy, surf->xlib_win, (GC)sc->xlib_gc, (XImage*)sc->xlib_shm_imgs[sidx],
                          0, 0, 0, 0, w, h, False);
             XFlush(surf->xlib_dpy);
+            sc->shm_idx++;
+            sc->shm_in_flight = true;
         } else {
             std::vector<uint8_t> tmp;
             if (need_swap) {

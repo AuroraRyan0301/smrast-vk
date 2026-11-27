@@ -271,6 +271,12 @@ struct SmImage {
     // v0.7 Lazy attach_buf -> real_img sync tracking
     bool attach_pending_sync = false;
     bool stencil_pending_sync = false;
+    // v0.8 Zero-copy linear-aliased color G-Buffer (attach_buf aliases real_img VkDeviceMemory!)
+    bool linear_aliased = false;
+    bool ever_bound_in_ds = false;
+    bool real_layout_inited = false;
+    uint32_t row_stride_px = 0;
+    VkDeviceSize row_pitch_bytes = 0;
     uint32_t pending_mip = 0;
     uint32_t pending_layer = 0;
     VkImageLayout pending_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -343,12 +349,18 @@ struct SmPipeline {
     bool prim_restart = false;
     bool vs_writes_point_size = false;
     bool fs_uses_push_constants = true;
+    bool fs_batched_push_ok = false;
+    bool fs_batched_dyn_ubo_ok = false;
+    uint32_t fs_dyn_ubo_set = 0;
+    uint32_t fs_dyn_ubo_binding = 0;
+    uint32_t fs_dyn_ubo_slot = 0;
     bool fs_has_discard_or_depth = false;
     bool is_null_fs_stencil = false;
     float line_width = 1.0f;
     VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool depth_clamp = false;
+    bool depth_clip  = true;
     bool rasterizer_discard = false;
     bool depth_bias_enable = false;
     float depth_bias_const = 0.0f;
@@ -410,17 +422,19 @@ struct SmSwapchain {
     SmImage* pending_present_img[2] = {nullptr, nullptr};
     uint32_t present_ring_idx = 0;
     uint64_t present_frames = 0;
-    // Zero-Copy MIT-SHM XCB & Xlib presentation state
+    // Zero-Copy Double-Buffered MIT-SHM XCB & Xlib presentation state (ping-pong hides Xvfb blit behind GPU!)
     bool shm_checked = false;
     bool use_shm = false;
-    int shm_id = -1;
-    xcb_shm_seg_t shm_seg = 0;
-    uint8_t* shm_ptr = nullptr;
+    int shm_ids[2] = {-1, -1};
+    xcb_shm_seg_t shm_segs[2] = {0, 0};
+    uint8_t* shm_ptrs[2] = {nullptr, nullptr};
     size_t shm_bytes = 0;
+    uint32_t shm_idx = 0;
+    bool shm_in_flight = false;
     xcb_gcontext_t xcb_gc = 0;
     void* xlib_gc = nullptr;
-    void* xlib_shm_img = nullptr;
-    void* xlib_shminfo = nullptr;
+    void* xlib_shm_imgs[2] = {nullptr, nullptr};
+    void* xlib_shminfos[2] = {nullptr, nullptr};
 };
 
 struct alignas(256) SmVsParamsUBO {
@@ -454,7 +468,7 @@ struct alignas(512) SmFsParamsUBO {
     uint32_t stencil_refs;       // [0..7]=frontRef, [8..15]=backRef
     uint32_t tiles_x;            // screen tile columns for Active-Tile Indirect Dispatch!
     uint32_t direct_2d;          // 1 = coherent 2D grid (gl_WorkGroupID.xy), 0 = active_tiles[gl_WorkGroupID.x]
-    uint32_t pad2;
+    uint32_t batch_push_base;    // v0.8: base slot in batch_push_buf & batch_dyn_off_buf (+ sm_draw_id)
     float    blend_const[4];     // vec4 blend_const
     uint32_t rt_fmt[8];          // uvec4 rt_fmt[2]
     uint32_t rt_blend_en[8];     // uvec4 rt_blend_en[2]
@@ -465,6 +479,7 @@ struct alignas(512) SmFsParamsUBO {
     uint32_t rt_dst_alpha[8];    // uvec4 rt_dst_alpha[2]
     uint32_t rt_alpha_op[8];     // uvec4 rt_alpha_op[2]
     uint32_t rt_write_mask[8];   // uvec4 rt_write_mask[2]
+    uint32_t rt_stride_px[8];    // uvec4 rt_stride[2] (v0.8: rowPitch/bpp for zero-copy linear-aliased RTs!)
 };
 
 struct alignas(256) SmClearUBO {
@@ -478,6 +493,7 @@ struct alignas(256) SmClearUBO {
     uint32_t hiz_en;
     uint32_t rt_bpp_code[8];     // uvec4[2]: 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
     uint32_t rt_clear[8][4];     // uvec4[8]
+    uint32_t rt_stride_px[8];    // uvec4[2] (v0.8: rowPitch/bpp for zero-copy linear-aliased RTs!)
 };
 
 struct SmRasterEngine {
@@ -532,6 +548,9 @@ struct SmRasterEngine {
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
     VkBuffer fs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory fs_ubo_mem = VK_NULL_HANDLE; void* fs_ubo_ptr = nullptr;
     VkBuffer clr_ubo_buf = VK_NULL_HANDLE;     VkDeviceMemory clr_ubo_mem = VK_NULL_HANDLE; void* clr_ubo_ptr = nullptr;
+    VkBuffer batch_push_buf = VK_NULL_HANDLE;  VkDeviceMemory batch_push_mem = VK_NULL_HANDLE; void* batch_push_ptr = nullptr;
+    VkBuffer batch_dyn_off_buf = VK_NULL_HANDLE; VkDeviceMemory batch_dyn_off_mem = VK_NULL_HANDLE; uint32_t* batch_dyn_off_ptr = nullptr;
+    uint32_t batch_meta_cursor = 0;
 
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> clear_ds;
@@ -569,6 +588,17 @@ struct SmQueue {
     std::mutex mtx;
 };
 
+struct SmDynUboDesc {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    uint32_t dyn_slot = 0;
+};
+
+struct SmDsBufBinding {
+    VkBuffer real_buf = VK_NULL_HANDLE;
+    VkDeviceSize base_offset = 0;
+};
+
 struct SmDevice {
     VK_LOADER_DATA loader_data;
     SmPhysicalDevice* pd = nullptr;
@@ -577,6 +607,10 @@ struct SmDevice {
     SmQueue* main_queue = nullptr;
     SmRasterEngine rast;
     std::unordered_map<VkDescriptorSetLayout, uint32_t> dsl_dyn_counts;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<SmDynUboDesc>> dsl_dyn_ubos;
+    std::unordered_map<uint64_t, SmDsBufBinding> ds_dyn_ubo_bindings; // key = hash(ds, binding)
+    std::unordered_map<VkDescriptorSet, std::vector<SmImage*>> ds_bound_imgs;
+    std::unordered_map<uint32_t, VkFormatFeatureFlags> linear_fmt_feats;
     std::vector<SmImage*> storage_images;
     uint32_t compiled_gfx_pipes = 0;
     uint32_t failed_gfx_pipes = 0;
@@ -617,6 +651,7 @@ struct SmBatchedDraw {
     uint32_t app_dyn_off[8][8] = {{0}};
     uint8_t push_data[128] = {0};
     uint32_t push_size = 0;
+    uint32_t fs_dyn_ubo_byte_off = 0;
     std::vector<VkPushConstantRange> push_ranges;
     VkViewport vp{};
     int32_t sc_x0 = 0, sc_y0 = 0, sc_x1 = 0, sc_y1 = 0;
@@ -769,7 +804,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err,
                              bool* out_fs_uses_push = nullptr,
-                             bool* out_fs_has_discard_or_depth = nullptr);
+                             bool* out_fs_has_discard_or_depth = nullptr,
+                             const std::vector<SmDynUboDesc>* dyn_ubos = nullptr,
+                             bool* out_fs_batched_push_ok = nullptr,
+                             SmDynUboDesc* out_batched_dyn_ubo = nullptr);
 
 bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
                                   std::vector<uint32_t>& out_comp_spv,

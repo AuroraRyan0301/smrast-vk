@@ -208,10 +208,13 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     ts.v1   = vec4(s1, z1, invw1);
     ts.v2   = vec4(s2, z2, invw2);
     ts.area = vec4(inv_area, float(minx), float(miny), float(maxx));
-    ts.idx  = uvec4(i0, i1, i2, (uint(maxy) & 0x7FFFFFFFu) | (is_front ? 0x80000000u : 0u));
+    // Pack maxy[0..15] | draw_id[16..23] | is_front[31] (zero struct bloat!)
+    ts.idx  = uvec4(i0, i1, i2, (uint(maxy) & 0xFFFFu) | (((pc.flags >> 20u) & 0xFFu) << 16u) | (is_front ? 0x80000000u : 0u));
 
     // v0.7 Fused Quad FS Fast-Path (bit 17 = 131072u): writes TriSetup[0..7] directly for FS — ZERO Fine, ZERO VisBuf, ZERO Indirect!
     if ((pc.flags & 131072u) != 0u) {
+        // Pack painter's order (tid & 0x7Fu) into bits 24..30 so overlapping 2-tri draws obey API draw order!
+        ts.idx.w = (ts.idx.w & 0x80FFFFFFu) | ((tid & 0x7Fu) << 24u);
         uint slot = atomicAdd(s_out_n, 1u);
         if (slot < 8u) tris[slot] = ts;
         return;
@@ -266,8 +269,14 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
                 float d = clamp(l0 * z0 + l1 * z1 + l2 * z2, 0.0, 1.0);
                 uint pidx = uint(py) * pc.width + uint(px);
                 if (dtest && !depth_pass(d, depth_px[pidx], dop)) continue;
-                uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
-                uint64_t packed = (uint64_t(d_u32) << 32) | uint64_t(tid);
+                uint64_t packed;
+                if (!dtest || dop == 7u) {
+                    // Painter's order: upper 32 bits = ~tid (larger tid wins atomicMin), low 32 bits = tid
+                    packed = (uint64_t(~tid) << 32) | uint64_t(tid);
+                } else {
+                    uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
+                    packed = (uint64_t(d_u32) << 32) | uint64_t(tid);
+                }
                 atomicMin(vis_px[pidx], packed);
                 wrote_any = true;
             }
@@ -342,60 +351,86 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
     vec4 c2 = clip_verts[i2 * pc.vert_stride_vec4];
     if (floatBitsToUint(c0.w) == 0x7FC0DEADu || floatBitsToUint(c1.w) == 0x7FC0DEADu || floatBitsToUint(c2.w) == 0x7FC0DEADu) return;
 
-    bool depth_clamp = (pc.flags & 2048u) != 0u;
-    bool in0 = depth_clamp ? (c0.w > 1e-4) : (c0.z >= 0.0 && c0.z <= c0.w && c0.w > 1e-4);
-    bool in1 = depth_clamp ? (c1.w > 1e-4) : (c1.z >= 0.0 && c1.z <= c1.w && c1.w > 1e-4);
-    bool in2 = depth_clamp ? (c2.w > 1e-4) : (c2.z >= 0.0 && c2.z <= c2.w && c2.w > 1e-4);
+    if (any(isnan(c0)) || any(isnan(c1)) || any(isnan(c2)) ||
+        any(isinf(c0)) || any(isinf(c1)) || any(isinf(c2))) return;
+
+    bool no_depth_clip = (pc.flags & 2048u) != 0u;
+    // Exact homogeneous 4D frustum trivial-reject (valid for ALL w, including w <= 0!)
+    if (c0.w <= 1e-5 && c1.w <= 1e-5 && c2.w <= 1e-5) return;
+    if ((c0.x + c0.w < 0.0 && c1.x + c1.w < 0.0 && c2.x + c2.w < 0.0) ||
+        (c0.w - c0.x < 0.0 && c1.w - c1.x < 0.0 && c2.w - c2.x < 0.0) ||
+        (c0.y + c0.w < 0.0 && c1.y + c1.w < 0.0 && c2.y + c2.w < 0.0) ||
+        (c0.w - c0.y < 0.0 && c1.w - c1.y < 0.0 && c2.w - c2.y < 0.0)) return;
+    if (!no_depth_clip) {
+        if (c0.z < 0.0 && c1.z < 0.0 && c2.z < 0.0) return;
+        if (c0.z > c0.w && c1.z > c1.w && c2.z > c2.w) return;
+    }
+
+    // CUDARaster Guard-Band trivial-accept: |x|<=4w, |y|<=4w, w>1e-4, and (if depth_clip) 0<=z<=w
+    // Keeps projected screen coords strictly within [-4*W, +5*W] -> zero FP32 edge cancellation!
+    const float GB = 4.0;
+    bool in0 = (c0.w > 1e-4) && (abs(c0.x) <= GB * c0.w) && (abs(c0.y) <= GB * c0.w) && (no_depth_clip || (c0.z >= 0.0 && c0.z <= c0.w));
+    bool in1 = (c1.w > 1e-4) && (abs(c1.x) <= GB * c1.w) && (abs(c1.y) <= GB * c1.w) && (no_depth_clip || (c1.z >= 0.0 && c1.z <= c1.w));
+    bool in2 = (c2.w > 1e-4) && (abs(c2.x) <= GB * c2.w) && (abs(c2.y) <= GB * c2.w) && (no_depth_clip || (c2.z >= 0.0 && c2.z <= c2.w));
 
     if (in0 && in1 && in2) {
         process_tri(gtid, i0, i1, i2, c0, c1, c2);
         return;
     }
-    if (c0.w <= 1e-4 && c1.w <= 1e-4 && c2.w <= 1e-4) return;
-    if (!depth_clamp) {
-        if (c0.z < 0.0 && c1.z < 0.0 && c2.z < 0.0) return;
-        if (c0.z > c0.w && c1.z > c1.w && c2.z > c2.w) return;
-    }
 
-    uint poly_id[5];
-    vec4 poly_pos[5];
+    uint poly_id[10];
+    vec4 poly_pos[10];
     poly_id[0] = i0; poly_id[1] = i1; poly_id[2] = i2;
     poly_pos[0] = c0; poly_pos[1] = c1; poly_pos[2] = c2;
     uint n_poly = 3u;
 
-    uint n_planes = depth_clamp ? 1u : 2u;
-    for (uint pl = 0u; pl < n_planes && n_poly >= 3u; ++pl) {
-        uint out_id[5];
-        vec4 out_pos[5];
+    // 7-plane exact homogeneous Sutherland-Hodgman clipper:
+    //   pl=0: w >= 1e-4, pl=1: z >= 0, pl=2: w - z >= 0,
+    //   pl=3..6: guard-band x+4w>=0, 4w-x>=0, y+4w>=0, 4w-y>=0
+    for (uint pl = 0u; pl < 7u && n_poly >= 3u; ++pl) {
+        if (no_depth_clip && (pl == 1u || pl == 2u)) continue;
+        bool all_in = true, any_in = false;
+        float dists[10];
+        for (uint e = 0u; e < n_poly; ++e) {
+            vec4 p = poly_pos[e];
+            float d;
+            if (pl == 0u)      d = p.w - 1e-4;
+            else if (pl == 1u) d = p.z;
+            else if (pl == 2u) d = p.w - p.z;
+            else if (pl == 3u) d = p.x + GB * p.w;
+            else if (pl == 4u) d = GB * p.w - p.x;
+            else if (pl == 5u) d = p.y + GB * p.w;
+            else               d = GB * p.w - p.y;
+            dists[e] = d;
+            if (d < 0.0) all_in = false;
+            else         any_in = true;
+        }
+        if (all_in) continue;
+        if (!any_in) { n_poly = 0u; break; }
+
+        uint out_id[10];
+        vec4 out_pos[10];
         uint n_out = 0u;
         for (uint e = 0u; e < n_poly; ++e) {
             uint ne = (e + 1u == n_poly) ? 0u : (e + 1u);
-            vec4 pa = poly_pos[e], pb = poly_pos[ne];
-            float da = depth_clamp ? (pa.w - 1e-4) : ((pl == 0u) ? pa.z : (pa.w - pa.z));
-            float db = depth_clamp ? (pb.w - 1e-4) : ((pl == 0u) ? pb.z : (pb.w - pb.z));
-            bool a_in = (da >= 0.0);
-            bool b_in = (db >= 0.0);
-            if (a_in && n_out < 5u) {
+            float da = dists[e], db = dists[ne];
+            bool a_in = (da >= 0.0), b_in = (db >= 0.0);
+            if (a_in && n_out < 10u) {
                 out_id[n_out] = poly_id[e];
-                out_pos[n_out] = pa;
+                out_pos[n_out] = poly_pos[e];
                 n_out++;
             }
-            if (a_in != b_in && n_out < 5u) {
+            if (a_in != b_in && n_out < 10u) {
                 float denom = da - db;
                 float t = (abs(denom) > 1e-12) ? clamp(da / denom, 0.0, 1.0) : 0.5;
                 uint vslot = small_coop ? atomicAdd(s_clip_v, 1u) : atomicAdd(tile_counts[meta_idx], 1u);
                 if (vslot >= 900000u) return;
                 uint nv = pc.extra_vert_base + vslot;
                 emit_interp_vert(nv, poly_id[e], poly_id[ne], t);
-                vec4 np = mix(pa, pb, t);
-                if (depth_clamp) {
-                    np.w = max(np.w, 1e-4);
-                } else if (pl == 0u) {
-                    np.z = max(np.z, 0.0);
-                } else {
-                    np.w = max(np.w, 1e-4);
-                    np.z = min(np.z, np.w);
-                }
+                vec4 np = mix(poly_pos[e], poly_pos[ne], t);
+                if (pl == 0u)      np.w = max(np.w, 1e-4);
+                else if (pl == 1u) np.z = max(np.z, 0.0);
+                else if (pl == 2u) { np.w = max(np.w, 1e-4); np.z = min(np.z, np.w); }
                 clip_verts[nv * pc.vert_stride_vec4] = np;
                 out_id[n_out] = nv;
                 out_pos[n_out] = np;

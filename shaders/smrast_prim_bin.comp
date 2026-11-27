@@ -48,7 +48,9 @@ void copy_vert_varyings(uint dst_idx, uint src_idx, vec4 pos) {
 }
 
 void emit_nocull_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2) {
-    if (c0.w <= 1e-6 || c1.w <= 1e-6 || c2.w <= 1e-6) return;
+    if (!(c0.w > 1e-6 && c1.w > 1e-6 && c2.w > 1e-6)) return;
+    if (any(isnan(c0)) || any(isnan(c1)) || any(isnan(c2)) ||
+        any(isinf(c0)) || any(isinf(c1)) || any(isinf(c2))) return;
     float invw0 = 1.0 / c0.w, invw1 = 1.0 / c1.w, invw2 = 1.0 / c2.w;
     vec2 s0 = round(vec2(pc.vp_x + (c0.x * invw0 * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y * invw0 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
     vec2 s1 = round(vec2(pc.vp_x + (c1.x * invw1 * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y * invw1 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
@@ -74,7 +76,7 @@ void emit_nocull_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4
     TriSetup ts;
     ts.v0 = vec4(s0, z0, invw0); ts.v1 = vec4(s1, z1, invw1); ts.v2 = vec4(s2, z2, invw2);
     ts.area = vec4(1.0 / area, float(minx), float(miny), float(maxx));
-    ts.idx = uvec4(i0, i1, i2, (uint(maxy) & 0x7FFFFFFFu) | 0x80000000u);
+    ts.idx = uvec4(i0, i1, i2, (uint(maxy) & 0xFFFFu) | 0x80000000u);
     tris[tid] = ts;
 
     bool direct_2d = (pc.flags & 32768u) != 0u;

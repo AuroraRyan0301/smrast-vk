@@ -209,7 +209,7 @@ bool sm_init_raster_engine(SmDevice* dev) {
         for (uint32_t i = 0; i < 2; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 2, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.blit_dsl);
-        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.blit_dsl, 1, &pcr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.blit_pl);
     }
@@ -231,10 +231,11 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.vs_int_dsl);
     }
     {
-        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf, 13=FsParams (DYNAMIC!), 14=ActiveTiles
-        VkDescriptorSetLayoutBinding b[15];
-        for (uint32_t i = 0; i < 15; ++i) b[i] = {i, (i == 13u) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 15, b};
+        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf,
+        //                  13=FsParams (DYNAMIC!), 14=ActiveTiles, 15=BatchPushBuf, 16=BatchDynUboRaw, 17=BatchDynOffBuf
+        VkDescriptorSetLayoutBinding b[18];
+        for (uint32_t i = 0; i < 18; ++i) b[i] = {i, (i == 13u) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 18, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.fs_int_dsl);
     }
 
@@ -274,13 +275,19 @@ bool sm_init_raster_engine(SmDevice* dev) {
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.fs_ubo_buf, R.fs_ubo_mem, &R.fs_ubo_ptr)) return false;
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_AUX_SLOTS * sizeof(SmClearUBO),
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hv, R.clr_ubo_buf, R.clr_ubo_mem, &R.clr_ubo_ptr)) return false;
+    if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * 128u,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.batch_push_buf, R.batch_push_mem, &R.batch_push_ptr)) return false;
+    void* dyn_off_p = nullptr;
+    if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(uint32_t),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.batch_dyn_off_buf, R.batch_dyn_off_mem, &dyn_off_p)) return false;
+    R.batch_dyn_off_ptr = reinterpret_cast<uint32_t*>(dyn_off_p);
 
     // 4. Batch-allocate cached DS ring pools (16,384 cached sets/stage w/ dynamic SSBO offsets -> 0 vkUpdateDescriptorSets/draw!)
     uint32_t ND = SmRasterEngine::MAX_DS_RING;
     uint32_t NI = SmRasterEngine::MAX_IND_SLOTS;
     uint32_t NA = SmRasterEngine::MAX_AUX_SLOTS;
     uint32_t total_sets = ND * 6 + NI + NA * 2;
-    uint32_t total_ssbo = ND * (10 + 14 + 9 + 7 + 4 + 3) + NI * 5 + NA * (13 + 2);
+    uint32_t total_ssbo = ND * (10 + 17 + 9 + 7 + 4 + 3) + NI * 5 + NA * (13 + 2);
     uint32_t total_dyn_ssbo = ND * 2;
     VkDescriptorPoolSize ps[3] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, total_ssbo},

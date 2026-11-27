@@ -181,7 +181,7 @@ void main() {
                     float tri_max_z = clamp(max(t.v0.z, max(t.v1.z, t.v2.z)), 0.0, 1.0);
                     if (dop == 4u ? (tri_max_z <= tile_zmin) : (tri_max_z < tile_zmin)) continue;
                 }
-                if (fx < t.area.y || fx > t.area.w + 1.0 || fy < t.area.z || fy > float(t.idx.w & 0x7FFFFFFFu) + 1.0)
+                if (fx < t.area.y || fx > t.area.w + 1.0 || fy < t.area.z || fy > float(t.idx.w & 0xFFFFu) + 1.0)
                     continue;
                 vec2 s0 = t.v0.xy, s1 = t.v1.xy, s2 = t.v2.xy;
                 float e0 = edge_eval(s1, s2, fx, fy);
@@ -197,8 +197,13 @@ void main() {
                 float d = clamp(l0 * t.v0.z + l1 * t.v1.z + l2 * t.v2.z, 0.0, 1.0);
                 if (dtest && !depth_pass(d, ref_d, dop)) continue;
 
-                uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
-                uint64_t cand = (uint64_t(d_u32) << 32) | uint64_t(s_tids[k]);
+                uint64_t cand;
+                if (!dtest || dop == 7u) {
+                    cand = (uint64_t(~s_tids[k]) << 32) | uint64_t(s_tids[k]);
+                } else {
+                    uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
+                    cand = (uint64_t(d_u32) << 32) | uint64_t(s_tids[k]);
+                }
                 if (cand < best) best = cand;
             }
         }

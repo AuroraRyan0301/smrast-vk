@@ -29,18 +29,22 @@ layout(std140, set = 0, binding = 11) uniform ClearUBO {
     uint hiz_en;
     uvec4 rt_bpp_code[2]; // 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
     uvec4 rt_clear[8];    // packed clear words (1B/2B replicated across u32 in .x)
+    uvec4 rt_stride[2];   // v0.8: row stride in pixels (width or rowPitch/bpp)
 } u;
 
-uint get_bpp(uint i) { return u.rt_bpp_code[i >> 2u][i & 3u]; }
+uint get_bpp(uint i)    { return u.rt_bpp_code[i >> 2u][i & 3u]; }
+uint get_stride(uint i) { return u.rt_stride[i >> 2u][i & 3u]; }
 
 #define CLEAR_RT(N, BUF) \
     if ((u.clear_mask & (1u << uint(N))) != 0u) { \
         uint bc = get_bpp(uint(N)); \
-        if (bc == 0u)      { BUF[idx] = u.rt_clear[N].x; } \
-        else if (bc == 1u) { BUF[idx*2u] = u.rt_clear[N].x; BUF[idx*2u+1u] = u.rt_clear[N].y; } \
-        else if (bc == 2u) { BUF[idx*4u] = u.rt_clear[N].x; BUF[idx*4u+1u] = u.rt_clear[N].y; BUF[idx*4u+2u] = u.rt_clear[N].z; BUF[idx*4u+3u] = u.rt_clear[N].w; } \
-        else if (bc == 3u) { if (idx < ((total_px + 3u) >> 2u)) BUF[idx] = u.rt_clear[N].x; } \
-        else if (bc == 4u) { if (idx < ((total_px + 1u) >> 1u)) BUF[idx] = u.rt_clear[N].x; } \
+        uint st = get_stride(uint(N)); \
+        uint ridx = p.y * st + p.x; \
+        if (bc == 0u)      { BUF[ridx] = u.rt_clear[N].x; } \
+        else if (bc == 1u) { BUF[ridx*2u] = u.rt_clear[N].x; BUF[ridx*2u+1u] = u.rt_clear[N].y; } \
+        else if (bc == 2u) { BUF[ridx*4u] = u.rt_clear[N].x; BUF[ridx*4u+1u] = u.rt_clear[N].y; BUF[ridx*4u+2u] = u.rt_clear[N].z; BUF[ridx*4u+3u] = u.rt_clear[N].w; } \
+        else if (bc == 3u) { if ((st & 3u) == 0u) { if ((p.x & 3u) == 0u) BUF[ridx >> 2u] = u.rt_clear[N].x; } else if (idx < ((total_px + 3u) >> 2u)) BUF[idx] = u.rt_clear[N].x; } \
+        else if (bc == 4u) { if ((st & 1u) == 0u) { if ((p.x & 1u) == 0u) BUF[ridx >> 1u] = u.rt_clear[N].x; } else if (idx < ((total_px + 1u) >> 1u)) BUF[idx] = u.rt_clear[N].x; } \
     }
 
 void main() {

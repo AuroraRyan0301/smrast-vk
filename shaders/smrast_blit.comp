@@ -11,6 +11,7 @@ layout(push_constant) uniform BlitPC {
     int  sx0, sy0, sx1, sy1;
     int  dx0, dy0, dx1, dy1;
     uint src_fc, dst_fc, linear_filter, pad;
+    uint src_stride, dst_stride;
 } pc;
 
 float sm_uf11_to_f32(uint v) { uint e = (v >> 6u) & 31u; uint m = v & 63u; if (e == 0u) return 0.0; return uintBitsToFloat(((e + 112u) << 23u) | (m << 17u)); }
@@ -23,7 +24,7 @@ float sm_srgb_to_lin(float x) { return (x <= 0.04045) ? (x / 12.92) : pow((x + 0
 vec4 load_src(int x, int y) {
     x = clamp(x, 0, int(pc.src_w) - 1);
     y = clamp(y, 0, int(pc.src_h) - 1);
-    uint idx = uint(y) * pc.src_w + uint(x);
+    uint idx = uint(y) * pc.src_stride + uint(x);
     uint fc = pc.src_fc;
     if (fc == 4u)  return vec4(unpackHalf2x16(src_px[idx*2u]), unpackHalf2x16(src_px[idx*2u+1u]));
     if (fc == 10u) return vec4(uintBitsToFloat(src_px[idx*2u]), uintBitsToFloat(src_px[idx*2u+1u]), 0.0, 1.0);
@@ -97,5 +98,5 @@ void main() {
     } else {
         col = load_src(int(round(fx)), int(round(fy)));
     }
-    store_dst(uint(py) * pc.dst_w + uint(px), col);
+    store_dst(uint(py) * pc.dst_stride + uint(px), col);
 }

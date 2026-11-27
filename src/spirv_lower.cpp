@@ -75,7 +75,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v7b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v8d_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -151,6 +151,8 @@ struct ReflectedIO {
     uint32_t vecsize = 4;
     uint32_t array_size = 0; // 0 = non-array
     spvc_basetype basetype = SPVC_BASETYPE_FP32;
+    bool is_flat = false;
+    bool is_noperspective = false;
     std::string glsl_type;
 };
 
@@ -160,11 +162,34 @@ static std::string glsl_type_str(spvc_basetype bt, uint32_t vecsize) {
     return (vecsize == 1) ? "float" : ("vec" + std::to_string(vecsize));
 }
 
+struct ReflectedBlockMember {
+    spvc_basetype basetype = SPVC_BASETYPE_FP32;
+    uint32_t vecsize = 1;
+    uint32_t cols = 1;
+    uint32_t array_size = 0; // 0 = non-array
+    uint32_t offset = 0;
+    uint32_t array_stride = 0;
+    uint32_t matrix_stride = 0;
+};
+
+struct ReflectedBlock {
+    bool valid = false;
+    bool batchable = false;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    uint32_t dyn_slot = 0xFFFFFFFFu;
+    size_t byte_size = 0;
+    std::vector<ReflectedBlockMember> members;
+};
+
 static bool decompile_spirv(const std::vector<uint32_t>& spv,
                             std::string& out_glsl,
                             std::vector<ReflectedIO>& inputs,
                             std::vector<ReflectedIO>& outputs,
-                            std::string& err) {
+                            std::string& err,
+                            const std::vector<SmDynUboDesc>* dyn_ubos = nullptr,
+                            ReflectedBlock* out_push = nullptr,
+                            ReflectedBlock* out_dyn_ubo = nullptr) {
     spvc_context ctx = nullptr;
     if (spvc_context_create(&ctx) != SPVC_SUCCESS) { err = "spvc_context_create failed"; return false; }
     spvc_parsed_ir ir = nullptr;
@@ -208,6 +233,8 @@ static bool decompile_spirv(const std::vector<uint32_t>& spv,
             }
             io.location = spvc_compiler_get_decoration(comp, list[i].id, SpvDecorationLocation);
             io.component = spvc_compiler_get_decoration(comp, list[i].id, SpvDecorationComponent);
+            io.is_flat = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationFlat) == SPVC_TRUE);
+            io.is_noperspective = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationNoPerspective) == SPVC_TRUE);
             io.vecsize = spvc_type_get_vector_size(t);
             unsigned ndims = spvc_type_get_num_array_dimensions(t);
             if (ndims > 0) {
@@ -219,6 +246,81 @@ static bool decompile_spirv(const std::vector<uint32_t>& spv,
     };
     collect(SPVC_RESOURCE_TYPE_STAGE_INPUT,  "sm_io_in_",  inputs);
     collect(SPVC_RESOURCE_TYPE_STAGE_OUTPUT, "sm_io_out_", outputs);
+
+    auto reflect_block = [&](const spvc_reflected_resource& r, size_t max_bytes, ReflectedBlock& out) {
+        spvc_type bt = spvc_compiler_get_type_handle(comp, r.base_type_id);
+        if (!bt) return;
+        size_t sz = 0;
+        if (spvc_compiler_get_declared_struct_size(comp, bt, &sz) != SPVC_SUCCESS) return;
+        unsigned nm = spvc_type_get_num_member_types(bt);
+        out.valid = (nm > 0);
+        out.byte_size = sz;
+        out.batchable = (nm > 0 && sz > 0 && sz <= max_bytes);
+        out.members.clear();
+        for (unsigned m = 0; m < nm && out.batchable; ++m) {
+            spvc_type_id mtid = spvc_type_get_member_type(bt, m);
+            spvc_type mt = spvc_compiler_get_type_handle(comp, mtid);
+            if (!mt) { out.batchable = false; break; }
+            ReflectedBlockMember bm;
+            bm.basetype = spvc_type_get_basetype(mt);
+            bm.vecsize  = spvc_type_get_vector_size(mt);
+            bm.cols     = spvc_type_get_columns(mt);
+            unsigned ndims = spvc_type_get_num_array_dimensions(mt);
+            if ((bm.basetype != SPVC_BASETYPE_FP32 && bm.basetype != SPVC_BASETYPE_INT32 && bm.basetype != SPVC_BASETYPE_UINT32) ||
+                bm.vecsize < 1 || bm.vecsize > 4 || bm.cols < 1 || bm.cols > 4 || ndims > 1) {
+                out.batchable = false; break;
+            }
+            if (ndims == 1) {
+                if (spvc_type_array_dimension_is_literal(mt, 0) != SPVC_TRUE) { out.batchable = false; break; }
+                bm.array_size = spvc_type_get_array_dimension(mt, 0);
+                if (bm.array_size == 0 || bm.array_size > 32) { out.batchable = false; break; }
+                bm.array_stride = spvc_compiler_get_decoration(comp, mtid, SpvDecorationArrayStride);
+                if (bm.array_stride == 0 || (bm.array_stride % 4) != 0) { out.batchable = false; break; }
+            }
+            bm.offset = spvc_compiler_get_member_decoration(comp, r.base_type_id, m, SpvDecorationOffset);
+            if ((bm.offset % 4) != 0) { out.batchable = false; break; }
+            if (spvc_compiler_has_member_decoration(comp, r.base_type_id, m, SpvDecorationRowMajor) == SPVC_TRUE) {
+                out.batchable = false; break;
+            }
+            if (bm.cols > 1) {
+                bm.matrix_stride = spvc_compiler_get_member_decoration(comp, r.base_type_id, m, SpvDecorationMatrixStride);
+                if (bm.matrix_stride == 0 || (bm.matrix_stride % 4) != 0) { out.batchable = false; break; }
+            }
+            out.members.push_back(bm);
+        }
+    };
+
+    if (out_push) {
+        const spvc_reflected_resource* plist = nullptr;
+        size_t pcnt = 0;
+        spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &plist, &pcnt);
+        if (pcnt == 1) reflect_block(plist[0], 128, *out_push);
+    }
+    if (dyn_ubos && !dyn_ubos->empty() && out_dyn_ubo) {
+        const spvc_reflected_resource* ulist = nullptr;
+        size_t ucnt = 0;
+        spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ulist, &ucnt);
+        int match_idx = -1, match_cnt = 0;
+        SmDynUboDesc matched_desc{};
+        for (size_t i = 0; i < ucnt; ++i) {
+            uint32_t uset = spvc_compiler_get_decoration(comp, ulist[i].id, SpvDecorationDescriptorSet);
+            uint32_t ubind = spvc_compiler_get_decoration(comp, ulist[i].id, SpvDecorationBinding);
+            for (const auto& du : *dyn_ubos) {
+                if (du.set == uset && du.binding == ubind) {
+                    match_idx = (int)i;
+                    matched_desc = du;
+                    match_cnt++;
+                    break;
+                }
+            }
+        }
+        if (match_cnt == 1 && match_idx >= 0) {
+            reflect_block(ulist[match_idx], 4096, *out_dyn_ubo);
+            out_dyn_ubo->set = matched_desc.set;
+            out_dyn_ubo->binding = matched_desc.binding;
+            out_dyn_ubo->dyn_slot = matched_desc.dyn_slot;
+        }
+    }
 
     const char* compiled = nullptr;
     if (spvc_compiler_compile(comp, &compiled) != SPVC_SUCCESS || !compiled) {
@@ -241,6 +343,139 @@ static bool decompile_spirv(const std::vector<uint32_t>& spv,
     out_glsl = compiled;
     spvc_context_destroy(ctx);
     return true;
+}
+
+static bool rewrite_block_to_ssbo_unpack(std::string& body,
+                                         const ReflectedBlock& blk,
+                                         bool is_push,
+                                         const std::string& struct_name,
+                                         const std::string& buf_var,
+                                         const std::string& base_word_expr,
+                                         std::string& out_init_code) {
+    if (!blk.batchable || blk.members.empty()) return false;
+    size_t main_pos = body.find("void sm_user_fs_main()");
+    size_t search_end = (main_pos == std::string::npos) ? body.size() : main_pos;
+
+    auto has_exact_kv = [](const std::string& hdr, const std::string& key, uint32_t val) -> bool {
+        std::regex re("\\b" + key + "\\s*=\\s*" + std::to_string(val) + "\\b");
+        return std::regex_search(hdr, re);
+    };
+
+    size_t pos = 0;
+    while (pos < search_end) {
+        size_t lp = body.find("layout(", pos);
+        if (lp == std::string::npos || lp >= search_end) return false;
+        size_t rp = body.find(')', lp + 7);
+        if (rp == std::string::npos || rp >= search_end) return false;
+        std::string hdr = body.substr(lp + 7, rp - (lp + 7));
+        bool match = is_push
+            ? (hdr.find("push_constant") != std::string::npos)
+            : (has_exact_kv(hdr, "set", blk.set) && has_exact_kv(hdr, "binding", blk.binding));
+        if (!match) { pos = rp + 1; continue; }
+
+        // Confirm `uniform` follows layout(...) before `{`
+        size_t lb = body.find('{', rp + 1);
+        if (lb == std::string::npos || lb >= search_end) { pos = rp + 1; continue; }
+        std::string between = body.substr(rp + 1, lb - (rp + 1));
+        if (between.find("uniform") == std::string::npos || between.find(';') != std::string::npos) {
+            pos = rp + 1; continue;
+        }
+        size_t rb = body.find('}', lb + 1);
+        if (rb == std::string::npos || rb >= search_end) return false;
+        std::string inner = body.substr(lb + 1, rb - (lb + 1));
+        if (inner.find('{') != std::string::npos) return false; // nested block/struct -> safe fallback
+
+        size_t semi = body.find(';', rb + 1);
+        if (semi == std::string::npos || semi >= search_end) return false;
+        std::string inst = body.substr(rb + 1, semi - (rb + 1));
+        auto trim = [](std::string s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+        };
+        inst = trim(inst);
+        // Reject array of uniform blocks (e.g., `ubo[2]`)
+        if (inst.find('[') != std::string::npos) return false;
+
+        // Parse member statements inside `{ ... }` and strip `layout(...)` member qualifiers
+        std::vector<std::string> member_names;
+        std::ostringstream clean_inner;
+        size_t mp = 0;
+        while (mp < inner.size()) {
+            size_t ms = inner.find(';', mp);
+            if (ms == std::string::npos) break;
+            std::string stmt = trim(inner.substr(mp, ms - mp));
+            mp = ms + 1;
+            if (stmt.empty()) continue;
+            // Strip any layout(...) qualifiers on member
+            while (true) {
+                size_t mlp = stmt.find("layout(");
+                if (mlp == std::string::npos) break;
+                size_t mrp = stmt.find(')', mlp + 7);
+                if (mrp == std::string::npos) return false;
+                stmt.erase(mlp, mrp - mlp + 1);
+                stmt = trim(stmt);
+            }
+            // Extract member identifier (token immediately before `[` or end of stmt)
+            size_t br = stmt.find('[');
+            std::string before_br = trim((br == std::string::npos) ? stmt : stmt.substr(0, br));
+            size_t sp = before_br.find_last_of(" \t");
+            if (sp == std::string::npos) return false;
+            std::string mname = trim(before_br.substr(sp + 1));
+            if (mname.empty()) return false;
+            member_names.push_back(mname);
+            clean_inner << "    " << stmt << ";\n";
+        }
+        if (member_names.size() != blk.members.size()) return false;
+
+        // Replace `layout(...) uniform ... { ... } inst;` with local struct + global variable
+        std::ostringstream repl;
+        if (!inst.empty()) {
+            repl << "struct " << struct_name << " {\n" << clean_inner.str() << "};\n"
+                 << struct_name << " " << inst << ";";
+        } else {
+            repl << clean_inner.str();
+        }
+        body.replace(lp, semi - lp + 1, repl.str());
+
+        // Emit exact word-level SSBO unpack code for main()
+        auto emit_vec = [&](spvc_basetype bt, uint32_t vs, uint32_t woff) -> std::string {
+            auto rd = [&](uint32_t w) {
+                std::string raw = buf_var + "[_b + " + std::to_string(w) + "u]";
+                if (bt == SPVC_BASETYPE_INT32)  return "int(" + raw + ")";
+                if (bt == SPVC_BASETYPE_UINT32) return raw;
+                return "uintBitsToFloat(" + raw + ")";
+            };
+            if (vs == 1) return rd(woff);
+            std::string r = glsl_type_str(bt, vs) + "(";
+            for (uint32_t c = 0; c < vs; ++c) { if (c) r += ", "; r += rd(woff + c); }
+            return r + ")";
+        };
+
+        std::ostringstream init;
+        init << "    {\n        uint _b = " << base_word_expr << ";\n";
+        for (size_t m = 0; m < blk.members.size(); ++m) {
+            const auto& bm = blk.members[m];
+            std::string lhs = inst.empty() ? member_names[m] : (inst + "." + member_names[m]);
+            uint32_t elems = (bm.array_size > 0) ? bm.array_size : 1u;
+            for (uint32_t a = 0; a < elems; ++a) {
+                uint32_t eo = bm.offset + a * bm.array_stride;
+                std::string alhs = (bm.array_size > 0) ? (lhs + "[" + std::to_string(a) + "]") : lhs;
+                if (bm.cols == 1) {
+                    init << "        " << alhs << " = " << emit_vec(bm.basetype, bm.vecsize, eo >> 2) << ";\n";
+                } else {
+                    for (uint32_t c = 0; c < bm.cols; ++c) {
+                        init << "        " << alhs << "[" << c << "] = "
+                             << emit_vec(bm.basetype, bm.vecsize, (eo + c * bm.matrix_stride) >> 2) << ";\n";
+                    }
+                }
+            }
+        }
+        init << "    }\n";
+        out_init_code = init.str();
+        return true;
+    }
+    return false;
 }
 
 static std::string replace_ident(const std::string& src, const std::string& from, const std::string& to) {
@@ -497,21 +732,21 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
         case VK_FORMAT_R32G32B32A32_SFLOAT:
             assign_f4("vec4(" + load_f(0) + ", " + load_f(1) + ", " + load_f(2) + ", " + load_f(3) + ")"); break;
         case VK_FORMAT_R16_SFLOAT:
-            ss << "        uint p16 = (" << load_u_raw(0) << " >> bsh) & 0xFFFFu;\n";
+            ss << "        uint p16 = (" << load_u(0) << ") & 0xFFFFu;\n";
             assign_f4("vec4(unpackHalf2x16(p16).x, 0.0, 0.0, 1.0)"); break;
         case VK_FORMAT_R16G16_SFLOAT:
             assign_f4("vec4(unpackHalf2x16(" + load_u(0) + "), 0.0, 1.0)"); break;
         case VK_FORMAT_R16G16B16A16_SFLOAT:
             assign_f4("vec4(unpackHalf2x16(" + load_u(0) + "), unpackHalf2x16(" + load_u(1) + "))"); break;
         case VK_FORMAT_R16_UNORM:
-            ss << "        uint p16 = (" << load_u_raw(0) << " >> bsh) & 0xFFFFu;\n";
+            ss << "        uint p16 = (" << load_u(0) << ") & 0xFFFFu;\n";
             assign_f4("vec4(float(p16) / 65535.0, 0.0, 0.0, 1.0)"); break;
         case VK_FORMAT_R16G16_UNORM:
             assign_f4("vec4(unpackUnorm2x16(" + load_u(0) + "), 0.0, 1.0)"); break;
         case VK_FORMAT_R16G16B16A16_UNORM:
             assign_f4("vec4(unpackUnorm2x16(" + load_u(0) + "), unpackUnorm2x16(" + load_u(1) + "))"); break;
         case VK_FORMAT_R16_SNORM:
-            ss << "        int s16 = bitfieldExtract(int(" << load_u_raw(0) << "), int(bsh), 16);\n";
+            ss << "        int s16 = bitfieldExtract(int(" << load_u(0) << "), 0, 16);\n";
             assign_f4("vec4(max(float(s16) / 32767.0, -1.0), 0.0, 0.0, 1.0)"); break;
         case VK_FORMAT_R16G16_SNORM:
             assign_f4("vec4(unpackSnorm2x16(" + load_u(0) + "), 0.0, 1.0)"); break;
@@ -559,9 +794,9 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
             ss << "        int pi8 = int(" << load_u(0) << ");\n";
             assign_i4("ivec4(bitfieldExtract(pi8,0,8), bitfieldExtract(pi8,8,8), bitfieldExtract(pi8,16,8), bitfieldExtract(pi8,24,8))"); break;
         case VK_FORMAT_R16_UINT:
-            assign_u4("uvec4((" + load_u_raw(0) + " >> bsh) & 65535u, 0u, 0u, 1u)"); break;
+            assign_u4("uvec4((" + load_u(0) + ") & 65535u, 0u, 0u, 1u)"); break;
         case VK_FORMAT_R16_SINT:
-            assign_i4("ivec4(bitfieldExtract(int(" + load_u_raw(0) + "), int(bsh), 16), 0, 0, 1)"); break;
+            assign_i4("ivec4(bitfieldExtract(int(" + load_u(0) + "), 0, 16), 0, 0, 1)"); break;
         case VK_FORMAT_R16G16_UINT:
             ss << "        uint pu16 = " << load_u(0) << ";\n";
             assign_u4("uvec4(pu16 & 65535u, pu16 >> 16u, 0u, 1u)"); break;
@@ -783,12 +1018,18 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err,
                              bool* out_fs_uses_push,
-                             bool* out_fs_has_discard_or_depth) {
+                             bool* out_fs_has_discard_or_depth,
+                             const std::vector<SmDynUboDesc>* dyn_ubos,
+                             bool* out_fs_batched_push_ok,
+                             SmDynUboDesc* out_batched_dyn_ubo) {
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
-    if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
+    ReflectedBlock push_blk, dyn_ubo_blk;
+    if (!decompile_spirv(in_spv, glsl, inputs, outputs, err, dyn_ubos, &push_blk, &dyn_ubo_blk)) return false;
 
     if (out_fs_uses_push) *out_fs_uses_push = (glsl.find("push_constant") != std::string::npos);
+    if (out_fs_batched_push_ok) *out_fs_batched_push_ok = false;
+    if (out_batched_dyn_ubo) out_batched_dyn_ubo->dyn_slot = 0xFFFFFFFFu;
     bool uses_frag_depth = (glsl.find("gl_FragDepth") != std::string::npos);
 
     std::string user_exts;
@@ -820,6 +1061,21 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     if (out_fs_has_discard_or_depth)
         *out_fs_has_discard_or_depth = (uses_frag_depth || body.find("sm_discarded = true;") != std::string::npos);
     body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_fs_main()");
+
+    // v0.8 Per-Draw Push-Constant & Dynamic-UBO SSBO Cross-Material Uber-Batching Lowering!
+    std::string push_init_code, dyn_ubo_init_code;
+    bool batched_push = rewrite_block_to_ssbo_unpack(
+        body, push_blk, true, "SmBatchPushStruct", "sm_bp_raw",
+        "(sm_fs.batch_push_base + sm_draw_id) * 32u", push_init_code);
+    bool batched_dyn_ubo = rewrite_block_to_ssbo_unpack(
+        body, dyn_ubo_blk, false, "SmBatchDynUboStruct", "sm_dyn_raw",
+        "sm_dyn_off[sm_fs.batch_push_base + sm_draw_id] >> 2u", dyn_ubo_init_code);
+    if (out_fs_batched_push_ok) *out_fs_batched_push_ok = batched_push;
+    if (batched_dyn_ubo && out_batched_dyn_ubo) {
+        out_batched_dyn_ubo->set      = dyn_ubo_blk.set;
+        out_batched_dyn_ubo->binding  = dyn_ubo_blk.binding;
+        out_batched_dyn_ubo->dyn_slot = dyn_ubo_blk.dyn_slot;
+    }
 
     std::ostringstream ss;
     ss << "#version 460\n";
@@ -853,7 +1109,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    uint stencil_front_cfg;\n"
        << "    uint stencil_back_cfg;\n"
        << "    uint stencil_refs;\n"
-       << "    uint tiles_x; uint direct_2d; uint pad2;\n"
+       << "    uint tiles_x; uint direct_2d; uint batch_push_base;\n"
        << "    vec4 blend_const;\n"
        << "    uvec4 rt_fmt[2];\n"
        << "    uvec4 rt_blend_en[2];\n"
@@ -864,8 +1120,16 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    uvec4 rt_dst_alpha[2];\n"
        << "    uvec4 rt_alpha_op[2];\n"
        << "    uvec4 rt_write_mask[2];\n"
+       << "    uvec4 rt_stride[2];\n"
        << "} sm_fs;\n";
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n";
+    if (batched_push)
+        ss << "layout(std430, set = " << sm_set_idx << ", binding = 15) readonly buffer SmBatchPushBuf   { uint sm_bp_raw[]; };\n";
+    if (batched_dyn_ubo) {
+        ss << "layout(std430, set = " << sm_set_idx << ", binding = 16) readonly buffer SmBatchDynUboBuf { uint sm_dyn_raw[]; };\n";
+        ss << "layout(std430, set = " << sm_set_idx << ", binding = 17) readonly buffer SmBatchDynOffBuf { uint sm_dyn_off[]; };\n";
+    }
+    ss << "\n";
 
     ss << "uint sm_u4(uvec4 a[2], uint i) { return a[i >> 2u][i & 3u]; }\n";
     ss << "uint sm_quad_lane;\n";
@@ -1025,16 +1289,17 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
         if (kfc >= 0 && kwm == 0u) return;
 
         ss << "    if ((sm_fs.rt_active_mask & (1u << " << rts << ")) != 0u) {\n";
+        ss << "        uint rpidx = p.y * sm_u4(sm_fs.rt_stride, " << rts << ") + p.x;\n";
         if (kfc == 11 || io.basetype == SPVC_BASETYPE_UINT32 || io.basetype == SPVC_BASETYPE_INT32) {
             std::string first_comp = (io.vecsize == 1) ? io.name : (io.name + ".x");
             if (kfc == 17) {
-                ss << "        { uint sh = (pidx & 3u) << 3u; uint v8 = uint(" << first_comp << ") & 0xFFu; "
-                   << "atomicAnd(" << buf << "[pidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[pidx >> 2u], v8 << sh); }\n";
+                ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(" << first_comp << ") & 0xFFu; "
+                   << "atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
             } else if (kfc == 20) {
-                ss << "        { uint sh = (pidx & 1u) << 4u; uint v16 = uint(" << first_comp << ") & 0xFFFFu; "
-                   << "atomicAnd(" << buf << "[pidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[pidx >> 1u], v16 << sh); }\n";
+                ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = uint(" << first_comp << ") & 0xFFFFu; "
+                   << "atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
             } else {
-                ss << "        " << buf << "[pidx] = uint(" << first_comp << ");\n";
+                ss << "        " << buf << "[rpidx] = uint(" << first_comp << ");\n";
             }
             ss << "    }\n";
             return;
@@ -1050,26 +1315,26 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             bool need_rmw = ben || need_wm;
             if (need_rmw) {
                 ss << "        vec4 dst_c;\n";
-                if (kfc == 4)       ss << "        dst_c = vec4(unpackHalf2x16(" << buf << "[pidx*2u]), unpackHalf2x16(" << buf << "[pidx*2u+1u]));\n";
-                else if (kfc == 10) ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[pidx*2u]), uintBitsToFloat(" << buf << "[pidx*2u+1u]), 0.0, 1.0);\n";
-                else if (kfc == 15) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[pidx*2u]), unpackUnorm2x16(" << buf << "[pidx*2u+1u]));\n";
-                else if (kfc == 16) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[pidx*2u]), unpackSnorm2x16(" << buf << "[pidx*2u+1u]));\n";
-                else if (kfc == 8)  ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[pidx*4u]), uintBitsToFloat(" << buf << "[pidx*4u+1u]), uintBitsToFloat(" << buf << "[pidx*4u+2u]), uintBitsToFloat(" << buf << "[pidx*4u+3u]));\n";
-                else if (kfc == 5)  ss << "        { uint pk = " << buf << "[pidx]; dst_c = vec4(sm_uf11_to_f32(pk&0x7FFu), sm_uf11_to_f32((pk>>11u)&0x7FFu), sm_uf10_to_f32((pk>>22u)&0x3FFu), 1.0); }\n";
-                else if (kfc == 6)  ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[pidx]), 0.0, 0.0, 1.0);\n";
-                else if (kfc == 7)  ss << "        dst_c = vec4(unpackHalf2x16(" << buf << "[pidx]), 0.0, 1.0);\n";
-                else if (kfc == 9)  ss << "        { uint pk = " << buf << "[pidx]; dst_c = vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0); }\n";
-                else if (kfc == 12) ss << "        dst_c = unpackSnorm4x8(" << buf << "[pidx]);\n";
-                else if (kfc == 13) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[pidx]), 0.0, 1.0);\n";
-                else if (kfc == 14) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[pidx]), 0.0, 1.0);\n";
-                else if (kfc == 17) ss << "        { uint b8 = (" << buf << "[pidx >> 2u] >> ((pidx & 3u) << 3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 18) ss << "        { uint w16 = (" << buf << "[pidx >> 1u] >> ((pidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
-                else if (kfc == 19) ss << "        { uint w16 = (" << buf << "[pidx >> 1u] >> ((pidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 20) ss << "        { uint w16 = (" << buf << "[pidx >> 1u] >> ((pidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 1) ss << "        dst_c = unpackUnorm4x8(" << buf << "[pidx]).bgra;\n";
-                else if (kfc == 2) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[pidx]); dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
-                else if (kfc == 3) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[pidx]).bgra; dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
-                else                ss << "        dst_c = unpackUnorm4x8(" << buf << "[pidx]);\n";
+                if (kfc == 4)       ss << "        dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx*2u]), unpackHalf2x16(" << buf << "[rpidx*2u+1u]));\n";
+                else if (kfc == 10) ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*2u]), uintBitsToFloat(" << buf << "[rpidx*2u+1u]), 0.0, 1.0);\n";
+                else if (kfc == 15) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx*2u]), unpackUnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+                else if (kfc == 16) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+                else if (kfc == 8)  ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
+                else if (kfc == 5)  ss << "        { uint pk = " << buf << "[rpidx]; dst_c = vec4(sm_uf11_to_f32(pk&0x7FFu), sm_uf11_to_f32((pk>>11u)&0x7FFu), sm_uf10_to_f32((pk>>22u)&0x3FFu), 1.0); }\n";
+                else if (kfc == 6)  ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx]), 0.0, 0.0, 1.0);\n";
+                else if (kfc == 7)  ss << "        dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
+                else if (kfc == 9)  ss << "        { uint pk = " << buf << "[rpidx]; dst_c = vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0); }\n";
+                else if (kfc == 12) ss << "        dst_c = unpackSnorm4x8(" << buf << "[rpidx]);\n";
+                else if (kfc == 13) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
+                else if (kfc == 14) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
+                else if (kfc == 17) ss << "        { uint b8 = (" << buf << "[rpidx >> 2u] >> ((rpidx & 3u) << 3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 18) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
+                else if (kfc == 19) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 20) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 1) ss << "        dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra;\n";
+                else if (kfc == 2) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[rpidx]); dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
+                else if (kfc == 3) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra; dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
+                else                ss << "        dst_c = unpackUnorm4x8(" << buf << "[rpidx]);\n";
                 if (ben) {
                     ss << "        vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c).rgb;\n";
                     ss << "        vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c).rgb;\n";
@@ -1086,27 +1351,27 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                        << ((kwm & 8u) ? "true" : "false") << "));\n";
                 }
             }
-            if (kfc == 0)      ss << "        " << buf << "[pidx] = packUnorm4x8(clamp(out_c, 0.0, 1.0));\n";
-            else if (kfc == 1) ss << "        " << buf << "[pidx] = packUnorm4x8(clamp(out_c, 0.0, 1.0).bgra);\n";
-            else if (kfc == 2) ss << "        { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b)); " << buf << "[pidx] = packUnorm4x8(c); }\n";
-            else if (kfc == 3) ss << "        { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b)); " << buf << "[pidx] = packUnorm4x8(c.bgra); }\n";
-            else if (kfc == 4) ss << "        { vec4 s16 = sm_safe_f16(out_c); " << buf << "[pidx*2u] = packHalf2x16(s16.rg); " << buf << "[pidx*2u+1u] = packHalf2x16(s16.ba); }\n";
-            else if (kfc == 5) ss << "        " << buf << "[pidx] = sm_f32_to_uf11(out_c.r) | (sm_f32_to_uf11(out_c.g) << 11u) | (sm_f32_to_uf10(out_c.b) << 22u);\n";
-            else if (kfc == 6) ss << "        " << buf << "[pidx] = floatBitsToUint(isnan(out_c.r) ? 0.0 : out_c.r);\n";
-            else if (kfc == 7) ss << "        " << buf << "[pidx] = packHalf2x16(sm_safe_f16(out_c).rg);\n";
-            else if (kfc == 8) ss << "        " << buf << "[pidx*4u]=floatBitsToUint(out_c.r); " << buf << "[pidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[pidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[pidx*4u+3u]=floatBitsToUint(out_c.a);\n";
-            else if (kfc == 9) ss << "        { vec4 cl = clamp(out_c, 0.0, 1.0); " << buf << "[pidx] = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u); }\n";
-            else if (kfc == 10) ss << "        " << buf << "[pidx*2u] = floatBitsToUint(out_c.r); " << buf << "[pidx*2u+1u] = floatBitsToUint(out_c.g);\n";
-            else if (kfc == 11) ss << "        " << buf << "[pidx] = uint(out_c.r);\n";
-            else if (kfc == 12) ss << "        " << buf << "[pidx] = packSnorm4x8(clamp(out_c, -1.0, 1.0));\n";
-            else if (kfc == 13) ss << "        " << buf << "[pidx] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0));\n";
-            else if (kfc == 14) ss << "        " << buf << "[pidx] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0));\n";
-            else if (kfc == 15) ss << "        " << buf << "[pidx*2u] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0)); " << buf << "[pidx*2u+1u] = packUnorm2x16(clamp(out_c.ba, 0.0, 1.0));\n";
-            else if (kfc == 16) ss << "        " << buf << "[pidx*2u] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0)); " << buf << "[pidx*2u+1u] = packSnorm2x16(clamp(out_c.ba, -1.0, 1.0));\n";
-            else if (kfc == 17) ss << "        { uint sh = (pidx & 3u) << 3u; uint v8 = uint(round(clamp(out_c.r, 0.0, 1.0) * 255.0)) & 0xFFu; atomicAnd(" << buf << "[pidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[pidx >> 2u], v8 << sh); }\n";
-            else if (kfc == 18) ss << "        { uint sh = (pidx & 1u) << 4u; uint v16 = (uint(round(clamp(out_c.r, 0.0, 1.0)*255.0))&0xFFu) | ((uint(round(clamp(out_c.g, 0.0, 1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[pidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[pidx >> 1u], v16 << sh); }\n";
-            else if (kfc == 19) ss << "        { uint sh = (pidx & 1u) << 4u; uint v16 = packHalf2x16(vec2(sm_safe_f16(out_c).r, 0.0)) & 0xFFFFu; atomicAnd(" << buf << "[pidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[pidx >> 1u], v16 << sh); }\n";
-            else if (kfc == 20) ss << "        { uint sh = (pidx & 1u) << 4u; uint v16 = uint(round(clamp(out_c.r, 0.0, 1.0) * 65535.0)) & 0xFFFFu; atomicAnd(" << buf << "[pidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[pidx >> 1u], v16 << sh); }\n";
+            if (kfc == 0)      ss << "        " << buf << "[rpidx] = packUnorm4x8(clamp(out_c, 0.0, 1.0));\n";
+            else if (kfc == 1) ss << "        " << buf << "[rpidx] = packUnorm4x8(clamp(out_c, 0.0, 1.0).bgra);\n";
+            else if (kfc == 2) ss << "        { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b)); " << buf << "[rpidx] = packUnorm4x8(c); }\n";
+            else if (kfc == 3) ss << "        { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b)); " << buf << "[rpidx] = packUnorm4x8(c.bgra); }\n";
+            else if (kfc == 4) ss << "        { vec4 s16 = sm_safe_f16(out_c); " << buf << "[rpidx*2u] = packHalf2x16(s16.rg); " << buf << "[rpidx*2u+1u] = packHalf2x16(s16.ba); }\n";
+            else if (kfc == 5) ss << "        " << buf << "[rpidx] = sm_f32_to_uf11(out_c.r) | (sm_f32_to_uf11(out_c.g) << 11u) | (sm_f32_to_uf10(out_c.b) << 22u);\n";
+            else if (kfc == 6) ss << "        " << buf << "[rpidx] = floatBitsToUint(isnan(out_c.r) ? 0.0 : out_c.r);\n";
+            else if (kfc == 7) ss << "        " << buf << "[rpidx] = packHalf2x16(sm_safe_f16(out_c).rg);\n";
+            else if (kfc == 8) ss << "        " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a);\n";
+            else if (kfc == 9) ss << "        { vec4 cl = clamp(out_c, 0.0, 1.0); " << buf << "[rpidx] = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u); }\n";
+            else if (kfc == 10) ss << "        " << buf << "[rpidx*2u] = floatBitsToUint(out_c.r); " << buf << "[rpidx*2u+1u] = floatBitsToUint(out_c.g);\n";
+            else if (kfc == 11) ss << "        " << buf << "[rpidx] = uint(out_c.r);\n";
+            else if (kfc == 12) ss << "        " << buf << "[rpidx] = packSnorm4x8(clamp(out_c, -1.0, 1.0));\n";
+            else if (kfc == 13) ss << "        " << buf << "[rpidx] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0));\n";
+            else if (kfc == 14) ss << "        " << buf << "[rpidx] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0));\n";
+            else if (kfc == 15) ss << "        " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba, 0.0, 1.0));\n";
+            else if (kfc == 16) ss << "        " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba, -1.0, 1.0));\n";
+            else if (kfc == 17) ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(round(clamp(out_c.r, 0.0, 1.0) * 255.0)) & 0xFFu; atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
+            else if (kfc == 18) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = (uint(round(clamp(out_c.r, 0.0, 1.0)*255.0))&0xFFu) | ((uint(round(clamp(out_c.g, 0.0, 1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
+            else if (kfc == 19) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = packHalf2x16(vec2(sm_safe_f16(out_c).r, 0.0)) & 0xFFFFu; atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
+            else if (kfc == 20) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = uint(round(clamp(out_c.r, 0.0, 1.0) * 65535.0)) & 0xFFFFu; atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
         } else {
             ss << "        uint fc = sm_u4(sm_fs.rt_fmt, " << rts << ");\n";
             ss << "        uint wm = sm_u4(sm_fs.rt_write_mask, " << rts << ") & 0xFu;\n";
@@ -1114,16 +1379,16 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             ss << "            bool do_bl = (sm_u4(sm_fs.rt_blend_en, " << rts << ") != 0u);\n";
             ss << "            if (do_bl || wm != 0xFu) {\n";
             ss << "                vec4 dst_c;\n";
-            ss << "                if (fc == 4u)       dst_c = vec4(unpackHalf2x16(" << buf << "[pidx*2u]), unpackHalf2x16(" << buf << "[pidx*2u+1u]));\n";
-            ss << "                else if (fc == 10u) dst_c = vec4(uintBitsToFloat(" << buf << "[pidx*2u]), uintBitsToFloat(" << buf << "[pidx*2u+1u]), 0.0, 1.0);\n";
-            ss << "                else if (fc == 15u) dst_c = vec4(unpackUnorm2x16(" << buf << "[pidx*2u]), unpackUnorm2x16(" << buf << "[pidx*2u+1u]));\n";
-            ss << "                else if (fc == 16u) dst_c = vec4(unpackSnorm2x16(" << buf << "[pidx*2u]), unpackSnorm2x16(" << buf << "[pidx*2u+1u]));\n";
-            ss << "                else if (fc == 8u)  dst_c = vec4(uintBitsToFloat(" << buf << "[pidx*4u]), uintBitsToFloat(" << buf << "[pidx*4u+1u]), uintBitsToFloat(" << buf << "[pidx*4u+2u]), uintBitsToFloat(" << buf << "[pidx*4u+3u]));\n";
-            ss << "                else if (fc == 17u) { uint b8 = (" << buf << "[pidx>>2u] >> ((pidx&3u)<<3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 18u) { uint w16 = (" << buf << "[pidx>>1u] >> ((pidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 19u) { uint w16 = (" << buf << "[pidx>>1u] >> ((pidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 20u) { uint w16 = (" << buf << "[pidx>>1u] >> ((pidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
-            ss << "                else dst_c = sm_unpack_u32_fmt(" << buf << "[pidx], fc);\n";
+            ss << "                if (fc == 4u)       dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx*2u]), unpackHalf2x16(" << buf << "[rpidx*2u+1u]));\n";
+            ss << "                else if (fc == 10u) dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*2u]), uintBitsToFloat(" << buf << "[rpidx*2u+1u]), 0.0, 1.0);\n";
+            ss << "                else if (fc == 15u) dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx*2u]), unpackUnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+            ss << "                else if (fc == 16u) dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+            ss << "                else if (fc == 8u)  dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
+            ss << "                else if (fc == 17u) { uint b8 = (" << buf << "[rpidx>>2u] >> ((rpidx&3u)<<3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
+            ss << "                else if (fc == 18u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
+            ss << "                else if (fc == 19u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
+            ss << "                else if (fc == 20u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
+            ss << "                else dst_c = sm_unpack_u32_fmt(" << buf << "[rpidx], fc);\n";
             if (ben) {
                 ss << "                if (do_bl) {\n";
                 ss << "                    vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c).rgb;\n";
@@ -1136,16 +1401,16 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             }
             ss << "                if (wm != 0xFu) out_c = mix(dst_c, out_c, bvec4((wm&1u)!=0u, (wm&2u)!=0u, (wm&4u)!=0u, (wm&8u)!=0u));\n";
             ss << "            }\n";
-            ss << "            if (fc == 4u)       { vec4 s16 = sm_safe_f16(out_c); " << buf << "[pidx*2u] = packHalf2x16(s16.rg); " << buf << "[pidx*2u+1u] = packHalf2x16(s16.ba); }\n";
-            ss << "            else if (fc == 10u) { " << buf << "[pidx*2u] = floatBitsToUint(out_c.r); " << buf << "[pidx*2u+1u] = floatBitsToUint(out_c.g); }\n";
-            ss << "            else if (fc == 15u) { " << buf << "[pidx*2u] = packUnorm2x16(clamp(out_c.rg,0.0,1.0)); " << buf << "[pidx*2u+1u] = packUnorm2x16(clamp(out_c.ba,0.0,1.0)); }\n";
-            ss << "            else if (fc == 16u) { " << buf << "[pidx*2u] = packSnorm2x16(clamp(out_c.rg,-1.0,1.0)); " << buf << "[pidx*2u+1u] = packSnorm2x16(clamp(out_c.ba,-1.0,1.0)); }\n";
-            ss << "            else if (fc == 8u)  { " << buf << "[pidx*4u]=floatBitsToUint(out_c.r); " << buf << "[pidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[pidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[pidx*4u+3u]=floatBitsToUint(out_c.a); }\n";
-            ss << "            else if (fc == 17u) { uint sh=(pidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; atomicAnd(" << buf << "[pidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[pidx>>2u], v8<<sh); }\n";
-            ss << "            else if (fc == 18u) { uint sh=(pidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
-            ss << "            else if (fc == 19u) { uint sh=(pidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
-            ss << "            else if (fc == 20u) { uint sh=(pidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
-            ss << "            else { " << buf << "[pidx] = sm_pack_u32_fmt(out_c, fc); }\n";
+            ss << "            if (fc == 4u)       { vec4 s16 = sm_safe_f16(out_c); " << buf << "[rpidx*2u] = packHalf2x16(s16.rg); " << buf << "[rpidx*2u+1u] = packHalf2x16(s16.ba); }\n";
+            ss << "            else if (fc == 10u) { " << buf << "[rpidx*2u] = floatBitsToUint(out_c.r); " << buf << "[rpidx*2u+1u] = floatBitsToUint(out_c.g); }\n";
+            ss << "            else if (fc == 15u) { " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg,0.0,1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba,0.0,1.0)); }\n";
+            ss << "            else if (fc == 16u) { " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg,-1.0,1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba,-1.0,1.0)); }\n";
+            ss << "            else if (fc == 8u)  { " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a); }\n";
+            ss << "            else if (fc == 17u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
+            ss << "            else if (fc == 18u) { uint sh=(rpidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "            else if (fc == 19u) { uint sh=(rpidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "            else if (fc == 20u) { uint sh=(rpidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "            else { " << buf << "[rpidx] = sm_pack_u32_fmt(out_c, fc); }\n";
             ss << "        }\n";
         }
         ss << "    }\n";
@@ -1178,15 +1443,16 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "        bool any_ov = false;\n";
     ss << "        for (uint k = 0u; k < ntri; ++k) {\n";
     ss << "            SmTriSetup qt = sm_tris[k];\n";
-    ss << "            if (!(tx1 <= qt.area.y || tx0 > qt.area.w + 1.0 || ty1 <= qt.area.z || ty0 > float(qt.idx.w & 0x7FFFFFFFu) + 1.0)) { any_ov = true; break; }\n";
+    ss << "            if (!(tx1 <= qt.area.y || tx0 > qt.area.w + 1.0 || ty1 <= qt.area.z || ty0 > float(qt.idx.w & 0xFFFFu) + 1.0)) { any_ov = true; break; }\n";
     ss << "        }\n";
     ss << "        if (!any_ov) return;\n";
     ss << "        float qfx = float(p.x) + 0.5, qfy = float(p.y) + 0.5;\n";
     ss << "        my_tri = 0xFFFFFFFFu;\n";
     ss << "        if (in_bounds) {\n";
+    ss << "            uint best_ord = 0u;\n";
     ss << "            for (uint k = 0u; k < ntri; ++k) {\n";
     ss << "                SmTriSetup qt = sm_tris[k];\n";
-    ss << "                if (qfx < qt.area.y || qfx > qt.area.w + 1.0 || qfy < qt.area.z || qfy > float(qt.idx.w & 0x7FFFFFFFu) + 1.0) continue;\n";
+    ss << "                if (qfx < qt.area.y || qfx > qt.area.w + 1.0 || qfy < qt.area.z || qfy > float(qt.idx.w & 0xFFFFu) + 1.0) continue;\n";
     ss << "                vec2 a0 = qt.v0.xy, a1 = qt.v1.xy, a2 = qt.v2.xy;\n";
     ss << "                float e0 = sm_edge_eval(a1, a2, qfx, qfy);\n";
     ss << "                float e1 = sm_edge_eval(a2, a0, qfx, qfy);\n";
@@ -1194,8 +1460,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "                if ((sm_is_top_left(a2 - a1) ? (e0 < 0.0) : (e0 <= 0.0)) ||\n";
     ss << "                    (sm_is_top_left(a0 - a2) ? (e1 < 0.0) : (e1 <= 0.0)) ||\n";
     ss << "                    (sm_is_top_left(a1 - a0) ? (e2 < 0.0) : (e2 <= 0.0))) continue;\n";
-    ss << "                my_tri = k;\n";
-    ss << "                break;\n";
+    ss << "                uint ord = ((qt.idx.w >> 24u) & 0x7Fu) + 1u;\n";
+    ss << "                if (ord >= best_ord) { best_ord = ord; my_tri = k; }\n";
     ss << "            }\n";
     ss << "        }\n";
     ss << "        active_px = (my_tri != 0xFFFFFFFFu);\n";
@@ -1222,6 +1488,9 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    if (eff_tri == 0xFFFFFFFFu) return;\n\n";
 
     ss << "    SmTriSetup ts = sm_tris[eff_tri];\n";
+    ss << "    uint sm_draw_id = (ts.idx.w >> 16u) & 0xFFu;\n";
+    if (batched_push)    ss << push_init_code;
+    if (batched_dyn_ubo) ss << dyn_ubo_init_code;
     ss << "    sm_gl_PrimitiveID = int(eff_tri);\n";
     ss << "    sm_gl_FrontFacing = (ts.idx.w & 0x80000000u) != 0u;\n";
     ss << "    float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n";
@@ -1260,6 +1529,13 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                 ss << "        " << dst_var << " = floatBitsToInt(sm_clip_verts[vi0 + " << off << "u]" << s << ");\n";
             } else if (io.basetype == SPVC_BASETYPE_UINT32) {
                 ss << "        " << dst_var << " = floatBitsToUint(sm_clip_verts[vi0 + " << off << "u]" << s << ");\n";
+            } else if (io.is_flat) {
+                ss << "        " << dst_var << " = sm_clip_verts[vi0 + " << off << "u]" << s << ";\n";
+            } else if (io.is_noperspective) {
+                ss << "        vec4 interp = sm_clip_verts[vi0 + " << off << "u] * l0 + "
+                   << "sm_clip_verts[vi1 + " << off << "u] * l1 + "
+                   << "sm_clip_verts[vi2 + " << off << "u] * l2;\n";
+                ss << "        " << dst_var << " = interp" << s << ";\n";
             } else {
                 ss << "        vec4 interp = sm_clip_verts[vi0 + " << off << "u] * b0 + "
                    << "sm_clip_verts[vi1 + " << off << "u] * b1 + "
