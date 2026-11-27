@@ -5,7 +5,7 @@ GLSLANG := glslangValidator
 
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/libvulkan_smrast.so
-SHADERS := $(BUILD_DIR)/smrast_clear.comp.spv $(BUILD_DIR)/smrast_bin.comp.spv $(BUILD_DIR)/smrast_fine.comp.spv $(BUILD_DIR)/smrast_indirect_prep.comp.spv
+SHADERS := $(BUILD_DIR)/smrast_clear.comp.spv $(BUILD_DIR)/smrast_bin.comp.spv $(BUILD_DIR)/smrast_fine.comp.spv $(BUILD_DIR)/smrast_indirect_prep.comp.spv $(BUILD_DIR)/smrast_depth_only.comp.spv $(BUILD_DIR)/smrast_blit.comp.spv
 SRCS := src/smrast_icd.cpp src/smrast_raster_engine.cpp src/spirv_lower.cpp src/smrast_wsi.cpp
 OBJS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 

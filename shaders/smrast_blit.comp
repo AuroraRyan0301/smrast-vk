@@ -1,0 +1,81 @@
+#version 460
+// smrast_blit.comp — SmRast-VK v0.3: Pure-Compute Scaled Image Blit (vkCmdBlitImage on H20 qf[2]!)
+// Supports RGBA8/BGRA8/sRGB/RGBA16F/R11G11B10F/R32F/RG16F/RGBA32F/RGB10A2/RG32F + bilinear filtering.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer SrcBuf  { uint src_px[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer DstBuf { uint dst_px[]; };
+
+layout(push_constant) uniform BlitPC {
+    uint src_w, src_h, dst_w, dst_h;
+    int  sx0, sy0, sx1, sy1;
+    int  dx0, dy0, dx1, dy1;
+    uint src_fc, dst_fc, linear_filter, pad;
+} pc;
+
+float sm_uf11_to_f32(uint v) { uint e = (v >> 6u) & 31u; uint m = v & 63u; if (e == 0u) return 0.0; return uintBitsToFloat(((e + 112u) << 23u) | (m << 17u)); }
+float sm_uf10_to_f32(uint v) { uint e = (v >> 5u) & 31u; uint m = v & 31u; if (e == 0u) return 0.0; return uintBitsToFloat(((e + 112u) << 23u) | (m << 18u)); }
+uint sm_f32_to_uf11(float v) { uint u = floatBitsToUint(max(v, 0.0)); uint e = (u >> 23u) & 255u; if (e < 112u) return 0u; if (e >= 143u) return 0x7FFu; return ((e - 112u) << 6u) | ((u >> 17u) & 63u); }
+uint sm_f32_to_uf10(float v) { uint u = floatBitsToUint(max(v, 0.0)); uint e = (u >> 23u) & 255u; if (e < 112u) return 0u; if (e >= 143u) return 0x3FFu; return ((e - 112u) << 5u) | ((u >> 18u) & 31u); }
+float sm_lin_to_srgb(float x) { return (x <= 0.0031308) ? (x * 12.92) : (1.055 * pow(max(x, 0.0), 1.0/2.4) - 0.055); }
+float sm_srgb_to_lin(float x) { return (x <= 0.04045) ? (x / 12.92) : pow((x + 0.055) / 1.055, 2.4); }
+
+vec4 load_src(int x, int y) {
+    x = clamp(x, 0, int(pc.src_w) - 1);
+    y = clamp(y, 0, int(pc.src_h) - 1);
+    uint idx = uint(y) * pc.src_w + uint(x);
+    uint fc = pc.src_fc;
+    if (fc == 4u)  return vec4(unpackHalf2x16(src_px[idx*2u]), unpackHalf2x16(src_px[idx*2u+1u]));
+    if (fc == 10u) return vec4(uintBitsToFloat(src_px[idx*2u]), uintBitsToFloat(src_px[idx*2u+1u]), 0.0, 1.0);
+    if (fc == 8u)  return vec4(uintBitsToFloat(src_px[idx*4u]), uintBitsToFloat(src_px[idx*4u+1u]), uintBitsToFloat(src_px[idx*4u+2u]), uintBitsToFloat(src_px[idx*4u+3u]));
+    uint pk = src_px[idx];
+    if (fc == 5u) return vec4(sm_uf11_to_f32(pk & 0x7FFu), sm_uf11_to_f32((pk>>11u) & 0x7FFu), sm_uf10_to_f32((pk>>22u) & 0x3FFu), 1.0);
+    if (fc == 6u) return vec4(uintBitsToFloat(pk), 0.0, 0.0, 1.0);
+    if (fc == 7u) return vec4(unpackHalf2x16(pk), 0.0, 1.0);
+    if (fc == 9u) return vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0);
+    vec4 c = unpackUnorm4x8(pk);
+    if (fc == 1u || fc == 3u) c = c.bgra;
+    if (fc == 2u || fc == 3u) c.rgb = vec3(sm_srgb_to_lin(c.r), sm_srgb_to_lin(c.g), sm_srgb_to_lin(c.b));
+    return c;
+}
+
+void store_dst(uint idx, vec4 c) {
+    uint fc = pc.dst_fc;
+    if (fc == 4u) { dst_px[idx*2u] = packHalf2x16(c.rg); dst_px[idx*2u+1u] = packHalf2x16(c.ba); return; }
+    if (fc == 10u) { dst_px[idx*2u] = floatBitsToUint(c.r); dst_px[idx*2u+1u] = floatBitsToUint(c.g); return; }
+    if (fc == 8u) { dst_px[idx*4u]=floatBitsToUint(c.r); dst_px[idx*4u+1u]=floatBitsToUint(c.g); dst_px[idx*4u+2u]=floatBitsToUint(c.b); dst_px[idx*4u+3u]=floatBitsToUint(c.a); return; }
+    if (fc == 5u) { dst_px[idx] = sm_f32_to_uf11(c.r) | (sm_f32_to_uf11(c.g) << 11u) | (sm_f32_to_uf10(c.b) << 22u); return; }
+    if (fc == 6u) { dst_px[idx] = floatBitsToUint(c.r); return; }
+    if (fc == 7u) { dst_px[idx] = packHalf2x16(c.rg); return; }
+    if (fc == 9u) { vec4 cl = clamp(c, 0.0, 1.0); dst_px[idx] = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u); return; }
+    c = clamp(c, 0.0, 1.0);
+    if (fc == 2u || fc == 3u) c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b));
+    if (fc == 1u || fc == 3u) c = c.bgra;
+    dst_px[idx] = packUnorm4x8(c);
+}
+
+void main() {
+    int dw = abs(pc.dx1 - pc.dx0);
+    int dh = abs(pc.dy1 - pc.dy0);
+    if (int(gl_GlobalInvocationID.x) >= dw || int(gl_GlobalInvocationID.y) >= dh) return;
+    int px = min(pc.dx0, pc.dx1) + int(gl_GlobalInvocationID.x);
+    int py = min(pc.dy0, pc.dy1) + int(gl_GlobalInvocationID.y);
+    if (px < 0 || py < 0 || uint(px) >= pc.dst_w || uint(py) >= pc.dst_h) return;
+
+    float u = (float(px - pc.dx0) + 0.5) / float(pc.dx1 - pc.dx0);
+    float v = (float(py - pc.dy0) + 0.5) / float(pc.dy1 - pc.dy0);
+    float fx = float(pc.sx0) + u * float(pc.sx1 - pc.sx0) - 0.5;
+    float fy = float(pc.sy0) + v * float(pc.sy1 - pc.sy0) - 0.5;
+
+    vec4 col;
+    if (pc.linear_filter != 0u) {
+        int x0 = int(floor(fx)), y0 = int(floor(fy));
+        float tx = fx - float(x0), ty = fy - float(y0);
+        vec4 c00 = load_src(x0, y0),     c10 = load_src(x0 + 1, y0);
+        vec4 c01 = load_src(x0, y0 + 1), c11 = load_src(x0 + 1, y0 + 1);
+        col = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    } else {
+        col = load_src(int(round(fx)), int(round(fy)));
+    }
+    store_dst(uint(py) * pc.dst_w + uint(px), col);
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p build
-for s in smrast_clear smrast_bin smrast_fine smrast_indirect_prep; do
+for s in smrast_clear smrast_bin smrast_fine smrast_indirect_prep smrast_depth_only smrast_blit; do
     glslangValidator -V --target-env vulkan1.3 "shaders/${s}.comp" -o "build/${s}.comp.spv"
 done
 g++ -O3 -std=c++17 -fPIC -shared -Wl,--no-undefined \
@@ -21,4 +21,4 @@ if [ -f bench/test_vk13_game_features.cpp ]; then
     done
     g++ -O3 -std=c++17 bench/test_vk13_game_features.cpp -o build/test_vk13_game_features -lvulkan -lm
 fi
-echo "Built SmRast-VK v0.3 (libvulkan_smrast.so + 4 compute shaders + benchmarks) successfully!"
+echo "Built SmRast-VK v0.3 (libvulkan_smrast.so + 6 compute shaders + benchmarks) successfully!"

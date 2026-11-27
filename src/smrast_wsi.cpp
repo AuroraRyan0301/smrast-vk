@@ -88,8 +88,11 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     dev->fn.EndCommandBuffer(sc->present_cmd);
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &sc->present_cmd};
-    dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, VK_NULL_HANDLE);
-    dev->fn.QueueWaitIdle(dev->main_queue->real_q);
+    {
+        std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
+        dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, VK_NULL_HANDLE);
+        dev->fn.QueueWaitIdle(dev->main_queue->real_q);
+    }
 
     const uint8_t* src = (const uint8_t*)img->host_ptr;
     bool need_swap = (sc->format == VK_FORMAT_R8G8B8A8_UNORM || sc->format == VK_FORMAT_R8G8B8A8_SRGB);
@@ -151,4 +154,13 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
         XFlush(surf->xlib_dpy);
     }
     sc->present_frames++;
+    if (sc->present_frames <= 10 || sc->present_frames == 30 || (sc->present_frames % 60) == 0) {
+        const uint32_t* px32 = reinterpret_cast<const uint32_t*>(src);
+        uint32_t mid = px32[(h / 2) * w + (w / 2)];
+        uint32_t nz = 0;
+        for (size_t k = 0; k < (size_t)w * h; k += 37) if ((px32[k] & 0x00FFFFFFu) != 0) nz++;
+        fprintf(stderr, "[SmRast-WSI] Presented frame #%llu (%ux%u, shm=%d, mid=0x%08x, lit_samples=%u)\n",
+                (unsigned long long)sc->present_frames, w, h, sc->use_shm ? 1 : 0, mid, nz);
+        fflush(stderr);
+    }
 }

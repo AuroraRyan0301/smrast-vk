@@ -36,7 +36,8 @@ static constexpr uint32_t SM_MAX_VTX_BINDINGS   = 8;
 // Render-Target Format Encoding shared between Host & Compute Shaders:
 // 0=RGBA8_UNORM, 1=BGRA8_UNORM, 2=RGBA8_SRGB, 3=BGRA8_SRGB,
 // 4=RGBA16_SFLOAT (8B), 5=B10G11R11_UFLOAT (4B), 6=R32_SFLOAT (4B),
-// 7=RG16_SFLOAT (4B), 8=RGBA32_SFLOAT (16B), 9=A2B10G10R10_UNORM (4B), 10=RG32_SFLOAT (8B)
+// 7=RG16_SFLOAT (4B), 8=RGBA32_SFLOAT (16B), 9=A2B10G10R10_UNORM (4B),
+// 10=RG32_SFLOAT (8B), 11=R32_UINT/SINT (4B)
 static inline uint32_t sm_format_code(VkFormat f) {
     switch (f) {
         case VK_FORMAT_B8G8R8A8_UNORM:          return 1u;
@@ -49,6 +50,8 @@ static inline uint32_t sm_format_code(VkFormat f) {
         case VK_FORMAT_R32G32B32A32_SFLOAT:     return 8u;
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32:return 9u;
         case VK_FORMAT_R32G32_SFLOAT:           return 10u;
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32_SINT:                return 11u;
         default:                                return 0u;
     }
 }
@@ -60,6 +63,24 @@ static inline uint32_t sm_format_u32_stride(VkFormat f) {
 }
 static inline uint32_t sm_format_bpp(VkFormat f) {
     return sm_format_u32_stride(f) * 4u;
+}
+static inline uint32_t sm_format_exact_bpp(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_SRGB:
+            return 1u;
+        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16_SFLOAT:
+        case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16: case VK_FORMAT_D16_UNORM:
+            return 2u;
+        case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT:
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+            return 8u;
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+            return 16u;
+        default:
+            return 4u;
+    }
 }
 
 struct SmInstance;
@@ -94,6 +115,7 @@ struct BackendDevFns {
     PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
     PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
+    PFN_vkQueueSubmit2 QueueSubmit2 = nullptr;
     PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
 
     PFN_vkAllocateMemory AllocateMemory = nullptr;
@@ -206,9 +228,13 @@ struct SmImage {
     VkImage real_img = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent3D extent{1, 1, 1};
+    uint32_t mip_levels = 1;
+    uint32_t array_layers = 1;
     VkImageUsageFlags usage = 0;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool is_swapchain = false;
     bool is_depth = false;
+    bool attach_dirty = false;
     VkBuffer attach_buf = VK_NULL_HANDLE;
     VkDeviceMemory attach_mem = VK_NULL_HANDLE;
     VkBuffer host_buf = VK_NULL_HANDLE;
@@ -220,6 +246,10 @@ struct SmImageView {
     VkImageView real_view = VK_NULL_HANDLE;
     SmImage* image = nullptr;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t base_mip = 0;
+    uint32_t level_count = 1;
+    uint32_t base_layer = 0;
+    uint32_t layer_count = 1;
 };
 
 struct SmRenderPass {
@@ -271,6 +301,7 @@ struct SmPipeline {
     VkBlendFactor src_color_blend[SM_MAX_MRT] = {VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA};
     VkBlendFactor dst_color_blend[SM_MAX_MRT] = {VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA};
     VkBlendOp color_blend_op[SM_MAX_MRT] = {VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD};
+    uint32_t color_write_mask[SM_MAX_MRT] = {0xFu, 0xFu, 0xFu, 0xFu};
     bool has_static_vp = false;
     VkViewport static_vp{};
     bool has_static_scissor = false;
@@ -314,12 +345,14 @@ struct alignas(256) SmVsParamsUBO {
     int32_t  vertex_offset;
     uint32_t vert_stride_vec4;
     uint32_t idx_buf_offset;
-    uint32_t vtx_offsets[4];
-    uint32_t vtx_strides[4];
-    uint32_t verts_per_instance;
-    uint32_t vtx_inst_rate_mask;
+    uint32_t vtx_offsets[4];     // VB 0..3
+    uint32_t vtx_strides[4];     // VB 0..3
+    uint32_t verts_per_instance; // word 16 (patched by smrast_indirect_prep.comp!)
+    uint32_t vtx_inst_rate_mask; // bits 0..7 = instanced VB 0..7
     uint32_t pad0;
     uint32_t pad1;
+    uint32_t vtx_offsets_hi[4];  // VB 4..7
+    uint32_t vtx_strides_hi[4];  // VB 4..7
 };
 
 struct alignas(256) SmFsParamsUBO {
@@ -362,6 +395,14 @@ struct SmRasterEngine {
     VkPipelineLayout ind_prep_pl = VK_NULL_HANDLE;
     VkPipeline ind_prep_pipe = VK_NULL_HANDLE;
 
+    VkDescriptorSetLayout depth_only_dsl = VK_NULL_HANDLE;
+    VkPipelineLayout depth_only_pl = VK_NULL_HANDLE;
+    VkPipeline depth_only_pipe = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout blit_dsl = VK_NULL_HANDLE;
+    VkPipelineLayout blit_pl = VK_NULL_HANDLE;
+    VkPipeline blit_pipe = VK_NULL_HANDLE;
+
     VkDescriptorSetLayout vs_int_dsl = VK_NULL_HANDLE;
     VkDescriptorSetLayout fs_int_dsl = VK_NULL_HANDLE;
 
@@ -376,7 +417,7 @@ struct SmRasterEngine {
     VkBuffer ind_disp_buf = VK_NULL_HANDLE;    VkDeviceMemory ind_disp_mem = VK_NULL_HANDLE;
     VkBuffer dummy_buf = VK_NULL_HANDLE;       VkDeviceMemory dummy_mem = VK_NULL_HANDLE;
 
-    static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 1024;
+    static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 2048;
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
     VkBuffer fs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory fs_ubo_mem = VK_NULL_HANDLE; void* fs_ubo_ptr = nullptr;
     VkBuffer clr_ubo_buf = VK_NULL_HANDLE;     VkDeviceMemory clr_ubo_mem = VK_NULL_HANDLE; void* clr_ubo_ptr = nullptr;
@@ -386,18 +427,22 @@ struct SmRasterEngine {
     std::vector<VkDescriptorSet> bin_ds;
     std::vector<VkDescriptorSet> fine_ds;
     std::vector<VkDescriptorSet> ind_prep_ds;
+    std::vector<VkDescriptorSet> depth_only_ds;
+    std::vector<VkDescriptorSet> blit_ds;
     std::vector<VkDescriptorSet> vs_int_ds;
     std::vector<VkDescriptorSet> fs_int_ds;
     uint32_t draw_cursor = 0;
 
     uint32_t cur_w = 0, cur_h = 0;
     uint32_t tiles_x = 0, tiles_y = 0;
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> retired_bufs;
 };
 
 struct SmQueue {
     VK_LOADER_DATA loader_data;
     SmDevice* dev = nullptr;
     VkQueue real_q = VK_NULL_HANDLE;
+    std::mutex mtx;
 };
 
 struct SmDevice {
@@ -407,6 +452,10 @@ struct SmDevice {
     VkDevice real_dev = VK_NULL_HANDLE;
     SmQueue* main_queue = nullptr;
     SmRasterEngine rast;
+    std::unordered_map<VkDescriptorSetLayout, uint32_t> dsl_dyn_counts;
+    std::vector<SmImage*> storage_images;
+    uint32_t compiled_gfx_pipes = 0;
+    uint32_t failed_gfx_pipes = 0;
     std::mutex mtx;
 };
 
@@ -420,8 +469,11 @@ struct SmCommandBuffer {
     SmRenderPass* cur_rp = nullptr;
     SmFramebuffer* cur_fb = nullptr;
     SmImage* dyn_col_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    SmImageView* dyn_col_views[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    SmImage* dyn_res_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
     uint32_t dyn_col_count = 0;
     SmImage* dyn_dep_img = nullptr;
+    SmImageView* dyn_dep_view = nullptr;
     uint32_t dyn_w = 0, dyn_h = 0;
     SmPipeline* cur_gfx_pipe = nullptr;
     SmPipeline* cur_comp_pipe = nullptr;
@@ -438,12 +490,22 @@ struct SmCommandBuffer {
     bool has_dyn_depth_write = false; bool dyn_depth_write = false;
     bool has_dyn_depth_op = false;    VkCompareOp dyn_depth_op = VK_COMPARE_OP_LESS;
 
+    static constexpr uint32_t MAX_DYN_OFFS_PER_SET = 32;
     VkDescriptorSet gfx_sets[16] = {VK_NULL_HANDLE};
     uint32_t gfx_set_mask = 0;
     uint32_t gfx_dyn_counts[16] = {0};
-    uint32_t gfx_dyn_offs[16][8] = {{0}};
+    uint32_t gfx_dyn_offs[16][MAX_DYN_OFFS_PER_SET] = {{0}};
     uint8_t push_data[256] = {0};
     uint32_t push_size = 0;
+
+    // App Compute state mirror (restored before vkCmdDispatch if internal rasterizer passes clobbered COMPUTE bind point!)
+    VkDescriptorSet comp_sets[16] = {VK_NULL_HANDLE};
+    uint32_t comp_set_mask = 0;
+    uint32_t comp_dyn_counts[16] = {0};
+    uint32_t comp_dyn_offs[16][MAX_DYN_OFFS_PER_SET] = {{0}};
+    uint8_t comp_push_data[256] = {0};
+    uint32_t comp_push_size = 0;
+    bool comp_state_dirty = false;
 
     SmBuffer* vtx_bufs[SM_MAX_VTX_BINDINGS] = {nullptr};
     VkDeviceSize vtx_offsets[SM_MAX_VTX_BINDINGS] = {0};
@@ -468,9 +530,15 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            std::vector<uint32_t>& out_comp_spv,
                            std::string& err);
 
+struct SmFsCompileHints {
+    int  rt_fmt[SM_MAX_MRT]   = {-1, -1, -1, -1}; // -1 = dynamic via UBO, >=0 = exact sm_format_code()
+    bool blend_en[SM_MAX_MRT] = {true, true, true, true};
+};
+
 bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              const VkSpecializationInfo* spec,
                              uint32_t sm_set_idx,
+                             const SmFsCompileHints& hints,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err);
 

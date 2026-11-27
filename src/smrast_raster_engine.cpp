@@ -69,11 +69,11 @@ bool sm_ensure_geom_capacity(SmDevice* dev, uint32_t need_verts, uint32_t need_t
     if (nt > SM_MAX_DRAW_TRIS)  nt = SM_MAX_TRIS_PER_DRAW;
 
     if (R.clip_vert_buf) {
-        dev->fn.DeviceWaitIdle(dev->real_dev);
-        dev->fn.DestroyBuffer(dev->real_dev, R.clip_vert_buf, nullptr);
-        dev->fn.FreeMemory(dev->real_dev, R.clip_vert_mem, nullptr);
-        dev->fn.DestroyBuffer(dev->real_dev, R.tri_setup_buf, nullptr);
-        dev->fn.FreeMemory(dev->real_dev, R.tri_setup_mem, nullptr);
+        // Retire old buffers safely without destroying them while recorded command buffers may still reference them!
+        R.retired_bufs.push_back({R.clip_vert_buf, R.clip_vert_mem});
+        R.retired_bufs.push_back({R.tri_setup_buf, R.tri_setup_mem});
+        R.clip_vert_buf = VK_NULL_HANDLE; R.clip_vert_mem = VK_NULL_HANDLE;
+        R.tri_setup_buf = VK_NULL_HANDLE; R.tri_setup_mem = VK_NULL_HANDLE;
     }
     VkBufferUsageFlags ssbo_u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!create_buf(dev, (VkDeviceSize)nv * SM_VERT_STRIDE_VEC4 * 16, ssbo_u,
@@ -147,11 +147,29 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.ind_prep_pl);
     }
     {
-        // VS internal set: 0=ClipVert, 1=IdxBuf, 2..5=VB0..3, 6=VsParamsUBO
-        VkDescriptorSetLayoutBinding b[7];
-        for (uint32_t i = 0; i < 6; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[6] = {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 7, b};
+        VkDescriptorSetLayoutBinding b[3];
+        for (uint32_t i = 0; i < 3; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 3, b};
+        dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.depth_only_dsl);
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.depth_only_dsl, 1, &pcr};
+        dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.depth_only_pl);
+    }
+    {
+        VkDescriptorSetLayoutBinding b[2];
+        for (uint32_t i = 0; i < 2; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 2, b};
+        dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.blit_dsl);
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.blit_dsl, 1, &pcr};
+        dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.blit_pl);
+    }
+    {
+        // VS internal set: 0=ClipVert, 1=IdxBuf, 2..9=VB0..VB7, 10=VsParamsUBO
+        VkDescriptorSetLayoutBinding b[11];
+        for (uint32_t i = 0; i < 10; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[10] = {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 11, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.vs_int_dsl);
     }
     {
@@ -164,19 +182,23 @@ bool sm_init_raster_engine(SmDevice* dev) {
     }
 
     // 2. Load compiled internal Compute Rasterizer SPIR-V shaders onto H20 qf[2]
-    char p_clear[512], p_bin[512], p_fine[512], p_ind[512];
+    char p_clear[512], p_bin[512], p_fine[512], p_ind[512], p_dep[512], p_blit[512];
     snprintf(p_clear, sizeof(p_clear), "%s/smrast_clear.comp.spv", shader_dir);
     snprintf(p_bin,   sizeof(p_bin),   "%s/smrast_bin.comp.spv",   shader_dir);
     snprintf(p_fine,  sizeof(p_fine),  "%s/smrast_fine.comp.spv",  shader_dir);
     snprintf(p_ind,   sizeof(p_ind),   "%s/smrast_indirect_prep.comp.spv", shader_dir);
-    R.clear_pipe    = make_internal_pipe(dev, p_clear, R.clear_pl);
-    R.bin_pipe      = make_internal_pipe(dev, p_bin,   R.bin_pl);
-    R.fine_pipe     = make_internal_pipe(dev, p_fine,  R.fine_pl);
-    R.ind_prep_pipe = make_internal_pipe(dev, p_ind,   R.ind_prep_pl);
-    if (!R.clear_pipe || !R.bin_pipe || !R.fine_pipe || !R.ind_prep_pipe) return false;
+    snprintf(p_dep,   sizeof(p_dep),   "%s/smrast_depth_only.comp.spv", shader_dir);
+    snprintf(p_blit,  sizeof(p_blit),  "%s/smrast_blit.comp.spv",  shader_dir);
+    R.clear_pipe      = make_internal_pipe(dev, p_clear, R.clear_pl);
+    R.bin_pipe        = make_internal_pipe(dev, p_bin,   R.bin_pl);
+    R.fine_pipe       = make_internal_pipe(dev, p_fine,  R.fine_pl);
+    R.ind_prep_pipe   = make_internal_pipe(dev, p_ind,   R.ind_prep_pl);
+    R.depth_only_pipe = make_internal_pipe(dev, p_dep,   R.depth_only_pl);
+    R.blit_pipe       = make_internal_pipe(dev, p_blit,  R.blit_pl);
+    if (!R.clear_pipe || !R.bin_pipe || !R.fine_pipe || !R.ind_prep_pipe || !R.depth_only_pipe || !R.blit_pipe) return false;
 
-    // 3. Fast startup (~10ms!): start with 512K verts + 256K tris, auto-grows to 7M/2.5M on demand!
-    if (!sm_ensure_geom_capacity(dev, 524288, 262144)) return false;
+    // 3. Pre-allocate 2.2M verts + 1.1M tris on H20 HBM3 (~640 MB < 0.7% of 96 GB) so DrawIndirect never reallocs mid-CB!
+    if (!sm_ensure_geom_capacity(dev, 2200000, 1100000)) return false;
 
     VkBufferUsageFlags ssbo_u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!create_buf(dev, 4096, ssbo_u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.dummy_buf, R.dummy_mem)) return false;
@@ -194,10 +216,10 @@ bool sm_init_raster_engine(SmDevice* dev) {
     // 4. Allocate descriptor pool & per-slot ring sets
     uint32_t N = SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
     VkDescriptorPoolSize ps[2] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * (6 + 6 + 5 + 4 + 6 + 8)},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * (6 + 6 + 5 + 4 + 3 + 2 + 10 + 8)},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N * 3},
     };
-    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, N * 6, 2, ps};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, N * 8, 2, ps};
     if (dev->fn.CreateDescriptorPool(dev->real_dev, &dpci, nullptr, &R.desc_pool) != VK_SUCCESS) return false;
 
     auto alloc_ds = [&](VkDescriptorSetLayout dsl) {
@@ -210,15 +232,19 @@ bool sm_init_raster_engine(SmDevice* dev) {
     R.bin_ds.resize(N);
     R.fine_ds.resize(N);
     R.ind_prep_ds.resize(N);
+    R.depth_only_ds.resize(N);
+    R.blit_ds.resize(N);
     R.vs_int_ds.resize(N);
     R.fs_int_ds.resize(N);
     for (uint32_t i = 0; i < N; ++i) {
-        R.clear_ds[i]    = alloc_ds(R.clear_dsl);
-        R.bin_ds[i]      = alloc_ds(R.bin_dsl);
-        R.fine_ds[i]     = alloc_ds(R.fine_dsl);
-        R.ind_prep_ds[i] = alloc_ds(R.ind_prep_dsl);
-        R.vs_int_ds[i]   = alloc_ds(R.vs_int_dsl);
-        R.fs_int_ds[i]   = alloc_ds(R.fs_int_dsl);
+        R.clear_ds[i]      = alloc_ds(R.clear_dsl);
+        R.bin_ds[i]        = alloc_ds(R.bin_dsl);
+        R.fine_ds[i]       = alloc_ds(R.fine_dsl);
+        R.ind_prep_ds[i]   = alloc_ds(R.ind_prep_dsl);
+        R.depth_only_ds[i] = alloc_ds(R.depth_only_dsl);
+        R.blit_ds[i]       = alloc_ds(R.blit_dsl);
+        R.vs_int_ds[i]     = alloc_ds(R.vs_int_dsl);
+        R.fs_int_ds[i]     = alloc_ds(R.fs_int_dsl);
     }
 
     return sm_ensure_vis_size(dev, 1920, 1080);
@@ -234,13 +260,13 @@ bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
     uint32_t num_tiles = tx * ty;
 
     if (R.vis_buf) {
-        dev->fn.DeviceWaitIdle(dev->real_dev);
-        dev->fn.DestroyBuffer(dev->real_dev, R.vis_buf, nullptr);
-        dev->fn.FreeMemory(dev->real_dev, R.vis_mem, nullptr);
-        dev->fn.DestroyBuffer(dev->real_dev, R.tile_count_buf, nullptr);
-        dev->fn.FreeMemory(dev->real_dev, R.tile_count_mem, nullptr);
-        dev->fn.DestroyBuffer(dev->real_dev, R.tile_bins_buf, nullptr);
-        dev->fn.FreeMemory(dev->real_dev, R.tile_bins_mem, nullptr);
+        // Retire safely so in-flight / recorded CBs never hit freed HBM3 pages!
+        R.retired_bufs.push_back({R.vis_buf, R.vis_mem});
+        R.retired_bufs.push_back({R.tile_count_buf, R.tile_count_mem});
+        R.retired_bufs.push_back({R.tile_bins_buf, R.tile_bins_mem});
+        R.vis_buf = VK_NULL_HANDLE; R.vis_mem = VK_NULL_HANDLE;
+        R.tile_count_buf = VK_NULL_HANDLE; R.tile_count_mem = VK_NULL_HANDLE;
+        R.tile_bins_buf = VK_NULL_HANDLE; R.tile_bins_mem = VK_NULL_HANDLE;
     }
 
     VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -259,5 +285,10 @@ void sm_destroy_raster_engine(SmDevice* dev) {
     if (!dev->real_dev) return;
     dev->fn.DeviceWaitIdle(dev->real_dev);
     auto dpipe = [&](VkPipeline& p) { if (p) { dev->fn.DestroyPipeline(dev->real_dev, p, nullptr); p = VK_NULL_HANDLE; } };
-    dpipe(R.clear_pipe); dpipe(R.bin_pipe); dpipe(R.fine_pipe); dpipe(R.ind_prep_pipe);
+    dpipe(R.clear_pipe); dpipe(R.bin_pipe); dpipe(R.fine_pipe); dpipe(R.ind_prep_pipe); dpipe(R.depth_only_pipe); dpipe(R.blit_pipe);
+    for (auto& rb : R.retired_bufs) {
+        if (rb.first)  dev->fn.DestroyBuffer(dev->real_dev, rb.first, nullptr);
+        if (rb.second) dev->fn.FreeMemory(dev->real_dev, rb.second, nullptr);
+    }
+    R.retired_bufs.clear();
 }

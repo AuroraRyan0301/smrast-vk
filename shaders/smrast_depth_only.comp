@@ -1,0 +1,37 @@
+#version 460
+// smrast_depth_only.comp — SmRast-VK v0.3: Zero-Compile-Cost Depth-Only Pass (Shadow Maps / Z-Prepass)
+// Writes winning depth from 64-bit Visibility Buffer -> Depth attachment when a pipeline has VS-only (no FS).
+#extension GL_ARB_gpu_shader_int64 : require
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct SmTriSetup {
+    vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer TriSetupBuf { SmTriSetup sm_tris[]; };
+layout(std430, set = 0, binding = 1) readonly buffer VisBuf      { uint64_t sm_vis_px[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer DepthBuf   { float sm_depth_px[]; };
+
+layout(push_constant) uniform DepthOnlyPC {
+    uint width;
+    uint height;
+    uint depth_write;
+    uint pad;
+} pc;
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height || pc.depth_write == 0u) return;
+    uint pidx = p.y * pc.width + p.x;
+    uint64_t vis = sm_vis_px[pidx];
+    if (vis == 0xFFFFFFFFFFFFFFFFul) return;
+    uint tid = uint(vis & 0xFFFFFFFFul);
+    SmTriSetup ts = sm_tris[tid];
+    float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;
+    vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;
+    float l0 = ((s2.x - s1.x) * (fy - s1.y) - (s2.y - s1.y) * (fx - s1.x)) * ts.area.x;
+    float l1 = ((s0.x - s2.x) * (fy - s2.y) - (s0.y - s2.y) * (fx - s2.x)) * ts.area.x;
+    float l2 = 1.0 - l0 - l1;
+    float pz = clamp(l0 * ts.v0.z + l1 * ts.v1.z + l2 * ts.v2.z, 0.0, 1.0);
+    sm_depth_px[pidx] = pz;
+}
