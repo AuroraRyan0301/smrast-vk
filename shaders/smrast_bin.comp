@@ -1,10 +1,11 @@
 #version 460
-// smrast_bin.comp — SmRast-VK v0.6 (Pure-Triangle Hopper-Optimized Hot Kernel):
-//   - Lean register footprint (lines/points split into smrast_prim_bin.comp for peak Hopper SM occupancy!)
+// smrast_bin.comp — SmRast-VK v0.7 (Pure-Triangle Hopper-Optimized Hot Kernel):
+//   - Cooperative Zero-Atomic Small-Triangle Fast-Path (<=8 tris: 64-way parallel row-major active_tiles, 0 CmdUpdateBuffer, 0 global atomics!)
+//   - Multi-Draw Uber-Batching support (clip_vert_base + tri_setup_base for barrier-free parallel Binning!)
 //   - Hybrid Coherent-2D (giant 1M+ meshes) + GPU Active-Tile Compaction (small/medium draws)
-//   - Coarse Pre-Binning Hi-Z Early-Reject (Standard-Z & Reverse-Z)
-//   - CuRast (<=64 px) 64-bit Atomic Fast-Path + CUDARaster 16x16 Binning + Sutherland-Hodgman Clipping
-//   - Watertight Top-Left Fill-Rule + 4-bit (1/16 px) Subpixel Snapping + DepthBias + DepthClamp + PrimRestart
+//   - Exact 2-Plane Sutherland-Hodgman Clipping (Standard-Z z>=0 AND Reverse-Z z<=w!)
+//   - Coarse Pre-Binning Hi-Z Early-Reject + CuRast (<=64 px) 64-bit Atomic Fast-Path + CUDARaster 16x16 Binning
+//   - Watertight Top-Left Fill-Rule + 4-bit (1/16 px) Subpixel Snapping + DepthBias + DepthClamp + PrimRestart (0x7FC0DEADu)
 #extension GL_ARB_gpu_shader_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 
@@ -38,7 +39,7 @@ layout(push_constant) uniform BinParams {
     uint max_tris_per_tile;
     uint flags; // bit0=cull_back, bit1=cull_front, bit2=front_cw, bit3=depth_test,
                 // bits4..6=depth_op, bits8..10=topo, bit11=depth_clamp, bit12=depth_bias,
-                // bit13=use_prebin_hiz, bit14=has_point_size, bit15=direct_2d
+                // bit13=use_prebin_hiz, bit14=has_point_size, bit15=direct_2d, bit16=small_tri_coop
     float vp_x;
     float vp_y;
     float vp_w;
@@ -57,7 +58,24 @@ layout(push_constant) uniform BinParams {
     float depth_bias_slope;
     float depth_bias_clamp;
     float line_width;
+    uint clip_vert_base;
+    uint tri_setup_base;
 } pc;
+
+// Shared state for 1-workgroup zero-atomic cooperative small-triangle binning (bit 16)
+shared uint s_clip_v;
+shared uint s_clip_t;
+shared uint s_out_n;
+shared uint s_tx0;
+shared uint s_ty0;
+shared uint s_tx1;
+shared uint s_ty1;
+
+// Shared queue for 64-way warp-cooperative large-triangle binning (>32 tiles -> 64x faster on giant triangles!)
+shared uint  s_big_cnt;
+shared uint  s_big_tid[64];
+shared uvec4 s_big_bb[64];
+shared vec2  s_big_z[64];
 
 bool depth_pass(float d, float ref_d, uint op) {
     if (op == 0u) return false;
@@ -112,7 +130,9 @@ void emit_interp_vert(uint dst_idx, uint ia, uint ib, float t) {
 }
 
 void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2) {
-    if (c0.w <= 1e-6 || c1.w <= 1e-6 || c2.w <= 1e-6) return;
+    if (!(c0.w > 1e-6 && c1.w > 1e-6 && c2.w > 1e-6)) return;
+    if (any(isnan(c0)) || any(isnan(c1)) || any(isnan(c2)) ||
+        any(isinf(c0)) || any(isinf(c1)) || any(isinf(c2))) return;
 
     bool depth_clamp = (pc.flags & 2048u) != 0u;
     if ((c0.x < -c0.w && c1.x < -c1.w && c2.x < -c2.w) ||
@@ -137,7 +157,7 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     float z2 = pc.vp_min_d + (c2.z * invw2) * (pc.vp_max_d - pc.vp_min_d);
 
     float area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x);
-    if (abs(area) < 1e-6) return;
+    if (!(abs(area) >= 1e-6)) return;
 
     bool front_cw = (pc.flags & 4u) != 0u;
     bool is_front = front_cw ? (area > 0.0) : (area < 0.0);
@@ -153,10 +173,10 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
         area = -area;
     }
 
-    int minx = max(pc.sc_x0, int(floor(min(s0.x, min(s1.x, s2.x)))));
-    int miny = max(pc.sc_y0, int(floor(min(s0.y, min(s1.y, s2.y)))));
-    int maxx = min(pc.sc_x1 - 1, int(ceil(max(s0.x, max(s1.x, s2.x)))));
-    int maxy = min(pc.sc_y1 - 1, int(ceil(max(s0.y, max(s1.y, s2.y)))));
+    int minx = max(pc.sc_x0, int(floor(clamp(min(s0.x, min(s1.x, s2.x)), -1e6, 1e6))));
+    int miny = max(pc.sc_y0, int(floor(clamp(min(s0.y, min(s1.y, s2.y)), -1e6, 1e6))));
+    int maxx = min(pc.sc_x1 - 1, int(ceil(clamp(max(s0.x, max(s1.x, s2.x)), -1e6, 1e6))));
+    int maxy = min(pc.sc_y1 - 1, int(ceil(clamp(max(s0.y, max(s1.y, s2.y)), -1e6, 1e6))));
     if (minx > maxx || miny > maxy) return;
 
     float inv_area = 1.0 / area;
@@ -189,6 +209,26 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     ts.v2   = vec4(s2, z2, invw2);
     ts.area = vec4(inv_area, float(minx), float(miny), float(maxx));
     ts.idx  = uvec4(i0, i1, i2, (uint(maxy) & 0x7FFFFFFFu) | (is_front ? 0x80000000u : 0u));
+
+    // v0.7 Fused Quad FS Fast-Path (bit 17 = 131072u): writes TriSetup[0..7] directly for FS — ZERO Fine, ZERO VisBuf, ZERO Indirect!
+    if ((pc.flags & 131072u) != 0u) {
+        uint slot = atomicAdd(s_out_n, 1u);
+        if (slot < 8u) tris[slot] = ts;
+        return;
+    }
+
+    // v0.7 Cooperative Zero-Atomic Small-Triangle Fast-Path (<=8 tris: post-process, skybox, fog, UI, video):
+    // Accumulates union tile AABB in shared memory -> all 64 threads fill active_tiles[] in parallel with 0 global atomics!
+    if ((pc.flags & 65536u) != 0u) {
+        tris[tid] = ts;
+        uint slot = atomicAdd(s_out_n, 1u);
+        if (slot < 64u) tile_bins[slot] = tid;
+        atomicMin(s_tx0, tx0);
+        atomicMin(s_ty0, ty0);
+        atomicMax(s_tx1, tx1);
+        atomicMax(s_ty1, ty1);
+        return;
+    }
 
     int bw = maxx - minx + 1;
     int bh = maxy - miny + 1;
@@ -242,7 +282,19 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
         return;
     }
 
-    bool wrote_ts = false;
+    uint ntiles = (tx1 - tx0 + 1u) * (ty1 - ty0 + 1u);
+    if (ntiles > 32u) {
+        tris[tid] = ts;
+        uint bslot = atomicAdd(s_big_cnt, 1u);
+        if (bslot < 64u) {
+            s_big_tid[bslot] = tid;
+            s_big_bb[bslot]  = uvec4(tx0, ty0, tx1, ty1);
+            s_big_z[bslot]   = vec2(tri_min_z, tri_max_z);
+            return;
+        }
+    }
+
+    bool wrote_ts = (ntiles > 32u);
     for (uint ty = ty0; ty <= ty1; ++ty) {
         for (uint tx = tx0; tx <= tx1; ++tx) {
             uint tile_id = ty * pc.tiles_x + tx;
@@ -257,18 +309,11 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     }
 }
 
-void main() {
-    uint meta_idx = pc.tiles_x * pc.tiles_y;
-    uint eff_tri_count = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 2u] : pc.tri_count;
-    uint eff_tpi       = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 3u] : pc.tris_per_inst;
-    uint eff_vpi       = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 4u] : pc.verts_per_inst;
-
-    uint tid = gl_GlobalInvocationID.x;
-    if (tid >= eff_tri_count) return;
-
+void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint eff_vpi, uint eff_cv_base, uint eff_ts_base) {
     uint inst_local = tid / max(eff_tpi, 1u);
     uint tri_local  = tid - inst_local * max(eff_tpi, 1u);
-    uint vbase      = inst_local * eff_vpi;
+    uint vbase      = eff_cv_base + inst_local * eff_vpi;
+    uint gtid       = eff_ts_base + tid;
 
     uint topo = (pc.flags >> 8u) & 7u;
     uint i0, i1, i2;
@@ -295,56 +340,173 @@ void main() {
     vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
     vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
     vec4 c2 = clip_verts[i2 * pc.vert_stride_vec4];
-    if (c0.w < -1.5 || c1.w < -1.5 || c2.w < -1.5) return;
+    if (floatBitsToUint(c0.w) == 0x7FC0DEADu || floatBitsToUint(c1.w) == 0x7FC0DEADu || floatBitsToUint(c2.w) == 0x7FC0DEADu) return;
 
     bool depth_clamp = (pc.flags & 2048u) != 0u;
-    bool in0 = depth_clamp ? (c0.w > 1e-5) : (c0.z >= 0.0 && c0.w > 1e-5);
-    bool in1 = depth_clamp ? (c1.w > 1e-5) : (c1.z >= 0.0 && c1.w > 1e-5);
-    bool in2 = depth_clamp ? (c2.w > 1e-5) : (c2.z >= 0.0 && c2.w > 1e-5);
+    bool in0 = depth_clamp ? (c0.w > 1e-4) : (c0.z >= 0.0 && c0.z <= c0.w && c0.w > 1e-4);
+    bool in1 = depth_clamp ? (c1.w > 1e-4) : (c1.z >= 0.0 && c1.z <= c1.w && c1.w > 1e-4);
+    bool in2 = depth_clamp ? (c2.w > 1e-4) : (c2.z >= 0.0 && c2.z <= c2.w && c2.w > 1e-4);
 
     if (in0 && in1 && in2) {
-        process_tri(tid, i0, i1, i2, c0, c1, c2);
+        process_tri(gtid, i0, i1, i2, c0, c1, c2);
         return;
     }
-    if (!in0 && !in1 && !in2) return;
-
-    uint v_in[4];
-    vec4 p_in[4];
-    uint in_ids[3] = uint[3](i0, i1, i2);
-    vec4 in_pos[3] = vec4[3](c0, c1, c2);
-    bool inside[3] = bool[3](in0, in1, in2);
-
-    uint n_out = 0u;
-    for (uint e = 0u; e < 3u; ++e) {
-        uint ne = (e + 1u) % 3u;
-        bool a_in = inside[e];
-        bool b_in = inside[ne];
-        if (a_in) {
-            v_in[n_out] = in_ids[e];
-            p_in[n_out] = in_pos[e];
-            n_out++;
-        }
-        if (a_in != b_in) {
-            float da = depth_clamp ? (in_pos[e].w - 1e-4) : in_pos[e].z;
-            float db = depth_clamp ? (in_pos[ne].w - 1e-4) : in_pos[ne].z;
-            float t = clamp(da / (da - db), 0.0, 1.0);
-            uint vslot = atomicAdd(tile_counts[meta_idx], 1u);
-            if (vslot >= 900000u) return;
-            uint nv = pc.extra_vert_base + vslot;
-            emit_interp_vert(nv, in_ids[e], in_ids[ne], t);
-            vec4 np = mix(in_pos[e], in_pos[ne], t);
-            if (depth_clamp) np.w = max(np.w, 1e-4);
-            else             np.z = max(np.z, 0.0);
-            clip_verts[nv * pc.vert_stride_vec4] = np;
-            v_in[n_out] = nv;
-            p_in[n_out] = np;
-            n_out++;
-        }
+    if (c0.w <= 1e-4 && c1.w <= 1e-4 && c2.w <= 1e-4) return;
+    if (!depth_clamp) {
+        if (c0.z < 0.0 && c1.z < 0.0 && c2.z < 0.0) return;
+        if (c0.z > c0.w && c1.z > c1.w && c2.z > c2.w) return;
     }
 
-    if (n_out >= 3u) process_tri(tid, v_in[0], v_in[1], v_in[2], p_in[0], p_in[1], p_in[2]);
-    if (n_out == 4u) {
-        uint tslot = atomicAdd(tile_counts[meta_idx + 1u], 1u);
-        if (tslot < 390000u) process_tri(pc.extra_tri_base + tslot, v_in[0], v_in[2], v_in[3], p_in[0], p_in[2], p_in[3]);
+    uint poly_id[5];
+    vec4 poly_pos[5];
+    poly_id[0] = i0; poly_id[1] = i1; poly_id[2] = i2;
+    poly_pos[0] = c0; poly_pos[1] = c1; poly_pos[2] = c2;
+    uint n_poly = 3u;
+
+    uint n_planes = depth_clamp ? 1u : 2u;
+    for (uint pl = 0u; pl < n_planes && n_poly >= 3u; ++pl) {
+        uint out_id[5];
+        vec4 out_pos[5];
+        uint n_out = 0u;
+        for (uint e = 0u; e < n_poly; ++e) {
+            uint ne = (e + 1u == n_poly) ? 0u : (e + 1u);
+            vec4 pa = poly_pos[e], pb = poly_pos[ne];
+            float da = depth_clamp ? (pa.w - 1e-4) : ((pl == 0u) ? pa.z : (pa.w - pa.z));
+            float db = depth_clamp ? (pb.w - 1e-4) : ((pl == 0u) ? pb.z : (pb.w - pb.z));
+            bool a_in = (da >= 0.0);
+            bool b_in = (db >= 0.0);
+            if (a_in && n_out < 5u) {
+                out_id[n_out] = poly_id[e];
+                out_pos[n_out] = pa;
+                n_out++;
+            }
+            if (a_in != b_in && n_out < 5u) {
+                float denom = da - db;
+                float t = (abs(denom) > 1e-12) ? clamp(da / denom, 0.0, 1.0) : 0.5;
+                uint vslot = small_coop ? atomicAdd(s_clip_v, 1u) : atomicAdd(tile_counts[meta_idx], 1u);
+                if (vslot >= 900000u) return;
+                uint nv = pc.extra_vert_base + vslot;
+                emit_interp_vert(nv, poly_id[e], poly_id[ne], t);
+                vec4 np = mix(pa, pb, t);
+                if (depth_clamp) {
+                    np.w = max(np.w, 1e-4);
+                } else if (pl == 0u) {
+                    np.z = max(np.z, 0.0);
+                } else {
+                    np.w = max(np.w, 1e-4);
+                    np.z = min(np.z, np.w);
+                }
+                clip_verts[nv * pc.vert_stride_vec4] = np;
+                out_id[n_out] = nv;
+                out_pos[n_out] = np;
+                n_out++;
+            }
+        }
+        for (uint k = 0u; k < n_out; ++k) { poly_id[k] = out_id[k]; poly_pos[k] = out_pos[k]; }
+        n_poly = n_out;
+    }
+
+    if (n_poly >= 3u) process_tri(gtid, poly_id[0], poly_id[1], poly_id[2], poly_pos[0], poly_pos[1], poly_pos[2]);
+    for (uint k = 3u; k < n_poly; ++k) {
+        uint tslot = small_coop ? atomicAdd(s_clip_t, 1u) : atomicAdd(tile_counts[meta_idx + 1u], 1u);
+        if (tslot < 390000u) process_tri(pc.extra_tri_base + tslot, poly_id[0], poly_id[k - 1u], poly_id[k], poly_pos[0], poly_pos[k - 1u], poly_pos[k]);
+    }
+}
+
+void main() {
+    uint meta_idx = pc.tiles_x * pc.tiles_y;
+    bool fused_quad = (pc.flags & 131072u) != 0u;
+    bool small_coop = (pc.flags & 65536u) != 0u;
+    if (small_coop || fused_quad) {
+        if (gl_LocalInvocationIndex == 0u) {
+            s_clip_v = 0u; s_clip_t = 0u; s_out_n = 0u;
+            s_tx0 = pc.tiles_x; s_ty0 = pc.tiles_y; s_tx1 = 0u; s_ty1 = 0u;
+        }
+        barrier();
+    } else {
+        if (gl_LocalInvocationIndex == 0u) s_big_cnt = 0u;
+        barrier();
+    }
+
+    uint eff_tri_count, eff_tpi, eff_vpi, eff_cv_base, eff_ts_base;
+    if (pc.tri_count == 0xFFFFFFFFu) {
+        eff_tri_count = tile_counts[meta_idx + 2u];
+        eff_tpi       = tile_counts[meta_idx + 3u];
+        eff_vpi       = tile_counts[meta_idx + 4u];
+        eff_cv_base   = pc.clip_vert_base;
+        eff_ts_base   = pc.tri_setup_base;
+    } else if ((pc.tri_count & 0xFFFFFF00u) == 0xFFFFFF00u) {
+        uint d = 16u + (pc.tri_count & 0xFFu) * 16u;
+        eff_tri_count = disp_cmds[d + 8u];
+        eff_tpi       = disp_cmds[d + 9u];
+        eff_vpi       = disp_cmds[d + 10u];
+        eff_cv_base   = disp_cmds[d + 11u];
+        eff_ts_base   = disp_cmds[d + 12u];
+    } else {
+        eff_tri_count = pc.tri_count;
+        eff_tpi       = pc.tris_per_inst;
+        eff_vpi       = pc.verts_per_inst;
+        eff_cv_base   = pc.clip_vert_base;
+        eff_ts_base   = pc.tri_setup_base;
+    }
+
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid < eff_tri_count) {
+        run_one_tri(tid, meta_idx, small_coop || fused_quad, eff_tpi, eff_vpi, eff_cv_base, eff_ts_base);
+    }
+
+    if (fused_quad) {
+        barrier();
+        if (gl_LocalInvocationIndex == 0u) {
+            tris[8u].idx.x = min(s_out_n, 8u);
+        }
+    } else if (small_coop) {
+        barrier();
+        uint out_n = min(s_out_n, 64u);
+        uint ntiles = 0u;
+        if (out_n > 0u && s_tx0 <= s_tx1 && s_ty0 <= s_ty1) {
+            uint bw = s_tx1 - s_tx0 + 1u;
+            uint bh = s_ty1 - s_ty0 + 1u;
+            ntiles = bw * bh;
+            for (uint idx = gl_LocalInvocationIndex; idx < ntiles; idx += 64u) {
+                uint tx = s_tx0 + (idx % bw);
+                uint ty = s_ty0 + (idx / bw);
+                active_tiles[idx] = ty * pc.tiles_x + tx;
+            }
+        }
+        if (gl_LocalInvocationIndex == 0u) {
+            tile_counts[meta_idx + 5u] = out_n;
+            disp_cmds[8u] = ntiles;
+            disp_cmds[9u] = 1u;
+            disp_cmds[10u] = 1u;
+        }
+    } else {
+        // 64-way warp-cooperative large-triangle binning (eliminates single-thread 3,600-tile atomic bottleneck!)
+        barrier();
+        uint nbig = min(s_big_cnt, 64u);
+        if (nbig > 0u) {
+            bool use_hiz   = (pc.flags & 8192u) != 0u;
+            uint dop       = (pc.flags >> 4u) & 7u;
+            bool direct_2d = (pc.flags & 32768u) != 0u;
+            for (uint b = 0u; b < nbig; ++b) {
+                uint btid = s_big_tid[b];
+                uvec4 bb  = s_big_bb[b];
+                vec2 bz   = s_big_z[b];
+                uint bw   = bb.z - bb.x + 1u;
+                uint bh   = bb.w - bb.y + 1u;
+                uint tot  = bw * bh;
+                for (uint idx = gl_LocalInvocationIndex; idx < tot; idx += 64u) {
+                    uint tx = bb.x + (idx % bw);
+                    uint ty = bb.y + (idx / bw);
+                    uint tile_id = ty * pc.tiles_x + tx;
+                    if (use_hiz && !hiz_tile_pass(bz.x, bz.y, tile_hiz[tile_id], dop)) continue;
+                    uint slot = atomicAdd(tile_counts[tile_id], 1u);
+                    if (slot < pc.max_tris_per_tile) {
+                        tile_bins[tile_id * pc.max_tris_per_tile + slot] = btid;
+                        if (slot == 0u && !direct_2d) mark_tile_active(tile_id);
+                    }
+                }
+            }
+        }
     }
 }

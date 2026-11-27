@@ -30,7 +30,7 @@ layout(push_constant) uniform FineParams {
     uint height;
     uint tiles_x;
     uint max_tris_per_tile;
-    uint flags;   // bit3=depth_test, bits4..6=depth_op, bit13=use_prebin_hiz, bit15=direct_2d
+    uint flags;   // bit3=depth_test, bits4..6=depth_op, bit13=use_prebin_hiz, bit15=direct_2d, bit16=small_tri_direct
     uint tiles_y;
 } pc;
 
@@ -68,7 +68,8 @@ float edge_eval(vec2 a, vec2 b, float fx, float fy) {
 }
 
 void main() {
-    bool direct_2d = (pc.flags & 32768u) != 0u;
+    bool direct_2d        = (pc.flags & 32768u) != 0u;
+    bool small_tri_direct = (pc.flags & 65536u) != 0u;
     uint tile_x, tile_y, tile_id;
     if (direct_2d) {
         tile_x = gl_WorkGroupID.x;
@@ -81,11 +82,35 @@ void main() {
     }
 
     uint local_tid = gl_LocalInvocationIndex; // 0..255
-    uint total = min(tile_counts[tile_id], pc.max_tris_per_tile);
     uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
-    if (total == 0u) {
-        if (!direct_2d && local_tid == 0u) tile_counts[flag_idx] = 0u;
-        return;
+    uint total;
+    if (small_tri_direct) {
+        total = min(tile_counts[pc.tiles_x * pc.tiles_y + 5u], BATCH);
+        if (total == 0u) return;
+        if (local_tid < total) {
+            uint tid = tile_bins[local_tid];
+            s_tids[local_tid] = tid;
+            s_tris[local_tid] = tris[tid];
+        }
+        barrier();
+        // Uniform tile-level AABB reject BEFORE touching HBM3 depth_px / vis_px!
+        float tx0 = float(tile_x * 16u), ty0 = float(tile_y * 16u);
+        float tx1 = tx0 + 16.0, ty1 = ty0 + 16.0;
+        bool any_ov = false;
+        for (uint k = 0u; k < total; ++k) {
+            TriSetup t = s_tris[k];
+            if (!(tx1 <= t.area.y || tx0 > t.area.w + 1.0 || ty1 <= t.area.z || ty0 > float(t.idx.w & 0x7FFFFFFFu) + 1.0)) {
+                any_ov = true;
+                break;
+            }
+        }
+        if (!any_ov) return;
+    } else {
+        total = min(tile_counts[tile_id], pc.max_tris_per_tile);
+        if (total == 0u) {
+            if (!direct_2d && local_tid == 0u) tile_counts[flag_idx] = 0u;
+            return;
+        }
     }
 
     uvec2 p = uvec2(tile_x * 16u + gl_LocalInvocationID.x, tile_y * 16u + gl_LocalInvocationID.y);
@@ -137,12 +162,14 @@ void main() {
 
     for (uint base = 0u; base < total; base += BATCH) {
         uint count = min(BATCH, total - base);
-        if (local_tid < count) {
-            uint tid = tile_bins[bin_base + base + local_tid];
-            s_tids[local_tid] = tid;
-            s_tris[local_tid] = tris[tid];
+        if (!small_tri_direct) {
+            if (local_tid < count) {
+                uint tid = tile_bins[bin_base + base + local_tid];
+                s_tids[local_tid] = tid;
+                s_tris[local_tid] = tris[tid];
+            }
+            barrier();
         }
-        barrier();
 
         if (in_bounds) {
             for (uint k = 0u; k < count; ++k) {
@@ -175,11 +202,11 @@ void main() {
                 if (cand < best) best = cand;
             }
         }
-        barrier();
+        if (!small_tri_direct) barrier();
     }
 
     // Self-clear tile_counts & active flag for this tile (ZERO per-draw CmdFillBuffer!)
-    if (local_tid == 0u) {
+    if (!small_tri_direct && local_tid == 0u) {
         tile_counts[tile_id] = 0u;
         if (!direct_2d) tile_counts[flag_idx] = 0u;
     }

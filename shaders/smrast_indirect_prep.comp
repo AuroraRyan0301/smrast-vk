@@ -7,7 +7,7 @@ layout(local_size_x = 1) in;
 layout(std430, set = 0, binding = 0) readonly buffer IndirectBuf { uint ind_raw[]; };
 layout(std430, set = 0, binding = 1) buffer VsUboRawBuf          { uint vs_ubo_raw[]; };
 layout(std430, set = 0, binding = 2) buffer TileCountBuf         { uint tile_counts[]; };
-layout(std430, set = 0, binding = 3) writeonly buffer DispCmdBuf { uint disp_cmds[]; };
+layout(std430, set = 0, binding = 3) buffer DispCmdBuf           { uint disp_cmds[]; };
 layout(std430, set = 0, binding = 4) readonly buffer CountBuf    { uint draw_count_raw[]; };
 
 layout(push_constant) uniform IndPrepPC {
@@ -20,7 +20,7 @@ layout(push_constant) uniform IndPrepPC {
     uint max_draw_tris;
     uint count_word_off;   // 0xFFFFFFFFu = no count buffer
     uint draw_index;       // index of this draw within IndirectCount batch
-    uint pad0;
+    uint batch_slot;       // 0xFFFFFFFFu = single legacy indirect draw; 0..255 = batched indirect slot k!
 } pc;
 
 void main() {
@@ -72,6 +72,18 @@ void main() {
         total_tris  = min(tpi * eff_i, pc.max_draw_tris);
     }
 
+    uint v_base = 0u, t_base = 0u;
+    if (pc.batch_slot != 0xFFFFFFFFu && total_verts > 0u && total_tris > 0u) {
+        v_base = atomicAdd(disp_cmds[12u], total_verts);
+        t_base = atomicAdd(disp_cmds[13u], total_tris);
+        if (v_base + total_verts > pc.max_draw_verts || t_base + total_tris > pc.max_draw_tris) {
+            total_verts = 0u;
+            total_tris  = 0u;
+            v_base = 0u;
+            t_base = 0u;
+        }
+    }
+
     uint b = pc.vs_ubo_word_off;
     vs_ubo_raw[b + 0u] = total_verts;
     vs_ubo_raw[b + 1u] = (pc.indexed == 0u) ? first_v_or_i : 0u;
@@ -79,18 +91,38 @@ void main() {
     vs_ubo_raw[b + 4u] = (pc.indexed != 0u) ? first_v_or_i : 0u;
     vs_ubo_raw[b + 5u] = uint(vtx_offset);
     vs_ubo_raw[b + 16u] = max(vpi, 1u);
+    vs_ubo_raw[b + 19u] = v_base;
 
-    tile_counts[pc.meta_idx + 2u] = total_tris;
-    tile_counts[pc.meta_idx + 3u] = max(tpi, 1u);
-    tile_counts[pc.meta_idx + 4u] = max(vpi, 1u);
+    if (pc.batch_slot == 0xFFFFFFFFu) {
+        tile_counts[pc.meta_idx + 2u] = total_tris;
+        tile_counts[pc.meta_idx + 3u] = max(tpi, 1u);
+        tile_counts[pc.meta_idx + 4u] = max(vpi, 1u);
 
-    disp_cmds[0u] = (total_verts + 63u) / 64u;
-    disp_cmds[1u] = (total_verts > 0u) ? 1u : 0u;
-    disp_cmds[2u] = (total_verts > 0u) ? 1u : 0u;
-    disp_cmds[3u] = 0u;
+        disp_cmds[0u] = (total_verts + 63u) / 64u;
+        disp_cmds[1u] = (total_verts > 0u) ? 1u : 0u;
+        disp_cmds[2u] = (total_verts > 0u) ? 1u : 0u;
+        disp_cmds[3u] = 0u;
 
-    disp_cmds[4u] = (total_tris + 63u) / 64u;
-    disp_cmds[5u] = (total_tris > 0u) ? 1u : 0u;
-    disp_cmds[6u] = (total_tris > 0u) ? 1u : 0u;
-    disp_cmds[7u] = 0u;
+        disp_cmds[4u] = (total_tris + 63u) / 64u;
+        disp_cmds[5u] = (total_tris > 0u) ? 1u : 0u;
+        disp_cmds[6u] = (total_tris > 0u) ? 1u : 0u;
+        disp_cmds[7u] = 0u;
+    } else {
+        uint d = 16u + pc.batch_slot * 16u;
+        disp_cmds[d + 0u]  = (total_verts + 63u) / 64u;
+        disp_cmds[d + 1u]  = (total_verts > 0u) ? 1u : 0u;
+        disp_cmds[d + 2u]  = (total_verts > 0u) ? 1u : 0u;
+        disp_cmds[d + 3u]  = 0u;
+
+        disp_cmds[d + 4u]  = (total_tris + 63u) / 64u;
+        disp_cmds[d + 5u]  = (total_tris > 0u) ? 1u : 0u;
+        disp_cmds[d + 6u]  = (total_tris > 0u) ? 1u : 0u;
+        disp_cmds[d + 7u]  = 0u;
+
+        disp_cmds[d + 8u]  = total_tris;
+        disp_cmds[d + 9u]  = max(tpi, 1u);
+        disp_cmds[d + 10u] = max(vpi, 1u);
+        disp_cmds[d + 11u] = v_base;
+        disp_cmds[d + 12u] = t_base;
+    }
 }

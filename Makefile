@@ -1,6 +1,6 @@
 CXX := g++
 CXXFLAGS := -O3 -std=c++17 -fPIC -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter -Wno-unused-function -Iinclude -I/usr/include/spirv_cross
-LDFLAGS := -shared -Wl,--no-undefined -ldl -lspirv-cross-c-shared -lshaderc -lxcb -lxcb-shm -lX11 -lpthread
+LDFLAGS := -shared -Wl,--no-undefined -ldl -lspirv-cross-c-shared -lshaderc -lxcb -lxcb-shm -lX11 -lXext -lpthread
 GLSLANG := glslangValidator
 
 BUILD_DIR := build
@@ -23,7 +23,7 @@ $(TARGET): $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/%.comp.spv: shaders/%.comp | $(BUILD_DIR)
 	$(GLSLANG) --target-env vulkan1.3 -V $< -o $@
 
-bench: $(BUILD_DIR)/smrast_stress_bench $(BUILD_DIR)/test_vk13_game_features $(BUILD_DIR)/test_v04_features $(BUILD_DIR)/test_v05_features $(BUILD_DIR)/test_v06_features
+bench: $(BUILD_DIR)/smrast_stress_bench $(BUILD_DIR)/test_vk13_game_features $(BUILD_DIR)/test_v04_features $(BUILD_DIR)/test_v05_features $(BUILD_DIR)/test_v06_features $(BUILD_DIR)/test_v07_features
 
 $(BUILD_DIR)/test_v04_features: bench/test_v04_features.cpp | $(BUILD_DIR)
 	$(CXX) -O3 -std=c++17 bench/test_v04_features.cpp -o $@ -lvulkan -lm
@@ -33,6 +33,9 @@ $(BUILD_DIR)/test_v05_features: bench/test_v05_features.cpp | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_v06_features: bench/test_v06_features.cpp | $(BUILD_DIR)
 	$(CXX) -O3 -std=c++17 bench/test_v06_features.cpp -o $@ -lvulkan -lm
+
+$(BUILD_DIR)/test_v07_features: bench/test_v07_features.cpp | $(BUILD_DIR)
+	$(CXX) -O3 -std=c++17 bench/test_v07_features.cpp -o $@ -lvulkan -lm
 
 $(BUILD_DIR)/smrast_stress_bench: bench/smrast_stress_bench.cpp bench/pbr.vert bench/pbr.frag | $(BUILD_DIR)
 	$(GLSLANG) -V bench/pbr.vert -o bench/pbr.vert.spv

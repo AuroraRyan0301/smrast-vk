@@ -191,7 +191,7 @@ bool sm_init_raster_engine(SmDevice* dev) {
         for (uint32_t i = 0; i < 5; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 5, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.ind_prep_dsl);
-        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.ind_prep_dsl, 1, &pcr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.ind_prep_pl);
     }
@@ -258,12 +258,13 @@ bool sm_init_raster_engine(SmDevice* dev) {
     R.hiz_update_pipe = make_internal_pipe(dev, p_hiz,   R.hiz_update_pl);
     if (!R.clear_pipe || !R.bin_pipe || !R.prim_bin_pipe || !R.fine_pipe || !R.ind_prep_pipe || !R.depth_only_pipe || !R.blit_pipe || !R.hiz_update_pipe) return false;
 
-    // 3. Pre-allocate 2.2M verts + 1.1M tris on H20 HBM3 (~640 MB < 0.7% of 96 GB) so DrawIndirect never reallocs mid-CB!
-    if (!sm_ensure_geom_capacity(dev, 2200000, 1100000)) return false;
+    // 3. Pre-allocate 4.0M verts + 1.8M tris on H20 HBM3 (~1.16 GB < 1.2% of 96 GB) so 128-draw Indirect Uber-Batches never realloc or overflow!
+    if (!sm_ensure_geom_capacity(dev, 4000000, 1800000)) return false;
 
     VkBufferUsageFlags ssbo_u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!create_buf(dev, 4096, ssbo_u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.dummy_buf, R.dummy_mem)) return false;
-    if (!create_buf(dev, 256, ssbo_u | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.ind_disp_buf, R.ind_disp_mem)) return false;
+    // 32 KB indirect dispatch + batched indirect metadata table (64B header + 256 x 64B per-draw slots!)
+    if (!create_buf(dev, 32768, ssbo_u | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.ind_disp_buf, R.ind_disp_mem)) return false;
 
     VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     // VS & FS param buffers use STORAGE_BUFFER_BIT (zero UBO bank contention at set>=5 for vkd3d-proton!)
@@ -338,6 +339,7 @@ bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
 
     R.cur_w = nw; R.cur_h = nh;
     R.tiles_x = tx; R.tiles_y = ty;
+    R.vis_inited = false;
     return true;
 }
 

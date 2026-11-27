@@ -9,7 +9,7 @@ g++ -O3 -std=c++17 -fPIC -shared -Wl,--no-undefined \
     -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter -Wno-unused-function \
     -o build/libvulkan_smrast.so \
     src/smrast_icd.cpp src/smrast_raster_engine.cpp src/smrast_wsi.cpp src/spirv_lower.cpp \
-    -lspirv-cross-c-shared -lshaderc -lxcb -lxcb-shm -lX11 -ldl -lpthread
+    -lspirv-cross-c-shared -lshaderc -lxcb -lxcb-shm -lX11 -lXext -ldl -lpthread
 if [ -f bench/smrast_stress_bench.cpp ]; then
     glslangValidator -V bench/pbr.vert -o bench/pbr.vert.spv
     glslangValidator -V bench/pbr.frag -o bench/pbr.frag.spv
@@ -30,4 +30,7 @@ fi
 if [ -f bench/test_v06_features.cpp ]; then
     g++ -O3 -std=c++17 bench/test_v06_features.cpp -o build/test_v06_features -lvulkan -lm
 fi
-echo "Built SmRast-VK v0.6.0 (libvulkan_smrast.so + 8 compute shaders + benchmarks) successfully!"
+if [ -f bench/test_v07_features.cpp ]; then
+    g++ -O3 -std=c++17 bench/test_v07_features.cpp -o build/test_v07_features -lvulkan -lm
+fi
+echo "Built SmRast-VK v0.7.0 (libvulkan_smrast.so + 8 compute shaders + benchmarks) successfully!"

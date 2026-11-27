@@ -126,17 +126,32 @@ void main() {
         uint i1 = i0 + 1u;
         vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
         vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
-        if (c0.w < -1.5 || c1.w < -1.5) return;
-        bool in0 = depth_clamp ? (c0.w > 1e-5) : (c0.z >= 0.0 && c0.w > 1e-5);
-        bool in1 = depth_clamp ? (c1.w > 1e-5) : (c1.z >= 0.0 && c1.w > 1e-5);
-        if (!in0 && !in1) return;
-        if (in0 != in1) {
-            float da = depth_clamp ? (c0.w - 1e-4) : c0.z;
-            float db = depth_clamp ? (c1.w - 1e-4) : c1.z;
-            float t = clamp(da / (da - db), 0.0, 1.0);
-            vec4 np = mix(c0, c1, t);
-            if (depth_clamp) np.w = max(np.w, 1e-4); else np.z = max(np.z, 0.0);
-            if (!in0) c0 = np; else c1 = np;
+        if (floatBitsToUint(c0.w) == 0x7FC0DEADu || floatBitsToUint(c1.w) == 0x7FC0DEADu) return;
+        if (depth_clamp) {
+            bool in0 = (c0.w > 1e-4), in1 = (c1.w > 1e-4);
+            if (!in0 && !in1) return;
+            if (in0 != in1) {
+                float da = c0.w - 1e-4, db = c1.w - 1e-4;
+                float t = clamp(da / (da - db), 0.0, 1.0);
+                vec4 np = mix(c0, c1, t); np.w = max(np.w, 1e-4);
+                if (!in0) c0 = np; else c1 = np;
+            }
+        } else {
+            // Clip against both z >= 0 and w - z >= 0 (Standard-Z & Reverse-Z)
+            if (c0.z < 0.0 && c1.z < 0.0) return;
+            if ((c0.z < 0.0) != (c1.z < 0.0)) {
+                float t = clamp(c0.z / (c0.z - c1.z), 0.0, 1.0);
+                vec4 np = mix(c0, c1, t); np.z = max(np.z, 0.0);
+                if (c0.z < 0.0) c0 = np; else c1 = np;
+            }
+            float d0 = c0.w - c0.z, d1 = c1.w - c1.z;
+            if (d0 < 0.0 && d1 < 0.0) return;
+            if ((d0 < 0.0) != (d1 < 0.0)) {
+                float t = clamp(d0 / (d0 - d1), 0.0, 1.0);
+                vec4 np = mix(c0, c1, t); np.w = max(np.w, 1e-4); np.z = min(np.z, np.w);
+                if (d0 < 0.0) c0 = np; else c1 = np;
+            }
+            if (c0.w <= 1e-4 || c1.w <= 1e-4) return;
         }
         vec2 s0 = vec2(pc.vp_x + (c0.x / c0.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y / c0.w * 0.5 + 0.5) * pc.vp_h);
         vec2 s1 = vec2(pc.vp_x + (c1.x / c1.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y / c1.w * 0.5 + 0.5) * pc.vp_h);

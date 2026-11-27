@@ -75,7 +75,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v6_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v7b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -590,7 +590,33 @@ static std::string emit_attr_unpack(const ReflectedIO& io, const VkVertexInputAt
             assign_i4("ivec4(int(" + load_u(0) + "), int(" + load_u(1) + "), int(" + load_u(2) + "), 1)"); break;
         case VK_FORMAT_R32G32B32A32_SINT:
             assign_i4("ivec4(int(" + load_u(0) + "), int(" + load_u(1) + "), int(" + load_u(2) + "), int(" + load_u(3) + "))"); break;
+        case VK_FORMAT_R8G8B8A8_USCALED:
+            ss << "        uint pu8s = " << load_u(0) << ";\n";
+            assign_f4("vec4(float(pu8s&255u), float((pu8s>>8u)&255u), float((pu8s>>16u)&255u), float((pu8s>>24u)&255u))"); break;
+        case VK_FORMAT_R8G8B8A8_SSCALED:
+            ss << "        int pi8s = int(" << load_u(0) << ");\n";
+            assign_f4("vec4(float(bitfieldExtract(pi8s,0,8)), float(bitfieldExtract(pi8s,8,8)), float(bitfieldExtract(pi8s,16,8)), float(bitfieldExtract(pi8s,24,8)))"); break;
+        case VK_FORMAT_R16G16_USCALED:
+            ss << "        uint pu16s = " << load_u(0) << ";\n";
+            assign_f4("vec4(float(pu16s&65535u), float(pu16s>>16u), 0.0, 1.0)"); break;
+        case VK_FORMAT_R16G16_SSCALED:
+            ss << "        int pi16s = int(" << load_u(0) << ");\n";
+            assign_f4("vec4(float(bitfieldExtract(pi16s,0,16)), float(bitfieldExtract(pi16s,16,16)), 0.0, 1.0)"); break;
+        case VK_FORMAT_R16G16B16A16_USCALED:
+            ss << "        uint pu16sa = " << load_u(0) << ", pu16sb = " << load_u(1) << ";\n";
+            assign_f4("vec4(float(pu16sa&65535u), float(pu16sa>>16u), float(pu16sb&65535u), float(pu16sb>>16u))"); break;
+        case VK_FORMAT_R16G16B16A16_SSCALED:
+            ss << "        int pi16sa = int(" << load_u(0) << "), pi16sb = int(" << load_u(1) << ");\n";
+            assign_f4("vec4(float(bitfieldExtract(pi16sa,0,16)), float(bitfieldExtract(pi16sa,16,16)), float(bitfieldExtract(pi16sb,0,16)), float(bitfieldExtract(pi16sb,16,16)))"); break;
+        case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+            ss << "        uint p10r = " << load_u(0) << ";\n";
+            assign_f4("vec4(float((p10r>>20u)&1023u)/1023.0, float((p10r>>10u)&1023u)/1023.0, float(p10r&1023u)/1023.0, float((p10r>>30u)&3u)/3.0)"); break;
+        case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
+            ss << "        int p10rs = int(" << load_u(0) << ");\n";
+            assign_f4("vec4(max(float(bitfieldExtract(p10rs,20,10))/511.0,-1.0), max(float(bitfieldExtract(p10rs,10,10))/511.0,-1.0), max(float(bitfieldExtract(p10rs,0,10))/511.0,-1.0), max(float(bitfieldExtract(p10rs,30,2))/1.0,-1.0))"); break;
         default:
+            fprintf(stderr, "[SmRast] WARN: unhandled vertex format=%d (binding=%u off=%u loc=%u)\n",
+                    (int)attr->format, attr->binding, attr->offset, io.location);
             assign_f4("vec4(" + load_f(0) + ", " + load_f(1) + ", " + load_f(2) + ", " + load_f(3) + ")"); break;
     }
     ss << "    }\n";
@@ -659,7 +685,7 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
        << "    uint verts_per_instance;\n"
        << "    uint vtx_inst_rate_mask;\n"
        << "    uint prim_restart_en;\n"
-       << "    uint pad1;\n"
+       << "    uint clip_vert_base;\n"
        << "    uvec4 vtx_offsets_hi;\n"
        << "    uvec4 vtx_strides_hi;\n"
        << "} sm_vs;\n\n";
@@ -685,25 +711,25 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    sm_base_instance = int(sm_vs.instance_idx);\n";
     ss << "    sm_base_vertex   = (sm_vs.indexed != 0u) ? sm_vs.vertex_offset : int(sm_vs.first_vertex);\n";
     ss << "    sm_iidx = int(sm_vs.instance_idx + inst_local);\n";
-    ss << "    uint base_slot = gid * sm_vs.vert_stride_vec4;\n";
+    ss << "    uint base_slot = (sm_vs.clip_vert_base + gid) * sm_vs.vert_stride_vec4;\n";
     ss << "    if (sm_vs.indexed == 0u) {\n";
     ss << "        sm_vidx = int(sm_vs.first_vertex + vert_local);\n";
     ss << "    } else if (sm_vs.indexed == 1u) {\n";
     ss << "        uint ii = (sm_vs.idx_buf_offset >> 1u) + sm_vs.first_index + vert_local;\n";
     ss << "        uint w = sm_idx_raw[ii >> 1u];\n";
     ss << "        uint idx16 = ((ii & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);\n";
-    ss << "        if (sm_vs.prim_restart_en != 0u && idx16 == 0xFFFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, -2.0); return; }\n";
+    ss << "        if (sm_vs.prim_restart_en != 0u && idx16 == 0xFFFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, uintBitsToFloat(0x7FC0DEADu)); return; }\n";
     ss << "        sm_vidx = int(idx16) + sm_vs.vertex_offset;\n";
     ss << "    } else if (sm_vs.indexed == 3u) {\n";
     ss << "        uint ii = sm_vs.idx_buf_offset + sm_vs.first_index + vert_local;\n";
     ss << "        uint w = sm_idx_raw[ii >> 2u];\n";
     ss << "        uint idx8 = (w >> ((ii & 3u) << 3u)) & 0xFFu;\n";
-    ss << "        if (sm_vs.prim_restart_en != 0u && idx8 == 0xFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, -2.0); return; }\n";
+    ss << "        if (sm_vs.prim_restart_en != 0u && idx8 == 0xFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, uintBitsToFloat(0x7FC0DEADu)); return; }\n";
     ss << "        sm_vidx = int(idx8) + sm_vs.vertex_offset;\n";
     ss << "    } else {\n";
     ss << "        uint ii = (sm_vs.idx_buf_offset >> 2u) + sm_vs.first_index + vert_local;\n";
     ss << "        uint idx32 = sm_idx_raw[ii];\n";
-    ss << "        if (sm_vs.prim_restart_en != 0u && idx32 == 0xFFFFFFFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, -2.0); return; }\n";
+    ss << "        if (sm_vs.prim_restart_en != 0u && idx32 == 0xFFFFFFFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, uintBitsToFloat(0x7FC0DEADu)); return; }\n";
     ss << "        sm_vidx = int(idx32) + sm_vs.vertex_offset;\n";
     ss << "    }\n";
 
@@ -755,11 +781,14 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              uint32_t sm_set_idx,
                              const SmFsCompileHints& hints,
                              std::vector<uint32_t>& out_comp_spv,
-                             std::string& err) {
+                             std::string& err,
+                             bool* out_fs_uses_push,
+                             bool* out_fs_has_discard_or_depth) {
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
 
+    if (out_fs_uses_push) *out_fs_uses_push = (glsl.find("push_constant") != std::string::npos);
     bool uses_frag_depth = (glsl.find("gl_FragDepth") != std::string::npos);
 
     std::string user_exts;
@@ -788,6 +817,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     body = rewrite_texture_calls(body);
     body = std::regex_replace(body, std::regex(R"(\bdemote\s*;)"), "{ sm_discarded = true; sm_gl_HelperInvocation = true; }");
     body = std::regex_replace(body, std::regex(R"(\bdiscard\s*;)"), "{ sm_discarded = true; sm_gl_HelperInvocation = true; }");
+    if (out_fs_has_discard_or_depth)
+        *out_fs_has_discard_or_depth = (uses_frag_depth || body.find("sm_discarded = true;") != std::string::npos);
     body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_fs_main()");
 
     std::ostringstream ss;
@@ -886,6 +917,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "vec4 sm_safe_f16(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), vec4(-65504.0), vec4(65504.0)); }\n";
     if (need_srgb) {
         ss << "float sm_lin_to_srgb(float x) { return (x <= 0.0031308) ? (x * 12.92) : (1.055 * pow(max(x, 0.0), 1.0/2.4) - 0.055); }\n";
+        ss << "float sm_srgb_to_lin(float x) { return (x <= 0.04045) ? (x / 12.92) : pow((max(x, 0.0) + 0.055) / 1.055, 2.4); }\n";
     }
     if (need_r11g11b10) {
         ss << "uint sm_f32_to_uf11(float v) { if (isnan(v) || v <= 0.0) return 0u; uint u = floatBitsToUint(v); uint e = (u >> 23u) & 255u; if (e < 112u) return 0u; if (e >= 143u) return 0x7BFu; return ((e - 112u) << 6u) | ((u >> 17u) & 63u); }\n";
@@ -896,8 +928,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     if (need_dyn_fmt) {
         ss << "uint sm_pack_u32_fmt(vec4 c, uint fc) {\n"
            << "    if (fc == 5u)  return sm_f32_to_uf11(c.r) | (sm_f32_to_uf11(c.g) << 11u) | (sm_f32_to_uf10(c.b) << 22u);\n"
-           << "    if (fc == 6u)  return floatBitsToUint(c.r);\n"
-           << "    if (fc == 7u)  return packHalf2x16(c.rg);\n"
+           << "    if (fc == 6u)  return floatBitsToUint(isnan(c.r) ? 0.0 : c.r);\n"
+           << "    if (fc == 7u)  return packHalf2x16(sm_safe_f16(c).rg);\n"
            << "    if (fc == 9u)  { vec4 cl = clamp(c, 0.0, 1.0); return uint(round(cl.r*1023.0)) | (uint(round(cl.g*1023.0))<<10u) | (uint(round(cl.b*1023.0))<<20u) | (uint(round(cl.a*3.0))<<30u); }\n"
            << "    if (fc == 11u) return uint(c.r);\n"
            << "    if (fc == 12u) return packSnorm4x8(clamp(c, -1.0, 1.0));\n"
@@ -919,7 +951,9 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
            << "    if (fc == 13u) return vec4(unpackUnorm2x16(pk), 0.0, 1.0);\n"
            << "    if (fc == 14u) return vec4(unpackSnorm2x16(pk), 0.0, 1.0);\n"
            << "    vec4 c = unpackUnorm4x8(pk);\n"
-           << "    return (fc == 1u || fc == 3u) ? c.bgra : c;\n"
+           << "    if (fc == 1u || fc == 3u) c = c.bgra;\n"
+           << "    if (fc == 2u || fc == 3u) c.rgb = vec3(sm_srgb_to_lin(c.r), sm_srgb_to_lin(c.g), sm_srgb_to_lin(c.b));\n"
+           << "    return c;\n"
            << "}\n";
     }
     if (need_any_blend) {
@@ -1032,7 +1066,9 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                 else if (kfc == 18) ss << "        { uint w16 = (" << buf << "[pidx >> 1u] >> ((pidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
                 else if (kfc == 19) ss << "        { uint w16 = (" << buf << "[pidx >> 1u] >> ((pidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
                 else if (kfc == 20) ss << "        { uint w16 = (" << buf << "[pidx >> 1u] >> ((pidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 1 || kfc == 3) ss << "        dst_c = unpackUnorm4x8(" << buf << "[pidx]).bgra;\n";
+                else if (kfc == 1) ss << "        dst_c = unpackUnorm4x8(" << buf << "[pidx]).bgra;\n";
+                else if (kfc == 2) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[pidx]); dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
+                else if (kfc == 3) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[pidx]).bgra; dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
                 else                ss << "        dst_c = unpackUnorm4x8(" << buf << "[pidx]);\n";
                 if (ben) {
                     ss << "        vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c).rgb;\n";
@@ -1107,7 +1143,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             ss << "            else if (fc == 8u)  { " << buf << "[pidx*4u]=floatBitsToUint(out_c.r); " << buf << "[pidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[pidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[pidx*4u+3u]=floatBitsToUint(out_c.a); }\n";
             ss << "            else if (fc == 17u) { uint sh=(pidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; atomicAnd(" << buf << "[pidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[pidx>>2u], v8<<sh); }\n";
             ss << "            else if (fc == 18u) { uint sh=(pidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
-            ss << "            else if (fc == 19u) { uint sh=(pidx&1u)<<4u; uint v16=packHalf2x16(vec2(out_c.r,0.0))&0xFFFFu; atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
+            ss << "            else if (fc == 19u) { uint sh=(pidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
             ss << "            else if (fc == 20u) { uint sh=(pidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; atomicAnd(" << buf << "[pidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[pidx>>1u], v16<<sh); }\n";
             ss << "            else { " << buf << "[pidx] = sm_pack_u32_fmt(out_c, fc); }\n";
             ss << "        }\n";
@@ -1115,6 +1151,11 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
         ss << "    }\n";
     };
 
+    ss << "bool sm_is_top_left(vec2 d) { return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0); }\n";
+    ss << "float sm_edge_eval(vec2 a, vec2 b, float fx, float fy) {\n"
+       << "    if (a.y < b.y || (a.y == b.y && a.x < b.x)) { vec2 d = b - a; return d.x * (fy - a.y) - d.y * (fx - a.x); }\n"
+       << "    else { vec2 d = a - b; return -(d.x * (fy - b.y) - d.y * (fx - b.x)); }\n"
+       << "}\n";
     ss << "void main() {\n";
     ss << "    uint tid = gl_LocalInvocationIndex;\n";
     ss << "    uint quad_id = tid >> 2u;\n";
@@ -1122,19 +1163,57 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    uint lx = ((quad_id & 7u) << 1u) | (sm_quad_lane & 1u);\n";
     ss << "    uint ly = ((quad_id >> 3u) << 1u) | ((sm_quad_lane >> 1u) & 1u);\n";
     ss << "    uvec2 p;\n";
-    ss << "    if (sm_fs.direct_2d != 0u) {\n";
+    ss << "    bool in_bounds;\n";
+    ss << "    uint pidx;\n";
+    ss << "    bool active_px;\n";
+    ss << "    uint my_tri;\n";
+    ss << "    if (sm_fs.direct_2d == 2u) {\n";
     ss << "        p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
+    ss << "        in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
+    ss << "        pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
+    ss << "        uint ntri = sm_tris[8u].idx.x;\n";
+    ss << "        if (ntri == 0u) return;\n";
+    ss << "        float tx0 = float(gl_WorkGroupID.x * 16u), ty0 = float(gl_WorkGroupID.y * 16u);\n";
+    ss << "        float tx1 = tx0 + 16.0, ty1 = ty0 + 16.0;\n";
+    ss << "        bool any_ov = false;\n";
+    ss << "        for (uint k = 0u; k < ntri; ++k) {\n";
+    ss << "            SmTriSetup qt = sm_tris[k];\n";
+    ss << "            if (!(tx1 <= qt.area.y || tx0 > qt.area.w + 1.0 || ty1 <= qt.area.z || ty0 > float(qt.idx.w & 0x7FFFFFFFu) + 1.0)) { any_ov = true; break; }\n";
+    ss << "        }\n";
+    ss << "        if (!any_ov) return;\n";
+    ss << "        float qfx = float(p.x) + 0.5, qfy = float(p.y) + 0.5;\n";
+    ss << "        my_tri = 0xFFFFFFFFu;\n";
+    ss << "        if (in_bounds) {\n";
+    ss << "            for (uint k = 0u; k < ntri; ++k) {\n";
+    ss << "                SmTriSetup qt = sm_tris[k];\n";
+    ss << "                if (qfx < qt.area.y || qfx > qt.area.w + 1.0 || qfy < qt.area.z || qfy > float(qt.idx.w & 0x7FFFFFFFu) + 1.0) continue;\n";
+    ss << "                vec2 a0 = qt.v0.xy, a1 = qt.v1.xy, a2 = qt.v2.xy;\n";
+    ss << "                float e0 = sm_edge_eval(a1, a2, qfx, qfy);\n";
+    ss << "                float e1 = sm_edge_eval(a2, a0, qfx, qfy);\n";
+    ss << "                float e2 = sm_edge_eval(a0, a1, qfx, qfy);\n";
+    ss << "                if ((sm_is_top_left(a2 - a1) ? (e0 < 0.0) : (e0 <= 0.0)) ||\n";
+    ss << "                    (sm_is_top_left(a0 - a2) ? (e1 < 0.0) : (e1 <= 0.0)) ||\n";
+    ss << "                    (sm_is_top_left(a1 - a0) ? (e2 < 0.0) : (e2 <= 0.0))) continue;\n";
+    ss << "                my_tri = k;\n";
+    ss << "                break;\n";
+    ss << "            }\n";
+    ss << "        }\n";
+    ss << "        active_px = (my_tri != 0xFFFFFFFFu);\n";
     ss << "    } else {\n";
-    ss << "        uint sm_tile_id = sm_active_tiles[gl_WorkGroupID.x];\n";
-    ss << "        p = uvec2((sm_tile_id % sm_fs.tiles_x) * 16u + lx, (sm_tile_id / sm_fs.tiles_x) * 16u + ly);\n";
+    ss << "        if (sm_fs.direct_2d != 0u) {\n";
+    ss << "            p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
+    ss << "        } else {\n";
+    ss << "            uint sm_tile_id = sm_active_tiles[gl_WorkGroupID.x];\n";
+    ss << "            p = uvec2((sm_tile_id % sm_fs.tiles_x) * 16u + lx, (sm_tile_id / sm_fs.tiles_x) * 16u + ly);\n";
+    ss << "        }\n";
+    ss << "        in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
+    ss << "        pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
+    ss << "        uint64_t vis = in_bounds ? sm_vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;\n";
+    ss << "        active_px = in_bounds && (vis != 0xFFFFFFFFFFFFFFFFul);\n";
+    ss << "        if (active_px) sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n";
+    ss << "        my_tri = active_px ? uint(vis & 0xFFFFFFFFul) : 0xFFFFFFFFu;\n";
     ss << "    }\n";
-    ss << "    bool in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
-    ss << "    uint pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
-    ss << "    uint64_t vis = in_bounds ? sm_vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;\n";
-    ss << "    bool active_px = in_bounds && (vis != 0xFFFFFFFFFFFFFFFFul);\n";
-    ss << "    if (active_px) sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n";
     ss << "    sm_gl_HelperInvocation = !active_px;\n";
-    ss << "    uint my_tri = active_px ? uint(vis & 0xFFFFFFFFul) : 0xFFFFFFFFu;\n";
     ss << "    uint t0 = subgroupQuadBroadcast(my_tri, 0u);\n";
     ss << "    uint t1 = subgroupQuadBroadcast(my_tri, 1u);\n";
     ss << "    uint t2 = subgroupQuadBroadcast(my_tri, 2u);\n";
@@ -1152,9 +1231,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    float l2 = 1.0 - l0 - l1;\n";
     ss << "    float pz = clamp(l0 * ts.v0.z + l1 * ts.v1.z + l2 * ts.v2.z, 0.0, 1.0);\n";
     ss << "    float w0 = l0 * ts.v0.w, w1 = l1 * ts.v1.w, w2 = l2 * ts.v2.w;\n";
-    ss << "    float inv_wsum = 1.0 / max(1e-20, w0 + w1 + w2);\n";
+    ss << "    float wsum = w0 + w1 + w2;\n";
+    ss << "    float inv_wsum = 1.0 / max(1e-20, wsum);\n";
     ss << "    float b0 = w0 * inv_wsum, b1 = w1 * inv_wsum, b2 = w2 * inv_wsum;\n";
-    ss << "    sm_gl_FragCoord = vec4(fx, fy, pz, inv_wsum);\n";
+    ss << "    sm_gl_FragCoord = vec4(fx, fy, pz, wsum);\n";
     ss << "    sm_gl_FragDepth = pz;\n";
     ss << "    uint vi0 = ts.idx.x * sm_fs.vert_stride_vec4;\n";
     ss << "    uint vi1 = ts.idx.y * sm_fs.vert_stride_vec4;\n";

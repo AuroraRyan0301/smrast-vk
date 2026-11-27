@@ -11,6 +11,7 @@
 #include <vulkan/vk_icd.h>
 #include <xcb/shm.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -267,6 +268,12 @@ struct SmImage {
     bool stencil_dirty = false;
     int32_t stencil_mip = -1;
     int32_t stencil_layer = -1;
+    // v0.7 Lazy attach_buf -> real_img sync tracking
+    bool attach_pending_sync = false;
+    bool stencil_pending_sync = false;
+    uint32_t pending_mip = 0;
+    uint32_t pending_layer = 0;
+    VkImageLayout pending_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkBuffer attach_buf = VK_NULL_HANDLE;
     VkDeviceMemory attach_mem = VK_NULL_HANDLE;
     VkBuffer hiz_buf = VK_NULL_HANDLE;
@@ -335,6 +342,9 @@ struct SmPipeline {
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     bool prim_restart = false;
     bool vs_writes_point_size = false;
+    bool fs_uses_push_constants = true;
+    bool fs_has_discard_or_depth = false;
+    bool is_null_fs_stencil = false;
     float line_width = 1.0f;
     VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -394,11 +404,13 @@ struct SmSwapchain {
     VkExtent2D extent{800, 600};
     std::vector<SmImage*> images;
     uint32_t next_image = 0;
-    VkCommandPool present_pool = VK_NULL_HANDLE;
-    VkCommandBuffer present_cmd = VK_NULL_HANDLE;
-    VkFence present_fence = VK_NULL_HANDLE;
+    VkCommandPool present_pools[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkCommandBuffer present_cmds[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkFence present_fences[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    SmImage* pending_present_img[2] = {nullptr, nullptr};
+    uint32_t present_ring_idx = 0;
     uint64_t present_frames = 0;
-    // Zero-Copy MIT-SHM XCB presentation state
+    // Zero-Copy MIT-SHM XCB & Xlib presentation state
     bool shm_checked = false;
     bool use_shm = false;
     int shm_id = -1;
@@ -406,6 +418,9 @@ struct SmSwapchain {
     uint8_t* shm_ptr = nullptr;
     size_t shm_bytes = 0;
     xcb_gcontext_t xcb_gc = 0;
+    void* xlib_gc = nullptr;
+    void* xlib_shm_img = nullptr;
+    void* xlib_shminfo = nullptr;
 };
 
 struct alignas(256) SmVsParamsUBO {
@@ -421,8 +436,8 @@ struct alignas(256) SmVsParamsUBO {
     uint32_t vtx_strides[4];     // VB 0..3
     uint32_t verts_per_instance; // word 16 (patched by smrast_indirect_prep.comp!)
     uint32_t vtx_inst_rate_mask; // bits 0..7 = instanced VB 0..7
-    uint32_t prim_restart_en;    // 1 = emit restart sentinel (w = -2.0) for 0xFF/0xFFFF/0xFFFFFFFF
-    uint32_t pad1;
+    uint32_t prim_restart_en;    // 1 = emit restart sentinel (0x7FC0DEADu) for 0xFF/0xFFFF/0xFFFFFFFF
+    uint32_t clip_vert_base;     // v0.7: base vertex slot in ClipVertBuf for Multi-Draw Uber-Batching!
     uint32_t vtx_offsets_hi[4];  // VB 4..7
     uint32_t vtx_strides_hi[4];  // VB 4..7
 };
@@ -539,9 +554,11 @@ struct SmRasterEngine {
     std::unordered_map<uint64_t, VkDescriptorSet> fine_ds_cache;
     std::unordered_map<uint64_t, VkDescriptorSet> dep_ds_cache;
     std::unordered_map<uint64_t, VkDescriptorSet> hiz_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> ind_prep_ds_cache;
 
     uint32_t cur_w = 0, cur_h = 0;
     uint32_t tiles_x = 0, tiles_y = 0;
+    bool vis_inited = false;
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> retired_bufs;
 };
 
@@ -574,6 +591,67 @@ struct SmPushDescSet {
     std::vector<std::vector<VkBufferView>>           bvs;
 };
 
+struct SmBatchedDraw {
+    bool is_indirect = false;
+    VkDescriptorSet ind_prep_ds = VK_NULL_HANDLE;
+    uint32_t ind_w_off = 0;
+    uint32_t count_w_off = 0xFFFFFFFFu;
+    uint32_t draw_idx = 0;
+    uint32_t indexed = 0;
+    uint32_t topo_code = 0;
+    uint32_t vs_slot = 0;
+    uint32_t total_verts = 0;
+    uint32_t total_tris = 0;
+    uint32_t tris_per_inst = 0;
+    uint32_t verts_per_inst = 0;
+    uint32_t clip_vert_base = 0;
+    uint32_t tri_setup_base = 0;
+    uint32_t bin_rflags = 0;
+    VkPipeline vs_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout vs_layout = VK_NULL_HANDLE;
+    uint32_t sm_set_index = 0;
+    VkDescriptorSet vs_ds = VK_NULL_HANDLE;
+    VkDescriptorSet app_sets[8] = {VK_NULL_HANDLE};
+    uint32_t app_set_mask = 0;
+    uint32_t app_dyn_cnt[8] = {0};
+    uint32_t app_dyn_off[8][8] = {{0}};
+    uint8_t push_data[128] = {0};
+    uint32_t push_size = 0;
+    std::vector<VkPushConstantRange> push_ranges;
+    VkViewport vp{};
+    int32_t sc_x0 = 0, sc_y0 = 0, sc_x1 = 0, sc_y1 = 0;
+    float dbias_const = 0.f, dbias_slope = 0.f, dbias_clamp = 0.f, line_width = 1.f;
+};
+
+struct SmDrawBatch {
+    bool active = false;
+    bool is_indirect = false;
+    SmPipeline* fs_owner_pipe = nullptr;
+    uint32_t W = 0, H = 0, tx = 0, ty = 0;
+    uint32_t fs_slot = 0;
+    uint32_t fine_rflags = 0;
+    uint32_t extra_v_base = 0, extra_t_base = 0;
+    bool eff_dwrite = false;
+    bool can_use_hiz = false;
+    SmImage* dep_img = nullptr;
+    VkDescriptorSet bin_ds = VK_NULL_HANDLE;
+    VkDescriptorSet fine_ds = VK_NULL_HANDLE;
+    VkDescriptorSet fs_ds = VK_NULL_HANDLE;
+    VkDescriptorSet dep_ds = VK_NULL_HANDLE;
+    VkDescriptorSet hiz_ds = VK_NULL_HANDLE;
+    // Captured FS app bindings (constant across all draws in a color batch)
+    VkDescriptorSet fs_app_sets[8] = {VK_NULL_HANDLE};
+    uint32_t fs_app_set_mask = 0;
+    uint32_t fs_app_dyn_cnt[8] = {0};
+    uint32_t fs_app_dyn_off[8][8] = {{0}};
+    uint8_t fs_push_data[128] = {0};
+    uint32_t fs_push_size = 0;
+    uint64_t fs_state_hash = 0;
+    uint32_t accum_verts = 0;
+    uint32_t accum_tris = 0;
+    std::vector<SmBatchedDraw> draws;
+};
+
 struct SmCommandBuffer {
     VK_LOADER_DATA loader_data;
     SmDevice* dev = nullptr;
@@ -586,12 +664,20 @@ struct SmCommandBuffer {
     SmImage* dyn_col_imgs[SM_MAX_MRT] = {nullptr};
     SmImageView* dyn_col_views[SM_MAX_MRT] = {nullptr};
     SmImage* dyn_res_imgs[SM_MAX_MRT] = {nullptr};
+    bool dyn_col_store[SM_MAX_MRT] = {true,true,true,true,true,true,true,true};
+    bool dyn_dep_store = true;
+    bool dyn_stn_store = true;
+    bool pass_wrote_col[SM_MAX_MRT] = {false,false,false,false,false,false,false,false};
+    bool pass_wrote_dep = false;
+    bool pass_wrote_stn = false;
     uint32_t dyn_col_count = 0;
     SmImage* dyn_dep_img = nullptr;
     SmImageView* dyn_dep_view = nullptr;
     uint32_t dyn_w = 0, dyn_h = 0;
     SmPipeline* cur_gfx_pipe = nullptr;
     SmPipeline* cur_comp_pipe = nullptr;
+    SmPipeline* last_draw_pipe = nullptr;
+    uint64_t last_draw_state_hash = 0;
 
     VkViewport cur_vp{0, 0, 1920, 1080, 0.0f, 1.0f};
     VkRect2D cur_scissor{{0, 0}, {1920, 1080}};
@@ -647,6 +733,10 @@ struct SmCommandBuffer {
     SmBuffer* idx_buf = nullptr;
     VkDeviceSize idx_offset = 0;
     VkIndexType idx_type = VK_INDEX_TYPE_UINT32;
+
+    // v0.7 Multi-Draw Uber-Batcher & Lazy Sync queue
+    SmDrawBatch batch;
+    std::vector<SmImage*> pending_sync_imgs;
 };
 
 uint32_t sm_find_mem_type(SmPhysicalDevice* pd, uint32_t bits, VkMemoryPropertyFlags req);
@@ -677,7 +767,9 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              uint32_t sm_set_idx,
                              const SmFsCompileHints& hints,
                              std::vector<uint32_t>& out_comp_spv,
-                             std::string& err);
+                             std::string& err,
+                             bool* out_fs_uses_push = nullptr,
+                             bool* out_fs_has_discard_or_depth = nullptr);
 
 bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
                                   std::vector<uint32_t>& out_comp_spv,
@@ -685,3 +777,13 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
 
 void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img);
 void sm_wsi_cleanup_swapchain(SmSwapchain* sc);
+
+struct SmProfCounters {
+    std::atomic<uint64_t> rp_begins{0}, rp_clears{0}, rp_skip_clears{0};
+    std::atomic<uint64_t> sync_i2a{0}, sync_a2i{0}, sync_a2i_skip{0};
+    std::atomic<uint64_t> draws_total{0}, draws_small_tri{0}, draws_indirect{0}, draws_depth_only{0}, draws_batchable{0};
+    std::atomic<uint64_t> app_dispatches{0}, blits{0}, copies{0}, submits{0};
+    std::atomic<uint64_t> wait_fences_us{0}, wait_sems_us{0}, wsi_gpu_us{0}, wsi_x11_us{0};
+};
+extern bool g_sm_prof_en;
+extern SmProfCounters g_sm_prof;
