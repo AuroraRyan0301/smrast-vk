@@ -1,6 +1,6 @@
 #version 460
-// smrast_indirect_prep.comp — GPU-Driven Indirect Draw Dispatcher (Zero CPU Readback!)
-// Reads VkDrawIndirectCommand or VkDrawIndexedIndirectCommand directly from H20 HBM3,
+// smrast_indirect_prep.comp — GPU-Driven Indirect & IndirectCount Draw Dispatcher (Zero CPU Readback!)
+// Reads VkDrawIndirectCommand / VkDrawIndexedIndirectCommand + optional GPU Count Buffer from H20 HBM3,
 // patches SmVsParamsUBO[slot] + tile_counts tail metadata, and emits VkDispatchIndirectCommands!
 layout(local_size_x = 1) in;
 
@@ -8,6 +8,7 @@ layout(std430, set = 0, binding = 0) readonly buffer IndirectBuf { uint ind_raw[
 layout(std430, set = 0, binding = 1) buffer VsUboRawBuf          { uint vs_ubo_raw[]; };
 layout(std430, set = 0, binding = 2) buffer TileCountBuf         { uint tile_counts[]; };
 layout(std430, set = 0, binding = 3) writeonly buffer DispCmdBuf { uint disp_cmds[]; };
+layout(std430, set = 0, binding = 4) readonly buffer CountBuf    { uint draw_count_raw[]; };
 
 layout(push_constant) uniform IndPrepPC {
     uint ind_word_offset;  // byte_offset >> 2
@@ -17,20 +18,29 @@ layout(push_constant) uniform IndPrepPC {
     uint topo_code;        // 0=LIST, 1=STRIP, 2=FAN
     uint max_draw_verts;
     uint max_draw_tris;
-    uint pad;
+    uint count_word_off;   // 0xFFFFFFFFu = no count buffer
+    uint draw_index;       // index of this draw within IndirectCount batch
+    uint pad0;
 } pc;
 
 void main() {
-    uint count_v_or_i = ind_raw[pc.ind_word_offset + 0u];
-    uint inst_count   = ind_raw[pc.ind_word_offset + 1u];
-    uint first_v_or_i = ind_raw[pc.ind_word_offset + 2u];
+    uint count_v_or_i = 0u;
+    uint inst_count   = 0u;
+    uint first_v_or_i = 0u;
     int  vtx_offset   = 0;
     uint first_inst   = 0u;
-    if (pc.indexed != 0u) {
-        vtx_offset = int(ind_raw[pc.ind_word_offset + 3u]);
-        first_inst = ind_raw[pc.ind_word_offset + 4u];
-    } else {
-        first_inst = ind_raw[pc.ind_word_offset + 3u];
+
+    bool active_draw = (pc.count_word_off == 0xFFFFFFFFu) || (pc.draw_index < draw_count_raw[pc.count_word_off]);
+    if (active_draw) {
+        count_v_or_i = ind_raw[pc.ind_word_offset + 0u];
+        inst_count   = ind_raw[pc.ind_word_offset + 1u];
+        first_v_or_i = ind_raw[pc.ind_word_offset + 2u];
+        if (pc.indexed != 0u) {
+            vtx_offset = int(ind_raw[pc.ind_word_offset + 3u]);
+            first_inst = ind_raw[pc.ind_word_offset + 4u];
+        } else {
+            first_inst = ind_raw[pc.ind_word_offset + 3u];
+        }
     }
 
     uint tpi = 0u, vpi = 0u;
@@ -53,7 +63,6 @@ void main() {
         total_tris  = min(tpi * eff_i, pc.max_draw_tris);
     }
 
-    // Patch SmVsParamsUBO fields in-place (word offsets match struct SmVsParamsUBO!)
     uint b = pc.vs_ubo_word_off;
     vs_ubo_raw[b + 0u] = total_verts;
     vs_ubo_raw[b + 1u] = (pc.indexed == 0u) ? first_v_or_i : 0u;
@@ -62,12 +71,10 @@ void main() {
     vs_ubo_raw[b + 5u] = uint(vtx_offset);
     vs_ubo_raw[b + 16u] = max(vpi, 1u);
 
-    // Patch tile_counts indirect tail for smrast_bin.comp
     tile_counts[pc.meta_idx + 2u] = total_tris;
     tile_counts[pc.meta_idx + 3u] = max(tpi, 1u);
     tile_counts[pc.meta_idx + 4u] = max(vpi, 1u);
 
-    // Emit VkDispatchIndirectCommand[0] for VS (offset 0) and [1] for Bin (offset 16 bytes = 4 words)
     disp_cmds[0u] = (total_verts + 63u) / 64u;
     disp_cmds[1u] = (total_verts > 0u) ? 1u : 0u;
     disp_cmds[2u] = (total_verts > 0u) ? 1u : 0u;

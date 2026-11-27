@@ -16,12 +16,15 @@
 #include <atomic>
 
 static std::atomic<uint32_t> g_sm_trace_cnt{0};
+static std::atomic<int> g_sm_xray_frames{0};
+static bool g_sm_xray_env = false;
 static bool sm_trace_on() {
     static int en = -1;
     if (en < 0) en = getenv("SMRAST_TRACE") ? 1 : 0;
     return en != 0 && g_sm_trace_cnt.load(std::memory_order_relaxed) < 600;
 }
 #define SM_TRACE(fmt, ...) do { if (sm_trace_on()) { uint32_t _i = g_sm_trace_cnt.fetch_add(1); fprintf(stderr, "[SmTrace#%03u] " fmt "\n", _i, ##__VA_ARGS__); fflush(stderr); } } while (0)
+#define SM_XRAY(fmt, ...) do { if (g_sm_xray_frames.load(std::memory_order_relaxed) > 0) { fprintf(stderr, "[SmXRay] " fmt "\n", ##__VA_ARGS__); } } while (0)
 
 static void sm_crash_handler(int sig, siginfo_t* si, void* uctx) {
     ucontext_t* uc = reinterpret_cast<ucontext_t*>(uctx);
@@ -162,6 +165,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateInstanceVersion(uint32_t* pApi
 
 static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateInstance(
         const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks*, VkInstance* pInstance) {
+    if (getenv("SMRAST_XRAY")) {
+        g_sm_xray_env = true;
+    }
     if (getenv("SMRAST_CRASH_BT")) {
         struct sigaction sa{};
         sa.sa_sigaction = sm_crash_handler;
@@ -171,11 +177,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateInstance(
         sigaction(SIGFPE,  &sa, nullptr);
     }
     const char* backend_path = getenv("SMRAST_BACKEND_ICD");
-    if (!backend_path || !backend_path[0]) backend_path = "libGLX_nvidia.so.0";
-
-    void* dl = dlopen(backend_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+    void* dl = nullptr;
+    if (backend_path && backend_path[0]) {
+        dl = dlopen(backend_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+    } else {
+        static const char* kCandidates[] = {
+            "libGLX_nvidia.so.0",
+            "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.0",
+            "/usr/lib64/libGLX_nvidia.so.0",
+            "libvulkan_radeon.so",
+            "/usr/lib/x86_64-linux-gnu/libvulkan_radeon.so",
+        };
+        for (const char* cand : kCandidates) {
+            dl = dlopen(cand, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+            if (dl) { backend_path = cand; break; }
+        }
+    }
     if (!dl) {
-        fprintf(stderr, "[SmRast] ERROR: dlopen(%s) failed: %s\n", backend_path, dlerror());
+        fprintf(stderr, "[SmRast] ERROR: failed to load backend Vulkan ICD (set SMRAST_BACKEND_ICD=/path/to/backend_icd.so): %s\n", dlerror());
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     auto gipa = (PFN_vkGetInstanceProcAddr)dlsym(dl, "vk_icdGetInstanceProcAddr");
@@ -309,6 +328,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_GetPhysicalDeviceProperties2(VkPhysicalDevi
             m6->blockTexelViewCompatibleMultipleLayers = VK_TRUE;
             m6->maxCombinedImageSamplerDescriptorCount = 1;
             m6->fragmentShadingRateClampCombinerInputs = VK_FALSE;
+        } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR) {
+            auto* pdp = reinterpret_cast<VkPhysicalDevicePushDescriptorPropertiesKHR*>(next);
+            if (pdp->maxPushDescriptors == 0) pdp->maxPushDescriptors = 32;
         }
     }
 }
@@ -326,6 +348,15 @@ static VKAPI_ATTR void VKAPI_CALL sm_GetPhysicalDeviceFeatures2(VkPhysicalDevice
             reinterpret_cast<VkPhysicalDeviceMaintenance5FeaturesKHR*>(next)->maintenance5 = VK_TRUE;
         } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR) {
             reinterpret_cast<VkPhysicalDeviceMaintenance6FeaturesKHR*>(next)->maintenance6 = VK_TRUE;
+        } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT) {
+            reinterpret_cast<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT*>(next)->extendedDynamicState = VK_TRUE;
+        } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT) {
+            auto* eds2 = reinterpret_cast<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT*>(next);
+            eds2->extendedDynamicState2 = VK_TRUE;
+        } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT) {
+            reinterpret_cast<VkPhysicalDeviceIndexTypeUint8FeaturesEXT*>(next)->indexTypeUint8 = VK_TRUE;
+        } else if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT) {
+            reinterpret_cast<VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT*>(next)->dynamicRenderingUnusedAttachments = VK_TRUE;
         }
     }
 }
@@ -371,7 +402,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_GetPhysicalDeviceFormatProperties(VkPhysica
     // Ensure color/depth attachment & sampled/transfer bits are advertised cleanly
     p->optimalTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                 VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if (fmt == VK_FORMAT_D32_SFLOAT || fmt == VK_FORMAT_D24_UNORM_S8_UINT || fmt == VK_FORMAT_D16_UNORM)
+    if (fmt == VK_FORMAT_D32_SFLOAT || fmt == VK_FORMAT_D24_UNORM_S8_UINT || fmt == VK_FORMAT_D16_UNORM ||
+        fmt == VK_FORMAT_D32_SFLOAT_S8_UINT || fmt == VK_FORMAT_D16_UNORM_S8_UINT ||
+        fmt == VK_FORMAT_X8_D24_UNORM_PACK32 || fmt == VK_FORMAT_S8_UINT)
         p->optimalTilingFeatures |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
 }
 
@@ -386,7 +419,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_GetPhysicalDeviceFormatProperties2(VkPhysic
                                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                  VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
                                  VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if (fmt == VK_FORMAT_D32_SFLOAT || fmt == VK_FORMAT_D24_UNORM_S8_UINT || fmt == VK_FORMAT_D16_UNORM || fmt == VK_FORMAT_D32_SFLOAT_S8_UINT)
+    if (fmt == VK_FORMAT_D32_SFLOAT || fmt == VK_FORMAT_D24_UNORM_S8_UINT || fmt == VK_FORMAT_D16_UNORM ||
+        fmt == VK_FORMAT_D32_SFLOAT_S8_UINT || fmt == VK_FORMAT_D16_UNORM_S8_UINT ||
+        fmt == VK_FORMAT_X8_D24_UNORM_PACK32 || fmt == VK_FORMAT_S8_UINT)
         extra |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
     p->formatProperties.optimalTilingFeatures |= extra;
     for (auto* next = reinterpret_cast<VkBaseOutStructure*>(p->pNext); next; next = next->pNext) {
@@ -503,8 +538,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateDeviceExtensionProperties(
             "VK_KHR_load_store_op_none",
             "VK_KHR_maintenance1", "VK_KHR_maintenance2", "VK_KHR_maintenance3", "VK_KHR_maintenance4",
             "VK_KHR_maintenance5", "VK_KHR_maintenance6",
+            "VK_KHR_push_descriptor",
             "VK_KHR_shader_atomic_int64",
+            "VK_KHR_shader_float16_int8",
+            "VK_KHR_16bit_storage",
+            "VK_KHR_8bit_storage",
+            "VK_KHR_shader_subgroup_extended_types",
             "VK_KHR_shader_subgroup_uniform_control_flow",
+            "VK_KHR_shader_integer_dot_product",
+            "VK_KHR_shader_non_semantic_info",
+            "VK_KHR_shader_terminate_invocation",
+            "VK_KHR_shader_clock",
+            "VK_KHR_workgroup_memory_explicit_layout",
+            "VK_KHR_format_feature_flags2",
             "VK_KHR_dynamic_rendering",
             "VK_KHR_synchronization2",
             "VK_KHR_create_renderpass2",
@@ -529,6 +575,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateDeviceExtensionProperties(
             "VK_KHR_imageless_framebuffer",
             "VK_KHR_depth_stencil_resolve",
             "VK_KHR_zero_initialize_workgroup_memory",
+            "VK_EXT_descriptor_indexing",
+            "VK_EXT_index_type_uint8",
+            "VK_EXT_mutable_descriptor_type",
+            "VK_EXT_shader_subgroup_ballot",
+            "VK_EXT_shader_subgroup_vote",
+            "VK_EXT_conditional_rendering",
+            "VK_EXT_border_color_swizzle",
+            "VK_EXT_image_2d_view_of_3d",
+            "VK_EXT_image_view_min_lod",
+            "VK_EXT_texel_buffer_alignment",
             "VK_EXT_robustness2",
             "VK_EXT_extended_dynamic_state",
             "VK_EXT_extended_dynamic_state2",
@@ -545,6 +601,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateDeviceExtensionProperties(
             "VK_EXT_inline_uniform_block",
             "VK_EXT_pipeline_creation_cache_control",
             "VK_EXT_shader_demote_to_helper_invocation",
+            "VK_EXT_dynamic_rendering_unused_attachments",
             "VK_EXT_4444_formats",
         };
         for (const char* a : kAllow) if (strcmp(n, a) == 0) return true;
@@ -552,7 +609,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateDeviceExtensionProperties(
     };
     std::vector<VkExtensionProperties> exts;
     exts.reserve(64);
-    bool has_sc = false, has_scm = false, has_lson = false, has_m5 = false, has_m6 = false;
+    bool has_sc = false, has_scm = false, has_lson = false, has_m5 = false, has_m6 = false, has_drua = false;
     for (const auto& e : raw_exts) {
         if (!is_allowed(e.extensionName)) continue;
         if (strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) has_sc = true;
@@ -560,6 +617,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateDeviceExtensionProperties(
         if (strcmp(e.extensionName, "VK_KHR_load_store_op_none") == 0) has_lson = true;
         if (strcmp(e.extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0) has_m5 = true;
         if (strcmp(e.extensionName, VK_KHR_MAINTENANCE_6_EXTENSION_NAME) == 0) has_m6 = true;
+        if (strcmp(e.extensionName, "VK_EXT_dynamic_rendering_unused_attachments") == 0) has_drua = true;
         exts.push_back(e);
     }
     auto add_ext = [&](const char* name, uint32_t ver) {
@@ -573,6 +631,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_EnumerateDeviceExtensionProperties(
     if (!has_lson) add_ext("VK_KHR_load_store_op_none", 1);
     if (!has_m5)   add_ext(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, 1);
     if (!has_m6)   add_ext(VK_KHR_MAINTENANCE_6_EXTENSION_NAME, 1);
+    if (!has_drua) add_ext("VK_EXT_dynamic_rendering_unused_attachments", 1);
     if (!pProps) { *pCount = (uint32_t)exts.size(); return VK_SUCCESS; }
     uint32_t copy = std::min(*pCount, (uint32_t)exts.size());
     memcpy(pProps, exts.data(), copy * sizeof(VkExtensionProperties));
@@ -606,7 +665,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateDevice(
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vad{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     VkPhysicalDeviceDepthClipEnableFeaturesEXT dce{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
     VkPhysicalDeviceTransformFeedbackFeaturesEXT tfb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdt{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
+    VkPhysicalDeviceBorderColorSwizzleFeaturesEXT bcs{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT};
+    VkPhysicalDeviceImage2DViewOf3DFeaturesEXT i2d3d{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT};
+    VkPhysicalDeviceImageViewMinLodFeaturesEXT ivml{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT crf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
     void* tail_next = &r2;
+    auto chain_tail = [&](void* s) {
+        reinterpret_cast<VkBaseOutStructure*>(s)->pNext = nullptr;
+        reinterpret_cast<VkBaseOutStructure*>(tail_next)->pNext = reinterpret_cast<VkBaseOutStructure*>(s);
+        tail_next = s;
+    };
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
     if (pCreateInfo && pCreateInfo->pEnabledFeatures) f2.features = *pCreateInfo->pEnabledFeatures;
     if (pCreateInfo && pCreateInfo->pNext) {
@@ -625,26 +695,50 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateDevice(
                 f13.pNext = &f12;
                 f13.dynamicRendering = VK_TRUE;
                 f13.synchronization2 = VK_TRUE;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES) {
+                const auto* di = reinterpret_cast<const VkPhysicalDeviceDescriptorIndexingFeatures*>(n);
+                f12.descriptorIndexing = VK_TRUE;
+                if (di->shaderSampledImageArrayNonUniformIndexing) f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+                if (di->shaderStorageBufferArrayNonUniformIndexing) f12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+                if (di->shaderStorageImageArrayNonUniformIndexing) f12.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
+                if (di->shaderUniformTexelBufferArrayNonUniformIndexing) f12.shaderUniformTexelBufferArrayNonUniformIndexing = VK_TRUE;
+                if (di->shaderStorageTexelBufferArrayNonUniformIndexing) f12.shaderStorageTexelBufferArrayNonUniformIndexing = VK_TRUE;
+                if (di->descriptorBindingSampledImageUpdateAfterBind) f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+                if (di->descriptorBindingStorageImageUpdateAfterBind) f12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+                if (di->descriptorBindingStorageBufferUpdateAfterBind) f12.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+                if (di->descriptorBindingUniformTexelBufferUpdateAfterBind) f12.descriptorBindingUniformTexelBufferUpdateAfterBind = VK_TRUE;
+                if (di->descriptorBindingStorageTexelBufferUpdateAfterBind) f12.descriptorBindingStorageTexelBufferUpdateAfterBind = VK_TRUE;
+                if (di->descriptorBindingUpdateUnusedWhilePending) f12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+                if (di->descriptorBindingPartiallyBound) f12.descriptorBindingPartiallyBound = VK_TRUE;
+                if (di->descriptorBindingVariableDescriptorCount) f12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+                if (di->runtimeDescriptorArray) f12.runtimeDescriptorArray = VK_TRUE;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
+                const auto* bda = reinterpret_cast<const VkPhysicalDeviceBufferDeviceAddressFeatures*>(n);
+                if (bda->bufferDeviceAddress) f12.bufferDeviceAddress = VK_TRUE;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) {
+                f12.timelineSemaphore = VK_TRUE;
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES) {
+                if (reinterpret_cast<const VkPhysicalDeviceScalarBlockLayoutFeatures*>(n)->scalarBlockLayout) f12.scalarBlockLayout = VK_TRUE;
             } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT) {
-                cbc = *reinterpret_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(n);
-                cbc.pNext = nullptr;
-                reinterpret_cast<VkBaseOutStructure*>(tail_next)->pNext = reinterpret_cast<VkBaseOutStructure*>(&cbc);
-                tail_next = &cbc;
+                cbc = *reinterpret_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(n); chain_tail(&cbc);
             } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT) {
-                vad = *reinterpret_cast<const VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT*>(n);
-                vad.pNext = nullptr;
-                reinterpret_cast<VkBaseOutStructure*>(tail_next)->pNext = reinterpret_cast<VkBaseOutStructure*>(&vad);
-                tail_next = &vad;
+                vad = *reinterpret_cast<const VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT*>(n); chain_tail(&vad);
             } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT) {
-                dce = *reinterpret_cast<const VkPhysicalDeviceDepthClipEnableFeaturesEXT*>(n);
-                dce.pNext = nullptr;
-                reinterpret_cast<VkBaseOutStructure*>(tail_next)->pNext = reinterpret_cast<VkBaseOutStructure*>(&dce);
-                tail_next = &dce;
+                dce = *reinterpret_cast<const VkPhysicalDeviceDepthClipEnableFeaturesEXT*>(n); chain_tail(&dce);
             } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
-                tfb = *reinterpret_cast<const VkPhysicalDeviceTransformFeedbackFeaturesEXT*>(n);
-                tfb.pNext = nullptr;
-                reinterpret_cast<VkBaseOutStructure*>(tail_next)->pNext = reinterpret_cast<VkBaseOutStructure*>(&tfb);
-                tail_next = &tfb;
+                tfb = *reinterpret_cast<const VkPhysicalDeviceTransformFeedbackFeaturesEXT*>(n); chain_tail(&tfb);
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT) {
+                mdt = *reinterpret_cast<const VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT*>(n); chain_tail(&mdt);
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT) {
+                bcs = *reinterpret_cast<const VkPhysicalDeviceBorderColorSwizzleFeaturesEXT*>(n); chain_tail(&bcs);
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT) {
+                i2d3d = *reinterpret_cast<const VkPhysicalDeviceImage2DViewOf3DFeaturesEXT*>(n); chain_tail(&i2d3d);
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT) {
+                ivml = *reinterpret_cast<const VkPhysicalDeviceImageViewMinLodFeaturesEXT*>(n); chain_tail(&ivml);
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT) {
+                crf = *reinterpret_cast<const VkPhysicalDeviceConditionalRenderingFeaturesEXT*>(n); chain_tail(&crf);
+            } else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT) {
+                iu8 = *reinterpret_cast<const VkPhysicalDeviceIndexTypeUint8FeaturesEXT*>(n); chain_tail(&iu8);
             }
         }
     }
@@ -652,7 +746,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateDevice(
 
     std::vector<const char*> bexts;
     bexts.push_back(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
-    bool has_r2 = false;
+    bool has_r2 = false, has_pd = false;
     if (pCreateInfo) {
         for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
             const char* e = pCreateInfo->ppEnabledExtensionNames[i];
@@ -662,11 +756,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateDevice(
             if (strcmp(e, "VK_KHR_load_store_op_none") == 0) continue;
             if (strcmp(e, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0) continue;
             if (strcmp(e, VK_KHR_MAINTENANCE_6_EXTENSION_NAME) == 0) continue;
+            if (strcmp(e, "VK_EXT_dynamic_rendering_unused_attachments") == 0) continue;
             if (strcmp(e, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) == 0) has_r2 = true;
+            if (strcmp(e, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0) has_pd = true;
             bexts.push_back(e);
         }
     }
     if (!has_r2) bexts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    if (!has_pd) bexts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
     VkDeviceCreateInfo bdci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qci, 0, nullptr,
                             (uint32_t)bexts.size(), bexts.data(), nullptr};
@@ -704,6 +801,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateDevice(
     LOAD_D(CreateFence); LOAD_D(DestroyFence); LOAD_D(ResetFences); LOAD_D(GetFenceStatus); LOAD_D(WaitForFences);
     LOAD_D(CreateSemaphore); LOAD_D(DestroySemaphore);
     LOAD_D(CmdBindPipeline); LOAD_D(CmdBindDescriptorSets); LOAD_D(CmdPushConstants);
+    LOAD_D(CmdPushDescriptorSetKHR);
     LOAD_D(CmdDispatch); LOAD_D(CmdDispatchIndirect);
     LOAD_D(CmdCopyBuffer); LOAD_D(CmdCopyImage); LOAD_D(CmdCopyBufferToImage); LOAD_D(CmdCopyImageToBuffer);
     LOAD_D(CmdFillBuffer); LOAD_D(CmdUpdateBuffer); LOAD_D(CmdClearColorImage); LOAD_D(CmdPipelineBarrier);
@@ -835,13 +933,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BindBufferMemory(VkDevice d, VkBuffer b
 static bool is_depth_format(VkFormat f) {
     return f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D32_SFLOAT ||
            f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT ||
-           f == VK_FORMAT_X8_D24_UNORM_PACK32;
+           f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+           f == VK_FORMAT_S8_UINT;
+}
+static bool is_stencil_format(VkFormat f) {
+    return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+           f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_S8_UINT;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateImage(VkDevice d, const VkImageCreateInfo* ci, const VkAllocationCallbacks*, VkImage* out) {
     auto* dev = reinterpret_cast<SmDevice*>(d);
     VkImageCreateInfo ici = *ci;
     bool depth = is_depth_format(ci->format);
+    bool stencil = is_stencil_format(ci->format);
     // Strip GRAPHICS attachment bits & MSAA samples when creating real H20 image; add transfer bits for clean Compute interop!
     ici.usage = (ci->usage & ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT))
               | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -867,12 +971,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateImage(VkDevice d, const VkImageCr
     si->usage = ci->usage;
     si->samples = ci->samples;
     si->is_depth = depth;
+    si->has_stencil = stencil;
     if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) {
         std::lock_guard<std::mutex> lk(dev->mtx);
         dev->storage_images.push_back(si);
     }
     if (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
         sm_ensure_image_attach_buf(dev, si);
+        if (stencil) sm_ensure_image_stencil_buf(dev, si);
     }
     SM_TRACE("CreateImage(%ux%u mips=%u lay=%u fmt=%d usage=0x%x til=%d)",
              ci->extent.width, ci->extent.height, ci->mipLevels, ci->arrayLayers,
@@ -889,9 +995,10 @@ static VKAPI_ATTR void VKAPI_CALL sm_DestroyImage(VkDevice d, VkImage i, const V
         auto& v = dev->storage_images;
         v.erase(std::remove(v.begin(), v.end(), si), v.end());
     }
-    if (si->attach_buf) { dev->fn.DestroyBuffer(dev->real_dev, si->attach_buf, nullptr); dev->fn.FreeMemory(dev->real_dev, si->attach_mem, nullptr); }
-    if (si->host_buf)   { dev->fn.DestroyBuffer(dev->real_dev, si->host_buf, nullptr);   dev->fn.FreeMemory(dev->real_dev, si->host_mem, nullptr); }
-    if (si->real_img)   dev->fn.DestroyImage(dev->real_dev, si->real_img, nullptr);
+    if (si->attach_buf)  { dev->fn.DestroyBuffer(dev->real_dev, si->attach_buf, nullptr);  dev->fn.FreeMemory(dev->real_dev, si->attach_mem, nullptr); }
+    if (si->stencil_buf) { dev->fn.DestroyBuffer(dev->real_dev, si->stencil_buf, nullptr); dev->fn.FreeMemory(dev->real_dev, si->stencil_mem, nullptr); }
+    if (si->host_buf)    { dev->fn.DestroyBuffer(dev->real_dev, si->host_buf, nullptr);    dev->fn.FreeMemory(dev->real_dev, si->host_mem, nullptr); }
+    if (si->real_img)    dev->fn.DestroyImage(dev->real_dev, si->real_img, nullptr);
     delete si;
 }
 static VKAPI_ATTR void VKAPI_CALL sm_GetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements* mr) {
@@ -1181,19 +1288,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
             sp->front_face = gci.pRasterizationState->frontFace;
         }
         if (gci.pDepthStencilState) {
-            sp->depth_test  = (gci.pDepthStencilState->depthTestEnable == VK_TRUE);
-            sp->depth_write = (gci.pDepthStencilState->depthWriteEnable == VK_TRUE);
-            sp->depth_op    = gci.pDepthStencilState->depthCompareOp;
+            sp->depth_test    = (gci.pDepthStencilState->depthTestEnable == VK_TRUE);
+            sp->depth_write   = (gci.pDepthStencilState->depthWriteEnable == VK_TRUE);
+            sp->depth_op      = gci.pDepthStencilState->depthCompareOp;
+            sp->stencil_test  = (gci.pDepthStencilState->stencilTestEnable == VK_TRUE);
+            sp->stencil_front = gci.pDepthStencilState->front;
+            sp->stencil_back  = gci.pDepthStencilState->back;
         }
-        if (gci.pColorBlendState && gci.pColorBlendState->attachmentCount > 0) {
-            uint32_t nb = std::min(gci.pColorBlendState->attachmentCount, SM_MAX_MRT);
-            for (uint32_t b = 0; b < nb; ++b) {
-                const auto& cb = gci.pColorBlendState->pAttachments[b];
-                sp->blend_enable[b]     = (cb.blendEnable == VK_TRUE);
-                sp->src_color_blend[b]  = cb.srcColorBlendFactor;
-                sp->dst_color_blend[b]  = cb.dstColorBlendFactor;
-                sp->color_blend_op[b]   = cb.colorBlendOp;
-                sp->color_write_mask[b] = cb.colorWriteMask;
+        bool has_dyn_stencil = false;
+        if (gci.pDynamicState && gci.pDynamicState->pDynamicStates) {
+            for (uint32_t ds_i = 0; ds_i < gci.pDynamicState->dynamicStateCount; ++ds_i) {
+                VkDynamicState st = gci.pDynamicState->pDynamicStates[ds_i];
+                if (st == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE || st == VK_DYNAMIC_STATE_STENCIL_OP)
+                    has_dyn_stencil = true;
+            }
+        }
+        if (gci.pColorBlendState) {
+            for (int k = 0; k < 4; ++k) sp->blend_constants[k] = gci.pColorBlendState->blendConstants[k];
+            if (gci.pColorBlendState->attachmentCount > 0 && gci.pColorBlendState->pAttachments) {
+                uint32_t nb = std::min(gci.pColorBlendState->attachmentCount, SM_MAX_MRT);
+                for (uint32_t b = 0; b < nb; ++b) {
+                    const auto& cb = gci.pColorBlendState->pAttachments[b];
+                    sp->blend_enable[b]     = (cb.blendEnable == VK_TRUE);
+                    sp->src_color_blend[b]  = cb.srcColorBlendFactor;
+                    sp->dst_color_blend[b]  = cb.dstColorBlendFactor;
+                    sp->color_blend_op[b]   = cb.colorBlendOp;
+                    sp->src_alpha_blend[b]  = cb.srcAlphaBlendFactor;
+                    sp->dst_alpha_blend[b]  = cb.dstAlphaBlendFactor;
+                    sp->alpha_blend_op[b]   = cb.alphaBlendOp;
+                    sp->color_write_mask[b] = cb.colorWriteMask;
+                }
             }
         }
         if (gci.pViewportState) {
@@ -1255,7 +1379,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
         }
         if (ok && fs_spv_ptr) {
             SmFsCompileHints hints;
-            for (uint32_t b = 0; b < SM_MAX_MRT; ++b) hints.blend_en[b] = sp->blend_enable[b];
+            hints.stencil_en = sp->stencil_test || has_dyn_stencil;
+            for (uint32_t b = 0; b < SM_MAX_MRT; ++b) {
+                hints.blend_en[b]   = sp->blend_enable[b];
+                hints.write_mask[b] = sp->color_write_mask[b];
+            }
             if (gci.renderPass != VK_NULL_HANDLE) {
                 auto* rp = from_h<SmRenderPass>(gci.renderPass);
                 for (uint32_t r = 0; r < rp->color_attach_count && r < SM_MAX_MRT; ++r) {
@@ -1289,6 +1417,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
                 VkResult r = dev->fn.CreateComputePipelines(dev->real_dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &sp->fs_comp_pipe);
                 dev->fn.DestroyShaderModule(dev->real_dev, csm, nullptr);
                 if (r != VK_SUCCESS) { fprintf(stderr, "[SmRast] FS CreateComputePipelines failed: %d\n", r); ok = false; }
+            }
+        } else if (ok && !fs_spv_ptr && (sp->stencil_test || has_dyn_stencil)) {
+            std::vector<uint32_t> stn_spv;
+            std::string err;
+            if (sm_build_null_fs_stencil_spv(sp->layout->sm_set_index, stn_spv, err)) {
+                VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, stn_spv.size()*4, stn_spv.data()};
+                VkShaderModule csm = VK_NULL_HANDLE;
+                dev->fn.CreateShaderModule(dev->real_dev, &smci, nullptr, &csm);
+                VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0,
+                    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, csm, "main", nullptr},
+                    sp->layout->sm_fs_layout, VK_NULL_HANDLE, -1};
+                dev->fn.CreateComputePipelines(dev->real_dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &sp->fs_comp_pipe);
+                dev->fn.DestroyShaderModule(dev->real_dev, csm, nullptr);
             }
         }
         if (!ok) {
@@ -1380,6 +1521,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BeginCommandBuffer(VkCommandBuffer cb, 
     scb->has_dyn_depth_test = false;
     scb->has_dyn_depth_write = false;
     scb->has_dyn_depth_op = false;
+    scb->has_dyn_blend_const = false;
+    scb->has_dyn_stencil_test = false;
+    for (int f = 0; f < 2; ++f) {
+        scb->has_dyn_stencil_op[f] = false;
+        scb->has_dyn_stencil_ref[f] = false;
+        scb->has_dyn_stencil_cmask[f] = false;
+        scb->has_dyn_stencil_wmask[f] = false;
+    }
     scb->gfx_set_mask = 0;
     memset(scb->gfx_dyn_counts, 0, sizeof(scb->gfx_dyn_counts));
     memset(scb->has_dyn_vtx_stride, 0, sizeof(scb->has_dyn_vtx_stride));
@@ -1388,6 +1537,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BeginCommandBuffer(VkCommandBuffer cb, 
     memset(scb->comp_dyn_counts, 0, sizeof(scb->comp_dyn_counts));
     scb->comp_push_size = 0;
     scb->comp_state_dirty = false;
+    for (int s = 0; s < 16; ++s) {
+        scb->gfx_push_descs[s].active = false;
+        scb->gfx_push_descs[s].writes.clear(); scb->gfx_push_descs[s].bufs.clear();
+        scb->gfx_push_descs[s].imgs.clear();   scb->gfx_push_descs[s].bvs.clear();
+        scb->comp_push_descs[s].active = false;
+        scb->comp_push_descs[s].writes.clear(); scb->comp_push_descs[s].bufs.clear();
+        scb->comp_push_descs[s].imgs.clear();   scb->comp_push_descs[s].bvs.clear();
+    }
     return scb->dev->fn.BeginCommandBuffer(scb->real_cb, bi);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL sm_EndCommandBuffer(VkCommandBuffer cb) {
@@ -1527,8 +1684,11 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL sm_GetBufferDeviceAddress(VkDevice 
 }
 static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateDescriptorUpdateTemplate(VkDevice, const VkDescriptorUpdateTemplateCreateInfo* ci, const VkAllocationCallbacks*, VkDescriptorUpdateTemplate* out) {
     auto* t = new SmDescriptorUpdateTemplate();
-    if (ci && ci->descriptorUpdateEntryCount > 0 && ci->pDescriptorUpdateEntries) {
-        t->entries.assign(ci->pDescriptorUpdateEntries, ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+    if (ci) {
+        t->bind_point = ci->pipelineBindPoint;
+        if (ci->descriptorUpdateEntryCount > 0 && ci->pDescriptorUpdateEntries) {
+            t->entries.assign(ci->pDescriptorUpdateEntries, ci->pDescriptorUpdateEntries + ci->descriptorUpdateEntryCount);
+        }
     }
     *out = to_h<VkDescriptorUpdateTemplate>(t);
     return VK_SUCCESS;
@@ -1646,9 +1806,13 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBlitImage2(VkCommandBuffer cb, const VkB
 }
 static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_MAX_MRT], SmImage* dep_img,
                                     uint32_t W, uint32_t H, uint32_t clear_mask,
-                                    const uint32_t clear_words[SM_MAX_MRT][4], float clear_depth);
+                                    const uint32_t clear_words[SM_MAX_MRT][4], float clear_depth, uint32_t clear_stencil = 0u);
 static void sm_sync_attach_to_image(SmCommandBuffer* scb, SmImage* img, VkImageLayout target_layout, uint32_t mip = 0, uint32_t layer = 0);
 static void pack_clear_words(const VkClearColorValue& cv, VkFormat fmt, uint32_t out[4]);
+static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_count, uint32_t instance_count,
+                                 uint32_t first_vert_or_idx, int32_t vertex_offset, uint32_t first_instance,
+                                 bool indexed, SmBuffer* indirect_buf, VkDeviceSize indirect_offset,
+                                 SmBuffer* count_buf = nullptr, VkDeviceSize count_offset = 0, uint32_t draw_idx = 0);
 
 static VKAPI_ATTR void VKAPI_CALL sm_CmdResolveImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageResolve* r) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
@@ -1681,7 +1845,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdResolveImage2(VkCommandBuffer cb, const 
 static VKAPI_ATTR void VKAPI_CALL sm_CmdClearAttachments(VkCommandBuffer cb, uint32_t attachmentCount, const VkClearAttachment* pAttachments, uint32_t, const VkClearRect*) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
     if (!pAttachments || attachmentCount == 0) return;
-    SmImage* col_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    SmImage* col_imgs[SM_MAX_MRT] = {nullptr};
     SmImage* dep_img = nullptr;
     uint32_t W = 0, H = 0;
     if (scb->in_dyn_rendering) {
@@ -1701,6 +1865,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearAttachments(VkCommandBuffer cb, uin
     uint32_t clear_mask = 0;
     uint32_t clear_words[SM_MAX_MRT][4] = {{0}};
     float clear_depth = 1.0f;
+    uint32_t clear_stencil = 0u;
     for (uint32_t i = 0; i < attachmentCount; ++i) {
         const auto& a = pAttachments[i];
         if ((a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) && a.colorAttachment < SM_MAX_MRT && col_imgs[a.colorAttachment]) {
@@ -1708,19 +1873,35 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearAttachments(VkCommandBuffer cb, uin
             pack_clear_words(a.clearValue.color, col_imgs[a.colorAttachment]->format, clear_words[a.colorAttachment]);
         }
         if ((a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) && dep_img) {
-            clear_mask |= 16u;
+            clear_mask |= 256u;
             clear_depth = a.clearValue.depthStencil.depth;
         }
+        if ((a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && dep_img && dep_img->has_stencil) {
+            clear_mask |= 1024u;
+            clear_stencil = a.clearValue.depthStencil.stencil & 0xFFu;
+        }
     }
-    if (clear_mask) sm_begin_pass_clear_mrt(scb, col_imgs, dep_img, W, H, clear_mask, clear_words, clear_depth);
+    if (clear_mask) sm_begin_pass_clear_mrt(scb, col_imgs, dep_img, W, H, clear_mask, clear_words, clear_depth, clear_stencil);
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdDrawIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
 static VKAPI_ATTR void VKAPI_CALL sm_CmdDrawIndexedIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
-static VKAPI_ATTR void VKAPI_CALL sm_CmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkBuffer, VkDeviceSize, uint32_t maxDrawCount, uint32_t stride) {
-    if (maxDrawCount > 0) sm_CmdDrawIndirect(cb, buf, off, std::min(maxDrawCount, 16u), stride);
+static VKAPI_ATTR void VKAPI_CALL sm_CmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkBuffer countBuf, VkDeviceSize countOff, uint32_t maxDrawCount, uint32_t stride) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    auto* sb = from_h<SmBuffer>(buf);
+    auto* ctb = from_h<SmBuffer>(countBuf);
+    uint32_t st = stride ? stride : sizeof(VkDrawIndirectCommand);
+    uint32_t n = std::min(maxDrawCount, 64u);
+    for (uint32_t i = 0; i < n; ++i)
+        sm_execute_draw_core(scb, 0, 1, 0, 0, 0, false, sb, off + (VkDeviceSize)i * st, ctb, countOff, i);
 }
-static VKAPI_ATTR void VKAPI_CALL sm_CmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkBuffer, VkDeviceSize, uint32_t maxDrawCount, uint32_t stride) {
-    if (maxDrawCount > 0) sm_CmdDrawIndexedIndirect(cb, buf, off, std::min(maxDrawCount, 16u), stride);
+static VKAPI_ATTR void VKAPI_CALL sm_CmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkBuffer countBuf, VkDeviceSize countOff, uint32_t maxDrawCount, uint32_t stride) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    auto* sb = from_h<SmBuffer>(buf);
+    auto* ctb = from_h<SmBuffer>(countBuf);
+    uint32_t st = stride ? stride : sizeof(VkDrawIndexedIndirectCommand);
+    uint32_t n = std::min(maxDrawCount, 64u);
+    for (uint32_t i = 0; i < n; ++i)
+        sm_execute_draw_core(scb, 0, 1, 0, 0, 0, true, sb, off + (VkDeviceSize)i * st, ctb, countOff, i);
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetEvent(VkCommandBuffer cb, VkEvent ev, VkPipelineStageFlags stage) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
@@ -1840,25 +2021,31 @@ static uint16_t f32_to_f16(float f) {
     return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
 }
 static uint32_t f32_to_uf11_host(float v) {
-    if (v <= 0.0f) return 0u;
+    if (!(v > 0.0f)) return 0u;
     uint32_t u; memcpy(&u, &v, 4);
     uint32_t e = (u >> 23) & 255u;
     if (e < 112u) return 0u;
-    if (e >= 143u) return 0x7FFu;
+    if (e >= 143u) return 0x7BFu;
     return ((e - 112u) << 6) | ((u >> 17) & 63u);
 }
 static uint32_t f32_to_uf10_host(float v) {
-    if (v <= 0.0f) return 0u;
+    if (!(v > 0.0f)) return 0u;
     uint32_t u; memcpy(&u, &v, 4);
     uint32_t e = (u >> 23) & 255u;
     if (e < 112u) return 0u;
-    if (e >= 143u) return 0x3FFu;
+    if (e >= 143u) return 0x3DFu;
     return ((e - 112u) << 5) | ((u >> 18) & 31u);
 }
 static void pack_clear_words(const VkClearColorValue& cv, VkFormat fmt, uint32_t out[4]) {
     out[0] = out[1] = out[2] = out[3] = 0;
     uint32_t fc = sm_format_code(fmt);
     const float* f = cv.float32;
+    auto cl01 = [](float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); };
+    auto cl11 = [](float x){ return x < -1.f ? -1.f : (x > 1.f ? 1.f : x); };
+    auto sn8  = [&](float x){ return (uint32_t)(uint8_t)(int8_t)(cl11(x) * 127.f); };
+    auto un16 = [&](float x){ return (uint32_t)(uint16_t)(cl01(x) * 65535.f + 0.5f); };
+    auto sn16 = [&](float x){ return (uint32_t)(uint16_t)(int16_t)(cl11(x) * 32767.f); };
+
     if (fc == 4u) { // RGBA16F
         out[0] = (uint32_t)f32_to_f16(f[0]) | ((uint32_t)f32_to_f16(f[1]) << 16);
         out[1] = (uint32_t)f32_to_f16(f[2]) | ((uint32_t)f32_to_f16(f[3]) << 16);
@@ -1875,20 +2062,47 @@ static void pack_clear_words(const VkClearColorValue& cv, VkFormat fmt, uint32_t
     } else if (fc == 11u) { // R32_UINT / R32_SINT
         out[0] = cv.uint32[0];
     } else if (fc == 9u) { // RGB10A2
-        auto cl = [](float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); };
-        out[0] = (uint32_t)(cl(f[0])*1023.f+0.5f) | ((uint32_t)(cl(f[1])*1023.f+0.5f)<<10)
-               | ((uint32_t)(cl(f[2])*1023.f+0.5f)<<20) | ((uint32_t)(cl(f[3])*3.f+0.5f)<<30);
+        out[0] = (uint32_t)(cl01(f[0])*1023.f+0.5f) | ((uint32_t)(cl01(f[1])*1023.f+0.5f)<<10)
+               | ((uint32_t)(cl01(f[2])*1023.f+0.5f)<<20) | ((uint32_t)(cl01(f[3])*3.f+0.5f)<<30);
+    } else if (fc == 12u) { // RGBA8_SNORM
+        out[0] = sn8(f[0]) | (sn8(f[1]) << 8) | (sn8(f[2]) << 16) | (sn8(f[3]) << 24);
+    } else if (fc == 13u) { // RG16_UNORM
+        out[0] = un16(f[0]) | (un16(f[1]) << 16);
+    } else if (fc == 14u) { // RG16_SNORM
+        out[0] = sn16(f[0]) | (sn16(f[1]) << 16);
+    } else if (fc == 15u) { // RGBA16_UNORM
+        out[0] = un16(f[0]) | (un16(f[1]) << 16);
+        out[1] = un16(f[2]) | (un16(f[3]) << 16);
+    } else if (fc == 16u) { // RGBA16_SNORM
+        out[0] = sn16(f[0]) | (sn16(f[1]) << 16);
+        out[1] = sn16(f[2]) | (sn16(f[3]) << 16);
+    } else if (fc == 17u) { // R8_UNORM / R8_UINT (replicate 1B x 4)
+        uint32_t b = (fmt == VK_FORMAT_R8_UINT || fmt == VK_FORMAT_R8_SINT)
+                     ? (cv.uint32[0] & 0xFFu) : ((uint32_t)(cl01(f[0]) * 255.f + 0.5f) & 0xFFu);
+        out[0] = b | (b << 8) | (b << 16) | (b << 24);
+    } else if (fc == 18u) { // RG8_UNORM / RG8_SNORM (replicate 2B x 2)
+        uint32_t w = (fmt == VK_FORMAT_R8G8_SNORM)
+                     ? (sn8(f[0]) | (sn8(f[1]) << 8))
+                     : (((uint32_t)(cl01(f[0])*255.f+0.5f) & 0xFFu) | (((uint32_t)(cl01(f[1])*255.f+0.5f) & 0xFFu) << 8));
+        out[0] = w | (w << 16);
+    } else if (fc == 19u) { // R16_SFLOAT (replicate 2B x 2)
+        uint32_t w = (uint32_t)f32_to_f16(f[0]);
+        out[0] = w | (w << 16);
+    } else if (fc == 20u) { // R16_UNORM / R16_UINT (replicate 2B x 2)
+        uint32_t w = (fmt == VK_FORMAT_R16_UINT || fmt == VK_FORMAT_R16_SINT)
+                     ? (cv.uint32[0] & 0xFFFFu) : un16(f[0]);
+        out[0] = w | (w << 16);
     } else {
         out[0] = pack_clear_color(cv, fmt);
     }
 }
 
 // =============================================================================
-// Core RenderPass / Dynamic Rendering (4x MRT + HDR) & Compute Rasterization
+// Core RenderPass / Dynamic Rendering (8x MRT + 21 Formats + 8-bit Stencil!)
 // =============================================================================
 static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_MAX_MRT], SmImage* dep_img,
                                     uint32_t W, uint32_t H, uint32_t clear_mask,
-                                    const uint32_t clear_words[SM_MAX_MRT][4], float clear_depth) {
+                                    const uint32_t clear_words[SM_MAX_MRT][4], float clear_depth, uint32_t clear_stencil) {
     auto* dev = scb->dev;
     sm_ensure_vis_size(dev, W, H);
     for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
@@ -1899,40 +2113,42 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
     }
     if (dep_img) {
         sm_ensure_image_attach_buf(dev, dep_img);
-        if (clear_mask & 16u) dep_img->attach_dirty = true;
+        if (dep_img->has_stencil) sm_ensure_image_stencil_buf(dev, dep_img);
+        if (clear_mask & 256u) dep_img->attach_dirty = true;
     }
 
     uint32_t cslot = 0;
     {
         std::lock_guard<std::mutex> lk(dev->mtx);
-        cslot = dev->rast.draw_cursor % SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
-        dev->rast.draw_cursor++;
+        cslot = dev->rast.clear_cursor % SmRasterEngine::MAX_AUX_SLOTS;
+        dev->rast.clear_cursor++;
 
         auto* cubo = reinterpret_cast<SmClearUBO*>((uint8_t*)dev->rast.clr_ubo_ptr + cslot * sizeof(SmClearUBO));
         cubo->width = W;
         cubo->height = H;
         cubo->clear_mask = clear_mask;
         cubo->clear_depth = clear_depth;
+        cubo->clear_stencil = clear_stencil & 0xFFu;
+        cubo->pad0 = cubo->pad1 = cubo->pad2 = 0u;
         for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
-            cubo->rt_u32_stride[i] = col_imgs[i] ? sm_format_u32_stride(col_imgs[i]->format) : 1u;
+            cubo->rt_bpp_code[i] = col_imgs[i] ? sm_format_bpp_code(col_imgs[i]->format) : 0u;
             for (uint32_t k = 0; k < 4; ++k) cubo->rt_clear[i][k] = clear_words[i][k];
         }
 
-        VkDescriptorBufferInfo bi[7] = {
-            {col_imgs[0] ? col_imgs[0]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[1] ? col_imgs[1]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[2] ? col_imgs[2]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[3] ? col_imgs[3]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {dep_img     ? dep_img->attach_buf     : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.vis_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.clr_ubo_buf, cslot * sizeof(SmClearUBO), sizeof(SmClearUBO)},
-        };
-        VkWriteDescriptorSet ws[7];
-        for (uint32_t i = 0; i < 7; ++i) {
-            ws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.clear_ds[cslot], i, 0, 1,
-                     (i == 6) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[i]};
+        VkDescriptorBufferInfo bi[12];
+        for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
+            bi[i] = {col_imgs[i] ? col_imgs[i]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
         }
-        dev->fn.UpdateDescriptorSets(dev->real_dev, 7, ws, 0, nullptr);
+        bi[8]  = {dep_img ? dep_img->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
+        bi[9]  = {dev->rast.vis_buf, 0, VK_WHOLE_SIZE};
+        bi[10] = {(dep_img && dep_img->stencil_buf) ? dep_img->stencil_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
+        bi[11] = {dev->rast.clr_ubo_buf, cslot * sizeof(SmClearUBO), sizeof(SmClearUBO)};
+        VkWriteDescriptorSet ws[12];
+        for (uint32_t i = 0; i < 12; ++i) {
+            ws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.clear_ds[cslot], i, 0, 1,
+                     (i == 11) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[i]};
+        }
+        dev->fn.UpdateDescriptorSets(dev->real_dev, 12, ws, 0, nullptr);
     }
 
     dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.clear_pipe);
@@ -1965,6 +2181,8 @@ static void sm_sync_image_to_attach(SmCommandBuffer* scb, SmImage* img, VkImageL
                                0, 0, nullptr, 0, nullptr, 1, &bar);
     emit_compute_barrier(scb);
     img->attach_dirty = true;
+    img->attach_mip = (int32_t)mip;
+    img->attach_layer = (int32_t)layer;
 }
 
 static void sm_sync_attach_to_image(SmCommandBuffer* scb, SmImage* img, VkImageLayout target_layout, uint32_t mip, uint32_t layer) {
@@ -2000,10 +2218,11 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRenderPass(
     scb->cur_rp = rp;
     scb->cur_fb = fb;
 
-    SmImage* col_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    SmImage* col_imgs[SM_MAX_MRT] = {nullptr};
     uint32_t clear_words[SM_MAX_MRT][4] = {{0}};
-    uint32_t clear_mask = 32u; // always clear VisBuf
+    uint32_t clear_mask = 512u; // always clear VisBuf
     float clear_depth = 1.0f;
+    uint32_t clear_stencil = 0u;
 
     for (uint32_t i = 0; i < rp->color_attach_count && i < SM_MAX_MRT; ++i) {
         int idx = rp->color_attach_idxs[i];
@@ -2018,12 +2237,21 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRenderPass(
     }
     SmImage* dep_img = (rp->depth_attach_idx >= 0 && rp->depth_attach_idx < (int)fb->attachments.size())
                        ? fb->attachments[rp->depth_attach_idx]->image : nullptr;
-    if (dep_img && rp->attachments[rp->depth_attach_idx].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
-        bi->clearValueCount > (uint32_t)rp->depth_attach_idx) {
-        clear_mask |= 16u;
-        clear_depth = bi->pClearValues[rp->depth_attach_idx].depthStencil.depth;
+    if (dep_img && bi->clearValueCount > (uint32_t)rp->depth_attach_idx) {
+        if (rp->attachments[rp->depth_attach_idx].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            clear_mask |= 256u;
+            clear_depth = bi->pClearValues[rp->depth_attach_idx].depthStencil.depth;
+        }
+        if (dep_img->has_stencil && rp->attachments[rp->depth_attach_idx].stencilLoadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            clear_mask |= 1024u;
+            clear_stencil = bi->pClearValues[rp->depth_attach_idx].depthStencil.stencil & 0xFFu;
+        }
     }
-    sm_begin_pass_clear_mrt(scb, col_imgs, dep_img, fb->width, fb->height, clear_mask, clear_words, clear_depth);
+    SM_XRAY("BeginRenderPass(%ux%u, nc=%u, fmt0=%d, dep=%d, cmask=0x%x)",
+            fb->width, fb->height, rp->color_attach_count,
+            col_imgs[0] ? (int)col_imgs[0]->format : -1,
+            dep_img ? (int)dep_img->format : -1, clear_mask);
+    sm_begin_pass_clear_mrt(scb, col_imgs, dep_img, fb->width, fb->height, clear_mask, clear_words, clear_depth, clear_stencil);
 }
 
 static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRenderPass(VkCommandBuffer cb) {
@@ -2092,8 +2320,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRendering(VkCommandBuffer cb, const
     scb->dyn_h = ri->renderArea.offset.y + ri->renderArea.extent.height;
 
     uint32_t clear_words[SM_MAX_MRT][4] = {{0}};
-    uint32_t clear_mask = 32u;
+    uint32_t clear_mask = 512u; // always clear VisBuf
     float clear_depth = 1.0f;
+    uint32_t clear_stencil = 0u;
     bool got_dim = false;
 
     uint32_t nc = std::min(ri->colorAttachmentCount, SM_MAX_MRT);
@@ -2112,12 +2341,23 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRendering(VkCommandBuffer cb, const
                 got_dim = true;
             }
             VkFormat eff_fmt = (iv->format != VK_FORMAT_UNDEFINED) ? iv->format : (scb->dyn_col_imgs[i] ? scb->dyn_col_imgs[i]->format : VK_FORMAT_R8G8B8A8_UNORM);
-            if (ri->pColorAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR && scb->dyn_col_imgs[i]) {
-                clear_mask |= (1u << i);
-                pack_clear_words(ri->pColorAttachments[i].clearValue.color, eff_fmt, clear_words[i]);
-            } else if (ri->pColorAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && scb->dyn_col_imgs[i] &&
-                       !scb->dyn_col_imgs[i]->is_swapchain && !scb->dyn_col_imgs[i]->attach_dirty && scb->dyn_col_imgs[i]->real_img) {
-                sm_sync_image_to_attach(scb, scb->dyn_col_imgs[i], ri->pColorAttachments[i].imageLayout, iv->base_mip, iv->base_layer);
+            if (scb->dyn_col_imgs[i]) {
+                bool sub_changed = (scb->dyn_col_imgs[i]->attach_mip != (int32_t)iv->base_mip ||
+                                    scb->dyn_col_imgs[i]->attach_layer != (int32_t)iv->base_layer);
+                if (ri->pColorAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    clear_mask |= (1u << i);
+                    pack_clear_words(ri->pColorAttachments[i].clearValue.color, eff_fmt, clear_words[i]);
+                    scb->dyn_col_imgs[i]->attach_mip = (int32_t)iv->base_mip;
+                    scb->dyn_col_imgs[i]->attach_layer = (int32_t)iv->base_layer;
+                } else if (ri->pColorAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+                           !scb->dyn_col_imgs[i]->is_swapchain &&
+                           (!scb->dyn_col_imgs[i]->attach_dirty || sub_changed) &&
+                           scb->dyn_col_imgs[i]->real_img) {
+                    sm_sync_image_to_attach(scb, scb->dyn_col_imgs[i], ri->pColorAttachments[i].imageLayout, iv->base_mip, iv->base_layer);
+                } else {
+                    scb->dyn_col_imgs[i]->attach_mip = (int32_t)iv->base_mip;
+                    scb->dyn_col_imgs[i]->attach_layer = (int32_t)iv->base_layer;
+                }
             }
         }
     }
@@ -2128,10 +2368,41 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRendering(VkCommandBuffer cb, const
         if (!got_dim && scb->dyn_dep_img) {
             scb->dyn_w = std::max(1u, scb->dyn_dep_img->extent.width >> iv->base_mip);
             scb->dyn_h = std::max(1u, scb->dyn_dep_img->extent.height >> iv->base_mip);
+            got_dim = true;
         }
-        if (ri->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-            clear_mask |= 16u;
-            clear_depth = ri->pDepthAttachment->clearValue.depthStencil.depth;
+        if (scb->dyn_dep_img) {
+            bool sub_changed = (scb->dyn_dep_img->attach_mip != (int32_t)iv->base_mip ||
+                                scb->dyn_dep_img->attach_layer != (int32_t)iv->base_layer);
+            if (ri->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                clear_mask |= 256u;
+                clear_depth = ri->pDepthAttachment->clearValue.depthStencil.depth;
+                scb->dyn_dep_img->attach_mip = (int32_t)iv->base_mip;
+                scb->dyn_dep_img->attach_layer = (int32_t)iv->base_layer;
+            } else if (ri->pDepthAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+                       (!scb->dyn_dep_img->attach_dirty || sub_changed) &&
+                       scb->dyn_dep_img->real_img) {
+                sm_sync_image_to_attach(scb, scb->dyn_dep_img, ri->pDepthAttachment->imageLayout, iv->base_mip, iv->base_layer);
+            } else {
+                scb->dyn_dep_img->attach_mip = (int32_t)iv->base_mip;
+                scb->dyn_dep_img->attach_layer = (int32_t)iv->base_layer;
+            }
+        }
+    }
+    if (ri->pStencilAttachment && ri->pStencilAttachment->imageView != VK_NULL_HANDLE) {
+        auto* iv = from_h<SmImageView>(ri->pStencilAttachment->imageView);
+        if (!scb->dyn_dep_img) {
+            scb->dyn_dep_view = iv;
+            scb->dyn_dep_img = iv->image;
+            if (!got_dim && scb->dyn_dep_img) {
+                scb->dyn_w = std::max(1u, scb->dyn_dep_img->extent.width >> iv->base_mip);
+                scb->dyn_h = std::max(1u, scb->dyn_dep_img->extent.height >> iv->base_mip);
+                got_dim = true;
+            }
+        }
+        if (scb->dyn_dep_img) scb->dyn_dep_img->has_stencil = true;
+        if (ri->pStencilAttachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            clear_mask |= 1024u;
+            clear_stencil = ri->pStencilAttachment->clearValue.depthStencil.stencil & 0xFFu;
         }
     }
     if (scb->dyn_w == 0) scb->dyn_w = 1;
@@ -2143,7 +2414,21 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRendering(VkCommandBuffer cb, const
              scb->dyn_col_imgs[0] ? (int)scb->dyn_col_imgs[0]->is_swapchain : 0,
              scb->dyn_dep_img ? (int)scb->dyn_dep_img->format : -1,
              clear_mask, ri->renderArea.extent.width, ri->renderArea.extent.height);
-    sm_begin_pass_clear_mrt(scb, scb->dyn_col_imgs, scb->dyn_dep_img, scb->dyn_w, scb->dyn_h, clear_mask, clear_words, clear_depth);
+    SM_XRAY("BeginRendering(%ux%u nc=%u fmts=[%d,%d,%d,%d,%d,%d,%d,%d] dep=%d stn=%d sc0=%d cmask=0x%x)",
+            scb->dyn_w, scb->dyn_h, scb->dyn_col_count,
+            scb->dyn_col_imgs[0] ? (int)scb->dyn_col_imgs[0]->format : -1,
+            scb->dyn_col_imgs[1] ? (int)scb->dyn_col_imgs[1]->format : -1,
+            scb->dyn_col_imgs[2] ? (int)scb->dyn_col_imgs[2]->format : -1,
+            scb->dyn_col_imgs[3] ? (int)scb->dyn_col_imgs[3]->format : -1,
+            scb->dyn_col_imgs[4] ? (int)scb->dyn_col_imgs[4]->format : -1,
+            scb->dyn_col_imgs[5] ? (int)scb->dyn_col_imgs[5]->format : -1,
+            scb->dyn_col_imgs[6] ? (int)scb->dyn_col_imgs[6]->format : -1,
+            scb->dyn_col_imgs[7] ? (int)scb->dyn_col_imgs[7]->format : -1,
+            scb->dyn_dep_img ? (int)scb->dyn_dep_img->format : -1,
+            (scb->dyn_dep_img && scb->dyn_dep_img->has_stencil) ? 1 : 0,
+            scb->dyn_col_imgs[0] ? (int)scb->dyn_col_imgs[0]->is_swapchain : 0,
+            clear_mask);
+    sm_begin_pass_clear_mrt(scb, scb->dyn_col_imgs, scb->dyn_dep_img, scb->dyn_w, scb->dyn_h, clear_mask, clear_words, clear_depth, clear_stencil);
 }
 
 static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRendering(VkCommandBuffer cb) {
@@ -2168,7 +2453,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRendering(VkCommandBuffer cb) {
                 }
             }
         }
-        if (scb->dyn_dep_img && (scb->dyn_dep_img->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        if (scb->dyn_dep_img &&
+            ((scb->dyn_dep_img->usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
+             scb->dyn_dep_img->array_layers > 1 || scb->dyn_dep_img->mip_levels > 1)) {
             uint32_t dmip = scb->dyn_dep_view ? scb->dyn_dep_view->base_mip : 0u;
             uint32_t dlay = scb->dyn_dep_view ? scb->dyn_dep_view->base_layer : 0u;
             sm_sync_attach_to_image(scb, scb->dyn_dep_img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dmip, dlay);
@@ -2177,16 +2464,37 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRendering(VkCommandBuffer cb) {
     scb->in_dyn_rendering = false;
 }
 
+static void sm_replay_push_descs(SmDevice* dev, VkCommandBuffer real_cb, VkPipelineLayout layout, uint32_t set, SmPushDescSet& pds) {
+    if (!pds.active || pds.writes.empty() || !dev->fn.CmdPushDescriptorSetKHR) return;
+    for (size_t i = 0; i < pds.writes.size(); ++i) {
+        pds.writes[i].pBufferInfo      = pds.bufs[i].empty() ? nullptr : pds.bufs[i].data();
+        pds.writes[i].pImageInfo       = pds.imgs[i].empty() ? nullptr : pds.imgs[i].data();
+        pds.writes[i].pTexelBufferView = pds.bvs[i].empty()  ? nullptr : pds.bvs[i].data();
+    }
+    dev->fn.CmdPushDescriptorSetKHR(real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, set,
+                                    (uint32_t)pds.writes.size(), pds.writes.data());
+}
+
+static uint32_t sm_pack_stencil_cfg(const VkStencilOpState& st) {
+    return ((uint32_t)st.compareOp & 7u) |
+           (((uint32_t)st.failOp & 7u) << 3u) |
+           (((uint32_t)st.passOp & 7u) << 6u) |
+           (((uint32_t)st.depthFailOp & 7u) << 9u) |
+           ((st.compareMask & 0xFFu) << 16u) |
+           ((st.writeMask & 0xFFu) << 24u);
+}
+
 static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_count, uint32_t instance_count,
                                  uint32_t first_vert_or_idx, int32_t vertex_offset, uint32_t first_instance,
-                                 bool indexed, SmBuffer* indirect_buf, VkDeviceSize indirect_offset) {
+                                 bool indexed, SmBuffer* indirect_buf, VkDeviceSize indirect_offset,
+                                 SmBuffer* count_buf, VkDeviceSize count_offset, uint32_t draw_idx) {
     auto* dev = scb->dev;
     auto* pipe = scb->cur_gfx_pipe;
     bool is_indirect = (indirect_buf != nullptr);
     if (!pipe || !pipe->vs_comp_pipe) return;
     if (!is_indirect && (vert_or_idx_count < 3 || instance_count == 0)) return;
 
-    SmImage* col_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    SmImage* col_imgs[SM_MAX_MRT] = {nullptr};
     SmImage* dep_img = nullptr;
     uint32_t W = 0, H = 0;
     if (scb->in_dyn_rendering) {
@@ -2231,14 +2539,20 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
 
     uint32_t tx = (W + 15) / 16, ty = (H + 15) / 16;
     VkBuffer dep_buf = dep_img ? dep_img->attach_buf : dev->rast.dummy_buf;
+    if (dep_img && dep_img->has_stencil) sm_ensure_image_stencil_buf(dev, dep_img);
+    VkBuffer stn_buf = (dep_img && dep_img->stencil_buf) ? dep_img->stencil_buf : dev->rast.dummy_buf;
 
     VkViewport vp = scb->has_vp ? scb->cur_vp : (pipe->has_static_vp ? pipe->static_vp : VkViewport{0, 0, (float)W, (float)H, 0.0f, 1.0f});
     VkRect2D sc   = scb->has_scissor ? scb->cur_scissor : (pipe->has_static_scissor ? pipe->static_scissor : VkRect2D{{0, 0}, {W, H}});
-    SM_TRACE("Draw(v=%u, inst=%u, idx=%d, ind=%d, vp=%.0f,%.0f,%.0f,%.0f, W=%u,H=%u, fmt0=%d, sc0=%d)",
-             vert_or_idx_count, instance_count, (int)indexed, (int)is_indirect,
-             vp.x, vp.y, vp.width, vp.height, W, H,
-             col_imgs[0] ? (int)col_imgs[0]->format : -1,
-             col_imgs[0] ? (int)col_imgs[0]->is_swapchain : 0);
+    SM_TRACE("Draw(v=%u inst=%u idx=%d itype=%d ioff=%llu vb0off=%llu vb0st=%u vp=%.0f,%.0f,%.0f,%.0f sc=%d,%d,%d,%d dt=%d dw=%d dop=%d cull=%u topo=%u pds4=%d pfnPD=%p)",
+             vert_or_idx_count, instance_count, (int)indexed, (int)scb->idx_type, (unsigned long long)scb->idx_offset,
+             (unsigned long long)scb->vtx_offsets[0], scb->has_dyn_vtx_stride[0] ? scb->dyn_vtx_strides[0] : (pipe->vtx_input.bindings.empty() ? 0u : pipe->vtx_input.bindings[0].stride),
+             vp.x, vp.y, vp.width, vp.height, sc.offset.x, sc.offset.y, (int)sc.extent.width, (int)sc.extent.height,
+             (int)(scb->has_dyn_depth_test ? scb->dyn_depth_test : pipe->depth_test),
+             (int)(scb->has_dyn_depth_write ? scb->dyn_depth_write : pipe->depth_write),
+             (int)(scb->has_dyn_depth_op ? scb->dyn_depth_op : pipe->depth_op),
+             (unsigned)(scb->has_dyn_cull ? scb->dyn_cull : pipe->cull_mode),
+             (unsigned)eff_topo, (int)scb->gfx_push_descs[4].active, (void*)dev->fn.CmdPushDescriptorSetKHR);
     int sc_x0 = std::max(0, sc.offset.x);
     int sc_y0 = std::max(0, sc.offset.y);
     int sc_x1 = std::min((int)W, sc.offset.x + (int)sc.extent.width);
@@ -2249,8 +2563,24 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     bool eff_dtest           = scb->has_dyn_depth_test ? scb->dyn_depth_test : pipe->depth_test;
     bool eff_dwrite          = scb->has_dyn_depth_write ? scb->dyn_depth_write : pipe->depth_write;
     VkCompareOp eff_dop      = scb->has_dyn_depth_op ? scb->dyn_depth_op : pipe->depth_op;
+    bool eff_stest           = scb->has_dyn_stencil_test ? scb->dyn_stencil_test : pipe->stencil_test;
+    VkStencilOpState eff_sf  = pipe->stencil_front;
+    VkStencilOpState eff_sb  = pipe->stencil_back;
+    if (scb->has_dyn_stencil_op[0])    { eff_sf.failOp = scb->dyn_stencil_fail[0]; eff_sf.passOp = scb->dyn_stencil_pass[0]; eff_sf.depthFailOp = scb->dyn_stencil_dfail[0]; eff_sf.compareOp = scb->dyn_stencil_cmp[0]; }
+    if (scb->has_dyn_stencil_op[1])    { eff_sb.failOp = scb->dyn_stencil_fail[1]; eff_sb.passOp = scb->dyn_stencil_pass[1]; eff_sb.depthFailOp = scb->dyn_stencil_dfail[1]; eff_sb.compareOp = scb->dyn_stencil_cmp[1]; }
+    if (scb->has_dyn_stencil_ref[0])   eff_sf.reference   = scb->dyn_stencil_ref[0];
+    if (scb->has_dyn_stencil_ref[1])   eff_sb.reference   = scb->dyn_stencil_ref[1];
+    if (scb->has_dyn_stencil_cmask[0]) eff_sf.compareMask = scb->dyn_stencil_cmask[0];
+    if (scb->has_dyn_stencil_cmask[1]) eff_sb.compareMask = scb->dyn_stencil_cmask[1];
+    if (scb->has_dyn_stencil_wmask[0]) eff_sf.writeMask   = scb->dyn_stencil_wmask[0];
+    if (scb->has_dyn_stencil_wmask[1]) eff_sb.writeMask   = scb->dyn_stencil_wmask[1];
 
-    uint32_t slot = 0;
+    SM_XRAY("  Draw(v=%u inst=%u idx=%d ind=%d fs=%d dt=%d dw=%d st=%d bl0=%d wm0=0x%x)",
+            vert_or_idx_count, instance_count, (int)indexed, (int)is_indirect,
+            pipe->fs_comp_pipe ? 1 : 0, (int)eff_dtest, (int)eff_dwrite, (int)eff_stest,
+            (int)pipe->blend_enable[0], pipe->color_write_mask[0]);
+
+    uint32_t slot = 0, islot = 0;
     uint32_t extra_v_base = 0, extra_t_base = 0;
     {
         std::lock_guard<std::mutex> lk(dev->mtx);
@@ -2263,12 +2593,16 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
 
         slot = dev->rast.draw_cursor % SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
         dev->rast.draw_cursor++;
+        if (is_indirect) {
+            islot = dev->rast.ind_cursor % SmRasterEngine::MAX_IND_SLOTS;
+            dev->rast.ind_cursor++;
+        }
 
         auto* vs_ubo = reinterpret_cast<SmVsParamsUBO*>((uint8_t*)dev->rast.vs_ubo_ptr + slot * sizeof(SmVsParamsUBO));
         vs_ubo->vertex_count = total_verts;
         vs_ubo->first_vertex = indexed ? 0 : first_vert_or_idx;
         vs_ubo->instance_idx = first_instance;
-        vs_ubo->indexed      = indexed ? (scb->idx_type == VK_INDEX_TYPE_UINT16 ? 1u : 2u) : 0u;
+        vs_ubo->indexed      = indexed ? (scb->idx_type == VK_INDEX_TYPE_UINT16 ? 1u : (scb->idx_type == VK_INDEX_TYPE_UINT8_EXT ? 3u : 2u)) : 0u;
         vs_ubo->first_index  = indexed ? first_vert_or_idx : 0;
         vs_ubo->vertex_offset = vertex_offset;
         vs_ubo->vert_stride_vec4 = SM_VERT_STRIDE_VEC4;
@@ -2296,6 +2630,13 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         fs_ubo->vert_stride_vec4 = SM_VERT_STRIDE_VEC4;
         fs_ubo->depth_write = (eff_dwrite && dep_img != nullptr) ? 1u : 0u;
         fs_ubo->rt_active_mask = 0;
+        fs_ubo->stencil_enable = (eff_stest ? 1u : 0u) | ((dep_img && dep_img->stencil_buf) ? 2u : 0u);
+        fs_ubo->stencil_front_cfg = sm_pack_stencil_cfg(eff_sf);
+        fs_ubo->stencil_back_cfg  = sm_pack_stencil_cfg(eff_sb);
+        fs_ubo->stencil_refs = (eff_sf.reference & 0xFFu) | ((eff_sb.reference & 0xFFu) << 8u);
+        fs_ubo->pad0 = fs_ubo->pad1 = fs_ubo->pad2 = 0u;
+        for (int k = 0; k < 4; ++k)
+            fs_ubo->blend_const[k] = scb->has_dyn_blend_const ? scb->dyn_blend_const[k] : pipe->blend_constants[k];
         for (uint32_t r = 0; r < SM_MAX_MRT; ++r) {
             if (col_imgs[r] && pipe->color_write_mask[r] != 0u) {
                 col_imgs[r]->attach_dirty = true;
@@ -2306,10 +2647,14 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             } else {
                 fs_ubo->rt_fmt[r] = 0;
             }
-            fs_ubo->rt_blend_en[r]  = pipe->blend_enable[r] ? 1u : 0u;
-            fs_ubo->rt_src_blend[r] = (uint32_t)pipe->src_color_blend[r];
-            fs_ubo->rt_dst_blend[r] = (uint32_t)pipe->dst_color_blend[r];
-            fs_ubo->rt_blend_op[r]  = (uint32_t)pipe->color_blend_op[r];
+            fs_ubo->rt_blend_en[r]   = pipe->blend_enable[r] ? 1u : 0u;
+            fs_ubo->rt_src_blend[r]  = (uint32_t)pipe->src_color_blend[r];
+            fs_ubo->rt_dst_blend[r]  = (uint32_t)pipe->dst_color_blend[r];
+            fs_ubo->rt_blend_op[r]   = (uint32_t)pipe->color_blend_op[r];
+            fs_ubo->rt_src_alpha[r]  = (uint32_t)pipe->src_alpha_blend[r];
+            fs_ubo->rt_dst_alpha[r]  = (uint32_t)pipe->dst_alpha_blend[r];
+            fs_ubo->rt_alpha_op[r]   = (uint32_t)pipe->alpha_blend_op[r];
+            fs_ubo->rt_write_mask[r] = pipe->color_write_mask[r] & 0xFu;
         }
 
         VkDescriptorBufferInfo vbi[11] = {
@@ -2328,23 +2673,21 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         VkWriteDescriptorSet vws[11];
         for (uint32_t i = 0; i < 11; ++i)
             vws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.vs_int_ds[slot], i, 0, 1,
-                      (i == 10) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbi[i]};
+                      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbi[i]};
 
-        VkDescriptorBufferInfo fbi[9] = {
-            {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.tri_setup_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.vis_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[0] ? col_imgs[0]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[1] ? col_imgs[1]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[2] ? col_imgs[2]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {col_imgs[3] ? col_imgs[3]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {dep_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.fs_ubo_buf, slot * sizeof(SmFsParamsUBO), sizeof(SmFsParamsUBO)},
-        };
-        VkWriteDescriptorSet fws[9];
-        for (uint32_t i = 0; i < 9; ++i)
+        VkDescriptorBufferInfo fbi[14];
+        fbi[0] = {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE};
+        fbi[1] = {dev->rast.tri_setup_buf, 0, VK_WHOLE_SIZE};
+        fbi[2] = {dev->rast.vis_buf, 0, VK_WHOLE_SIZE};
+        for (uint32_t r = 0; r < SM_MAX_MRT; ++r)
+            fbi[3 + r] = {col_imgs[r] ? col_imgs[r]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
+        fbi[11] = {dep_buf, 0, VK_WHOLE_SIZE};
+        fbi[12] = {stn_buf, 0, VK_WHOLE_SIZE};
+        fbi[13] = {dev->rast.fs_ubo_buf, slot * sizeof(SmFsParamsUBO), sizeof(SmFsParamsUBO)};
+        VkWriteDescriptorSet fws[14];
+        for (uint32_t i = 0; i < 14; ++i)
             fws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.fs_int_ds[slot], i, 0, 1,
-                      (i == 8) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fbi[i]};
+                      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fbi[i]};
 
         VkDescriptorBufferInfo bbi[6] = {
             {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE},
@@ -2364,7 +2707,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             fn_ws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.fine_ds[slot], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fn_bi[i]};
 
         dev->fn.UpdateDescriptorSets(dev->real_dev, 11, vws, 0, nullptr);
-        dev->fn.UpdateDescriptorSets(dev->real_dev, 9, fws, 0, nullptr);
+        if (pipe->fs_comp_pipe) dev->fn.UpdateDescriptorSets(dev->real_dev, 14, fws, 0, nullptr);
         dev->fn.UpdateDescriptorSets(dev->real_dev, 6, bws, 0, nullptr);
         dev->fn.UpdateDescriptorSets(dev->real_dev, 5, fn_ws, 0, nullptr);
 
@@ -2381,16 +2724,17 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         }
 
         if (is_indirect) {
-            VkDescriptorBufferInfo ibi[4] = {
+            VkDescriptorBufferInfo ibi[5] = {
                 {indirect_buf->real_buf, 0, VK_WHOLE_SIZE},
                 {dev->rast.vs_ubo_buf, 0, VK_WHOLE_SIZE},
                 {dev->rast.tile_count_buf, 0, VK_WHOLE_SIZE},
                 {dev->rast.ind_disp_buf, 0, VK_WHOLE_SIZE},
+                {count_buf ? count_buf->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
             };
-            VkWriteDescriptorSet iws[4];
-            for (uint32_t i = 0; i < 4; ++i)
-                iws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.ind_prep_ds[slot], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibi[i]};
-            dev->fn.UpdateDescriptorSets(dev->real_dev, 4, iws, 0, nullptr);
+            VkWriteDescriptorSet iws[5];
+            for (uint32_t i = 0; i < 5; ++i)
+                iws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.ind_prep_ds[islot], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ibi[i]};
+            dev->fn.UpdateDescriptorSets(dev->real_dev, 5, iws, 0, nullptr);
         }
     }
 
@@ -2400,13 +2744,14 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
 
     if (is_indirect) {
         emit_compute_barrier(scb);
-        struct { uint32_t ind_w_off, vs_w_off, meta_idx, indexed, topo, max_v, max_t, pad; } ipc = {
+        struct { uint32_t ind_w_off, vs_w_off, meta_idx, indexed, topo, max_v, max_t, count_w_off, draw_idx, pad; } ipc = {
             (uint32_t)(indirect_offset >> 2),
             (uint32_t)((slot * sizeof(SmVsParamsUBO)) >> 2),
-            tx * ty, indexed ? 1u : 0u, topo_code, extra_v_base, extra_t_base, 0u
+            tx * ty, indexed ? 1u : 0u, topo_code, extra_v_base, extra_t_base,
+            count_buf ? (uint32_t)(count_offset >> 2) : 0xFFFFFFFFu, draw_idx, 0u
         };
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.ind_prep_pipe);
-        dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.ind_prep_pl, 0, 1, &dev->rast.ind_prep_ds[slot], 0, nullptr);
+        dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.ind_prep_pl, 0, 1, &dev->rast.ind_prep_ds[islot], 0, nullptr);
         dev->fn.CmdPushConstants(scb->real_cb, dev->rast.ind_prep_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
         dev->fn.CmdDispatch(scb->real_cb, 1, 1, 1);
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -2417,11 +2762,14 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
 
     // --- PASS 1: Lowered Vertex Compute Shader on H20 78 SMs! ---
     dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->vs_comp_pipe);
-    for (uint32_t s = 0; s < pipe->layout->sm_set_index; ++s) {
-        if (scb->gfx_set_mask & (1u << s))
+    for (uint32_t s = 0; s < pipe->layout->sm_set_index && s < 16; ++s) {
+        if (scb->gfx_set_mask & (1u << s)) {
             dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout->sm_vs_layout,
                                           s, 1, &scb->gfx_sets[s], scb->gfx_dyn_counts[s],
                                           scb->gfx_dyn_counts[s] ? scb->gfx_dyn_offs[s] : nullptr);
+        } else if (scb->gfx_push_descs[s].active) {
+            sm_replay_push_descs(dev, scb->real_cb, pipe->layout->sm_vs_layout, s, scb->gfx_push_descs[s]);
+        }
     }
     dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout->sm_vs_layout,
                                   pipe->layout->sm_set_index, 1, &dev->rast.vs_int_ds[slot], 0, nullptr);
@@ -2471,14 +2819,17 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
     emit_compute_barrier(scb);
 
-    // --- PASS 4: Lowered Quad-Subgroup MRT Fragment Compute Shader (Zero Overdraw + H20 TMUs!) ---
+    // --- PASS 4: Lowered Quad-Subgroup 8-MRT + Stencil Fragment Compute Shader (Zero Overdraw + H20 TMUs!) ---
     if (pipe->fs_comp_pipe) {
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->fs_comp_pipe);
-        for (uint32_t s = 0; s < pipe->layout->sm_set_index; ++s) {
-            if (scb->gfx_set_mask & (1u << s))
+        for (uint32_t s = 0; s < pipe->layout->sm_set_index && s < 16; ++s) {
+            if (scb->gfx_set_mask & (1u << s)) {
                 dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout->sm_fs_layout,
                                               s, 1, &scb->gfx_sets[s], scb->gfx_dyn_counts[s],
                                               scb->gfx_dyn_counts[s] ? scb->gfx_dyn_offs[s] : nullptr);
+            } else if (scb->gfx_push_descs[s].active) {
+                sm_replay_push_descs(dev, scb->real_cb, pipe->layout->sm_fs_layout, s, scb->gfx_push_descs[s]);
+            }
         }
         dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout->sm_fs_layout,
                                       pipe->layout->sm_set_index, 1, &dev->rast.fs_int_ds[slot], 0, nullptr);
@@ -2565,16 +2916,148 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBindDescriptorSets(
         }
     };
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        SM_TRACE("BindDescSets(GFX first=%u n=%u dyn=%u)", firstSet, count, dynCount);
         record_sets(scb->gfx_sets, scb->gfx_set_mask, scb->gfx_dyn_counts, scb->gfx_dyn_offs);
+        for (uint32_t i = 0; i < count && (firstSet + i) < 16; ++i) {
+            uint32_t s = firstSet + i;
+            scb->gfx_push_descs[s].active = false;
+            scb->gfx_push_descs[s].writes.clear(); scb->gfx_push_descs[s].bufs.clear();
+            scb->gfx_push_descs[s].imgs.clear();   scb->gfx_push_descs[s].bvs.clear();
+        }
     } else {
         record_sets(scb->comp_sets, scb->comp_set_mask, scb->comp_dyn_counts, scb->comp_dyn_offs);
+        for (uint32_t i = 0; i < count && (firstSet + i) < 16; ++i) {
+            uint32_t s = firstSet + i;
+            scb->comp_push_descs[s].active = false;
+            scb->comp_push_descs[s].writes.clear(); scb->comp_push_descs[s].bufs.clear();
+            scb->comp_push_descs[s].imgs.clear();   scb->comp_push_descs[s].bvs.clear();
+        }
         scb->dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE,
             pl->real_layout, firstSet, count, sets, dynCount, dynOffs);
     }
 }
+static VKAPI_ATTR void VKAPI_CALL sm_CmdPushDescriptorSetKHR(
+        VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set,
+        uint32_t writeCount, const VkWriteDescriptorSet* pWrites) {
+    if (!pWrites || writeCount == 0 || set >= 16) return;
+    SM_TRACE("PushDescSet(bp=%d set=%u n=%u b0=%u type0=%d)", (int)bp, set, writeCount, pWrites[0].dstBinding, (int)pWrites[0].descriptorType);
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    auto* pl = from_h<SmPipelineLayout>(layout);
+    SmPushDescSet& dst = (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) ? scb->gfx_push_descs[set] : scb->comp_push_descs[set];
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) scb->gfx_set_mask &= ~(1u << set);
+    else scb->comp_set_mask &= ~(1u << set);
+    dst.active = true;
+
+    std::vector<VkWriteDescriptorSet> batch_w;
+    std::vector<std::vector<VkDescriptorBufferInfo>> batch_b(writeCount);
+    std::vector<std::vector<VkDescriptorImageInfo>>  batch_i(writeCount);
+    std::vector<std::vector<VkBufferView>>           batch_v(writeCount);
+    batch_w.reserve(writeCount);
+
+    for (uint32_t i = 0; i < writeCount; ++i) {
+        VkWriteDescriptorSet w = pWrites[i];
+        w.dstSet = VK_NULL_HANDLE;
+        VkDescriptorType dt = w.descriptorType;
+        bool is_buf = (dt == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || dt == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                       dt == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || dt == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
+        bool is_img = (dt == VK_DESCRIPTOR_TYPE_SAMPLER || dt == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                       dt == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || dt == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                       dt == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT);
+        bool is_bv  = (dt == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || dt == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
+        if (is_buf && w.pBufferInfo && w.descriptorCount > 0) {
+            batch_b[i].assign(w.pBufferInfo, w.pBufferInfo + w.descriptorCount);
+            for (auto& bi : batch_b[i]) {
+                if (bi.buffer) bi.buffer = from_h<SmBuffer>(bi.buffer)->real_buf;
+                else { bi.buffer = VK_NULL_HANDLE; bi.offset = 0; bi.range = VK_WHOLE_SIZE; }
+            }
+            SM_TRACE("  PushDescBuf[%u] bind=%u buf=%p off=%llu range=%llu", i, w.dstBinding, (void*)batch_b[i][0].buffer, (unsigned long long)batch_b[i][0].offset, (unsigned long long)batch_b[i][0].range);
+            w.pBufferInfo = batch_b[i].data(); w.pImageInfo = nullptr; w.pTexelBufferView = nullptr;
+        } else if (is_img && w.pImageInfo && w.descriptorCount > 0) {
+            batch_i[i].assign(w.pImageInfo, w.pImageInfo + w.descriptorCount);
+            for (auto& ii : batch_i[i]) {
+                if (dt != VK_DESCRIPTOR_TYPE_SAMPLER) {
+                    if (ii.imageView) ii.imageView = from_h<SmImageView>(ii.imageView)->real_view;
+                    ii.imageLayout = sanitize_layout(ii.imageLayout);
+                }
+            }
+            w.pImageInfo = batch_i[i].data(); w.pBufferInfo = nullptr; w.pTexelBufferView = nullptr;
+        } else if (is_bv && w.pTexelBufferView && w.descriptorCount > 0) {
+            batch_v[i].assign(w.pTexelBufferView, w.pTexelBufferView + w.descriptorCount);
+            w.pTexelBufferView = batch_v[i].data(); w.pBufferInfo = nullptr; w.pImageInfo = nullptr;
+        }
+        batch_w.push_back(w);
+
+        // Update/replace matching (dstBinding, dstArrayElement, descriptorCount) entry in dst
+        int found = -1;
+        for (size_t k = 0; k < dst.writes.size(); ++k) {
+            if (dst.writes[k].dstBinding == w.dstBinding && dst.writes[k].dstArrayElement == w.dstArrayElement &&
+                dst.writes[k].descriptorCount == w.descriptorCount) { found = (int)k; break; }
+        }
+        if (found >= 0) {
+            dst.writes[found] = w;
+            dst.bufs[found] = batch_b[i]; dst.imgs[found] = batch_i[i]; dst.bvs[found] = batch_v[i];
+        } else {
+            dst.writes.push_back(w);
+            dst.bufs.push_back(batch_b[i]); dst.imgs.push_back(batch_i[i]); dst.bvs.push_back(batch_v[i]);
+        }
+    }
+    if (bp == VK_PIPELINE_BIND_POINT_COMPUTE && scb->dev->fn.CmdPushDescriptorSetKHR && pl && pl->real_layout) {
+        scb->dev->fn.CmdPushDescriptorSetKHR(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl->real_layout, set,
+                                             (uint32_t)batch_w.size(), batch_w.data());
+    }
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdPushDescriptorSetWithTemplateKHR(
+        VkCommandBuffer cb, VkDescriptorUpdateTemplate tmpl, VkPipelineLayout layout, uint32_t set, const void* data) {
+    if (!tmpl || !data) return;
+    auto* t = from_h<SmDescriptorUpdateTemplate>(tmpl);
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(data);
+    std::vector<VkWriteDescriptorSet> writes;
+    std::vector<std::vector<VkDescriptorBufferInfo>> bufs(t->entries.size());
+    std::vector<std::vector<VkDescriptorImageInfo>>  imgs(t->entries.size());
+    std::vector<std::vector<VkBufferView>>           bvs(t->entries.size());
+    writes.reserve(t->entries.size());
+    for (size_t i = 0; i < t->entries.size(); ++i) {
+        const auto& e = t->entries[i];
+        if (e.descriptorCount == 0) continue;
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstBinding = e.dstBinding; w.dstArrayElement = e.dstArrayElement;
+        w.descriptorCount = e.descriptorCount; w.descriptorType = e.descriptorType;
+        switch (e.descriptorType) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
+                bufs[i].resize(e.descriptorCount);
+                for (uint32_t k = 0; k < e.descriptorCount; ++k)
+                    bufs[i][k] = *reinterpret_cast<const VkDescriptorBufferInfo*>(base + e.offset + k * e.stride);
+                w.pBufferInfo = bufs[i].data(); writes.push_back(w); break;
+            }
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
+                imgs[i].resize(e.descriptorCount);
+                for (uint32_t k = 0; k < e.descriptorCount; ++k)
+                    imgs[i][k] = *reinterpret_cast<const VkDescriptorImageInfo*>(base + e.offset + k * e.stride);
+                w.pImageInfo = imgs[i].data(); writes.push_back(w); break;
+            }
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+                bvs[i].resize(e.descriptorCount);
+                for (uint32_t k = 0; k < e.descriptorCount; ++k)
+                    bvs[i][k] = *reinterpret_cast<const VkBufferView*>(base + e.offset + k * e.stride);
+                w.pTexelBufferView = bvs[i].data(); writes.push_back(w); break;
+            }
+            default: break;
+        }
+    }
+    if (!writes.empty()) sm_CmdPushDescriptorSetKHR(cb, t->bind_point, layout, set, (uint32_t)writes.size(), writes.data());
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdPushConstants(
         VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* values) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    SM_TRACE("PushConst(stages=0x%x off=%u sz=%u)", (unsigned)stages, offset, size);
     if (offset + size <= sizeof(scb->push_data)) {
         memcpy(scb->push_data + offset, values, size);
         if (offset + size > scb->push_size) scb->push_size = offset + size;
@@ -2621,12 +3104,14 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBindVertexBuffers(VkCommandBuffer cb, ui
         scb->vtx_bufs[first + i] = from_h<SmBuffer>(bufs[i]);
         scb->vtx_offsets[first + i] = offs[i];
     }
+    SM_TRACE("BindVB(first=%u n=%u b0=%p off0=%llu)", first, count, count ? (void*)bufs[0] : nullptr, count ? (unsigned long long)offs[0] : 0ull);
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkIndexType type) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
     scb->idx_buf = from_h<SmBuffer>(buf);
     scb->idx_offset = off;
     scb->idx_type = type;
+    SM_TRACE("BindIB(buf=%p off=%llu type=%d)", (void*)buf, (unsigned long long)off, (int)type);
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBindIndexBuffer2KHR(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkDeviceSize, VkIndexType type) {
     sm_CmdBindIndexBuffer(cb, buf, off, type);
@@ -2665,6 +3150,8 @@ static void sm_restore_app_compute_state(SmCommandBuffer* scb) {
                 dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl->real_layout,
                                               s, 1, &scb->comp_sets[s], scb->comp_dyn_counts[s],
                                               scb->comp_dyn_counts[s] ? scb->comp_dyn_offs[s] : nullptr);
+            } else if (scb->comp_push_descs[s].active) {
+                sm_replay_push_descs(dev, scb->real_cb, pl->real_layout, s, scb->comp_push_descs[s]);
             }
         }
         if (scb->comp_push_size > 0 && !pl->push_ranges.empty()) {
@@ -2689,6 +3176,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdDispatch(VkCommandBuffer cb, uint32_t x,
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
     sm_restore_app_compute_state(scb);
     SM_TRACE("CmdDispatch(%u,%u,%u)", x, y, z);
+    SM_XRAY("CmdDispatch(%u,%u,%u)", x, y, z);
     scb->dev->fn.CmdDispatch(scb->real_cb, x, y, z);
     sm_invalidate_storage_image_attaches(scb->dev);
 }
@@ -2768,8 +3256,8 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearColorImage(VkCommandBuffer cb, VkIm
     if (img->attach_buf) {
         uint32_t cw[SM_MAX_MRT][4] = {{0}};
         pack_clear_words(*c, img->format, cw[0]);
-        SmImage* cols[SM_MAX_MRT] = {img, nullptr, nullptr, nullptr};
-        sm_begin_pass_clear_mrt(scb, cols, nullptr, img->extent.width, img->extent.height, 1u, cw, 1.0f);
+        SmImage* cols[SM_MAX_MRT] = {img};
+        sm_begin_pass_clear_mrt(scb, cols, nullptr, img->extent.width, img->extent.height, 1u, cw, 1.0f, 0u);
     }
     if (img->real_img) scb->dev->fn.CmdClearColorImage(scb->real_cb, img->real_img, sanitize_layout(l), c, n, r);
 }
@@ -2779,6 +3267,10 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearDepthStencilImage(VkCommandBuffer c
     sm_ensure_image_attach_buf(scb->dev, img);
     uint32_t dbits = 0; memcpy(&dbits, &ds->depth, 4);
     scb->dev->fn.CmdFillBuffer(scb->real_cb, img->attach_buf, 0, (VkDeviceSize)img->extent.width * img->extent.height * 4, dbits);
+    if (img->has_stencil) {
+        sm_ensure_image_stencil_buf(scb->dev, img);
+        scb->dev->fn.CmdFillBuffer(scb->real_cb, img->stencil_buf, 0, (VkDeviceSize)img->extent.width * img->extent.height * 4, ds->stencil & 0xFFu);
+    }
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBlitImage(
         VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl,
@@ -2819,8 +3311,8 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBlitImage(
             uint32_t bslot = 0;
             {
                 std::lock_guard<std::mutex> lk(dev->mtx);
-                bslot = dev->rast.draw_cursor % SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
-                dev->rast.draw_cursor++;
+                bslot = dev->rast.blit_cursor % SmRasterEngine::MAX_AUX_SLOTS;
+                dev->rast.blit_cursor++;
                 VkDescriptorBufferInfo bi[2] = {
                     {si->attach_buf, 0, VK_WHOLE_SIZE},
                     {di->attach_buf, 0, VK_WHOLE_SIZE},
@@ -2900,11 +3392,19 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthCompareOp(VkCommandBuffer cb, Vk
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_depth_op = true; scb->dyn_depth_op = op;
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBoundsTestEnable(VkCommandBuffer, VkBool32) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilTestEnable(VkCommandBuffer, VkBool32) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilOp(VkCommandBuffer, VkStencilFaceFlags, VkStencilOp, VkStencilOp, VkStencilOp, VkCompareOp) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilTestEnable(VkCommandBuffer cb, VkBool32 e) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_stencil_test = true; scb->dyn_stencil_test = (e != 0);
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilOp(VkCommandBuffer cb, VkStencilFaceFlags mask, VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp, VkCompareOp cmpOp) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    if (mask & VK_STENCIL_FACE_FRONT_BIT) { scb->has_dyn_stencil_op[0] = true; scb->dyn_stencil_fail[0] = failOp; scb->dyn_stencil_pass[0] = passOp; scb->dyn_stencil_dfail[0] = depthFailOp; scb->dyn_stencil_cmp[0] = cmpOp; }
+    if (mask & VK_STENCIL_FACE_BACK_BIT)  { scb->has_dyn_stencil_op[1] = true; scb->dyn_stencil_fail[1] = failOp; scb->dyn_stencil_pass[1] = passOp; scb->dyn_stencil_dfail[1] = depthFailOp; scb->dyn_stencil_cmp[1] = cmpOp; }
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetRasterizerDiscardEnable(VkCommandBuffer, VkBool32) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBiasEnable(VkCommandBuffer, VkBool32) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetPrimitiveRestartEnable(VkCommandBuffer, VkBool32) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginConditionalRenderingEXT(VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdEndConditionalRenderingEXT(VkCommandBuffer) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginTransformFeedbackEXT(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdEndTransformFeedbackEXT(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*, const VkDeviceSize*) {}
@@ -3106,7 +3606,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_GetPhysicalDeviceSurfaceCapabilitiesKHR
     cap->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     cap->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR | VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     // Do NOT advertise STORAGE_BIT on swapchain so DXVK Presenter uses Graphics/Transfer path -> SmRast attach_buf!
-    cap->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    cap->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL sm_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice, VkSurfaceKHR, uint32_t* count, VkSurfaceFormatKHR* fmts) {
@@ -3114,8 +3615,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_GetPhysicalDeviceSurfaceFormatsKHR(VkPh
         { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
         { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
         { VK_FORMAT_B8G8R8A8_SRGB,  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_R8G8B8A8_SRGB,  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
     };
-    uint32_t n = 3;
+    uint32_t n = 4;
     if (!fmts) { *count = n; return VK_SUCCESS; }
     uint32_t c = std::min(*count, n);
     memcpy(fmts, list, c * sizeof(VkSurfaceFormatKHR));
@@ -3181,23 +3683,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateSwapchainKHR(VkDevice d, const Vk
     dev->fn.CreateCommandPool(dev->real_dev, &cpci, nullptr, &sc->present_pool);
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, sc->present_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     dev->fn.AllocateCommandBuffers(dev->real_dev, &cbai, &sc->present_cmd);
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, 0};
+    dev->fn.CreateFence(dev->real_dev, &fci, nullptr, &sc->present_fence);
 
-    // Zero-initialize swapchain attach_bufs once so uninitialized HBM3 memory never flashes!
-    VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    dev->fn.BeginCommandBuffer(sc->present_cmd, &cbi);
+    // Zero host staging buffers on CPU (never QueueWaitIdle during CreateSwapchain so vkd3d-proton timeline submits never deadlock!)
     for (auto* img : sc->images) {
-        if (img->attach_buf) dev->fn.CmdFillBuffer(sc->present_cmd, img->attach_buf, 0, sz, 0xFF000000u);
-    }
-    dev->fn.EndCommandBuffer(sc->present_cmd);
-    VkSubmitInfo zsi{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &sc->present_cmd};
-    {
-        std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
-        dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &zsi, VK_NULL_HANDLE);
-        dev->fn.QueueWaitIdle(dev->main_queue->real_q);
+        if (img->host_ptr) memset(img->host_ptr, 0, (size_t)sz);
     }
 
     fprintf(stderr, "[SmRast-WSI] Created swapchain %ux%u fmt=%d imgs=%u\n",
             sc->extent.width, sc->extent.height, (int)sc->format, n);
+    fflush(stderr);
     *out = to_h<VkSwapchainKHR>(sc);
     return VK_SUCCESS;
 }
@@ -3207,6 +3703,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_DestroySwapchainKHR(VkDevice d, VkSwapchain
     auto* sc = from_h<SmSwapchain>(s);
     dev->fn.DeviceWaitIdle(dev->real_dev);
     sm_wsi_cleanup_swapchain(sc);
+    if (sc->present_fence) dev->fn.DestroyFence(dev->real_dev, sc->present_fence, nullptr);
     if (sc->present_pool) dev->fn.DestroyCommandPool(dev->real_dev, sc->present_pool, nullptr);
     for (auto* img : sc->images) sm_DestroyImage(d, to_h<VkImage>(img), nullptr);
     delete sc;
@@ -3249,6 +3746,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_QueuePresentKHR(VkQueue queue, const Vk
         auto* sc = from_h<SmSwapchain>(pi->pSwapchains[i]);
         uint32_t idx = pi->pImageIndices[i];
         if (idx < sc->images.size()) sm_wsi_blit_to_surface(sc, sc->images[idx]);
+        if (g_sm_xray_env) {
+            if (g_sm_xray_frames.load(std::memory_order_relaxed) > 0) {
+                int rem = g_sm_xray_frames.fetch_sub(1, std::memory_order_relaxed) - 1;
+                fprintf(stderr, "[SmXRay] === PRESENT FRAME #%llu (rem=%d) ===\n", (unsigned long long)sc->present_frames, rem);
+                fflush(stderr);
+            } else if (access("/tmp/smrast_xray.trigger", F_OK) == 0) {
+                unlink("/tmp/smrast_xray.trigger");
+                g_sm_xray_frames.store(2, std::memory_order_relaxed);
+            }
+        }
     }
     return VK_SUCCESS;
 }
@@ -3293,11 +3800,107 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BindImageMemory2(VkDevice d, uint32_t c
 }
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetLineWidth(VkCommandBuffer, float) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBias(VkCommandBuffer, float, float, float) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetBlendConstants(VkCommandBuffer, const float[4]) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetBlendConstants(VkCommandBuffer cb, const float c[4]) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    scb->has_dyn_blend_const = true;
+    for (int k = 0; k < 4; ++k) scb->dyn_blend_const[k] = c[k];
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBounds(VkCommandBuffer, float, float) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilCompareMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilWriteMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilReference(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilCompareMask(VkCommandBuffer cb, VkStencilFaceFlags mask, uint32_t cmpMask) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    if (mask & VK_STENCIL_FACE_FRONT_BIT) { scb->has_dyn_stencil_cmask[0] = true; scb->dyn_stencil_cmask[0] = cmpMask & 0xFFu; }
+    if (mask & VK_STENCIL_FACE_BACK_BIT)  { scb->has_dyn_stencil_cmask[1] = true; scb->dyn_stencil_cmask[1] = cmpMask & 0xFFu; }
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilWriteMask(VkCommandBuffer cb, VkStencilFaceFlags mask, uint32_t wMask) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    if (mask & VK_STENCIL_FACE_FRONT_BIT) { scb->has_dyn_stencil_wmask[0] = true; scb->dyn_stencil_wmask[0] = wMask & 0xFFu; }
+    if (mask & VK_STENCIL_FACE_BACK_BIT)  { scb->has_dyn_stencil_wmask[1] = true; scb->dyn_stencil_wmask[1] = wMask & 0xFFu; }
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetStencilReference(VkCommandBuffer cb, VkStencilFaceFlags mask, uint32_t ref) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    if (mask & VK_STENCIL_FACE_FRONT_BIT) { scb->has_dyn_stencil_ref[0] = true; scb->dyn_stencil_ref[0] = ref & 0xFFu; }
+    if (mask & VK_STENCIL_FACE_BACK_BIT)  { scb->has_dyn_stencil_ref[1] = true; scb->dyn_stencil_ref[1] = ref & 0xFFu; }
+}
+static VKAPI_ATTR void VKAPI_CALL sm_GetDescriptorSetLayoutSupport(
+        VkDevice d, const VkDescriptorSetLayoutCreateInfo* ci, VkDescriptorSetLayoutSupport* sup) {
+    auto* dev = reinterpret_cast<SmDevice*>(d);
+    auto fn = (PFN_vkGetDescriptorSetLayoutSupport)dev->pd->inst->fn.GetDeviceProcAddr(dev->real_dev, "vkGetDescriptorSetLayoutSupport");
+    if (!fn || !ci) { if (sup) sup->supported = VK_TRUE; return; }
+    std::vector<VkDescriptorSetLayoutBinding> b(ci->bindingCount);
+    for (uint32_t i = 0; i < ci->bindingCount; ++i) {
+        b[i] = ci->pBindings[i];
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo mci = *ci;
+    mci.pBindings = b.data();
+    fn(dev->real_dev, &mci, sup);
+}
+static VKAPI_ATTR void VKAPI_CALL sm_TrimCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolTrimFlags f) {
+    auto* dev = reinterpret_cast<SmDevice*>(d);
+    auto fn = (PFN_vkTrimCommandPool)dev->pd->inst->fn.GetDeviceProcAddr(dev->real_dev, "vkTrimCommandPool");
+    if (fn) fn(dev->real_dev, p, f);
+}
+static VKAPI_ATTR void VKAPI_CALL sm_GetDeviceGroupPeerMemoryFeatures(
+        VkDevice, uint32_t, uint32_t, uint32_t, VkPeerMemoryFeatureFlags* f) {
+    if (f) *f = VK_PEER_MEMORY_FEATURE_COPY_SRC_BIT | VK_PEER_MEMORY_FEATURE_COPY_DST_BIT |
+                VK_PEER_MEMORY_FEATURE_GENERIC_SRC_BIT | VK_PEER_MEMORY_FEATURE_GENERIC_DST_BIT;
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDeviceMask(VkCommandBuffer, uint32_t) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdDispatchBase(VkCommandBuffer cb, uint32_t, uint32_t, uint32_t, uint32_t x, uint32_t y, uint32_t z) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
+    scb->dev->fn.CmdDispatch(scb->real_cb, x, y, z);
+}
+static VKAPI_ATTR uint64_t VKAPI_CALL sm_GetBufferOpaqueCaptureAddress(VkDevice d, const VkBufferDeviceAddressInfo* info) {
+    auto* dev = reinterpret_cast<SmDevice*>(d);
+    auto fn = (PFN_vkGetBufferOpaqueCaptureAddress)dev->pd->inst->fn.GetDeviceProcAddr(dev->real_dev, "vkGetBufferOpaqueCaptureAddress");
+    if (!fn || !info) return 0;
+    VkBufferDeviceAddressInfo m = *info; m.buffer = from_h<SmBuffer>(info->buffer)->real_buf;
+    return fn(dev->real_dev, &m);
+}
+static VKAPI_ATTR uint64_t VKAPI_CALL sm_GetDeviceMemoryOpaqueCaptureAddress(VkDevice d, const VkDeviceMemoryOpaqueCaptureAddressInfo* info) {
+    auto* dev = reinterpret_cast<SmDevice*>(d);
+    auto fn = (PFN_vkGetDeviceMemoryOpaqueCaptureAddress)dev->pd->inst->fn.GetDeviceProcAddr(dev->real_dev, "vkGetDeviceMemoryOpaqueCaptureAddress");
+    return (fn && info) ? fn(dev->real_dev, info) : 0;
+}
+static VKAPI_ATTR void VKAPI_CALL sm_GetDeviceImageSparseMemoryRequirements(
+        VkDevice, const VkDeviceImageMemoryRequirements*, uint32_t* count, VkSparseImageMemoryRequirements2*) {
+    if (count) *count = 0;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL sm_CreatePrivateDataSlot(VkDevice, const VkPrivateDataSlotCreateInfo*, const VkAllocationCallbacks*, VkPrivateDataSlot* out) {
+    if (out) *out = (VkPrivateDataSlot)(uintptr_t)(new std::unordered_map<uint64_t, uint64_t>());
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL sm_DestroyPrivateDataSlot(VkDevice, VkPrivateDataSlot s, const VkAllocationCallbacks*) {
+    if (s) delete reinterpret_cast<std::unordered_map<uint64_t, uint64_t>*>((uintptr_t)s);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL sm_SetPrivateData(VkDevice, VkObjectType, uint64_t obj, VkPrivateDataSlot s, uint64_t data) {
+    if (s) (*reinterpret_cast<std::unordered_map<uint64_t, uint64_t>*>((uintptr_t)s))[obj] = data;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL sm_GetPrivateData(VkDevice, VkObjectType, uint64_t obj, VkPrivateDataSlot s, uint64_t* out) {
+    if (!out) return;
+    *out = 0;
+    if (s) {
+        auto* m = reinterpret_cast<std::unordered_map<uint64_t, uint64_t>*>((uintptr_t)s);
+        auto it = m->find(obj);
+        if (it != m->end()) *out = it->second;
+    }
+}
+static VKAPI_ATTR VkResult VKAPI_CALL sm_AcquireNextImage2KHR(VkDevice d, const VkAcquireNextImageInfoKHR* info, uint32_t* idx) {
+    return sm_AcquireNextImageKHR(d, info->swapchain, info->timeout, info->semaphore, info->fence, idx);
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdPushDescriptorSet2KHR(VkCommandBuffer cb, const VkPushDescriptorSetInfoKHR* info) {
+    if (!info) return;
+    if (info->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT))
+        sm_CmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, info->layout, info->set, info->descriptorWriteCount, info->pDescriptorWrites);
+    if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+        sm_CmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, info->layout, info->set, info->descriptorWriteCount, info->pDescriptorWrites);
+}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdPushDescriptorSetWithTemplate2KHR(VkCommandBuffer cb, const VkPushDescriptorSetWithTemplateInfoKHR* info) {
+    if (!info) return;
+    sm_CmdPushDescriptorSetWithTemplateKHR(cb, info->descriptorUpdateTemplate, info->layout, info->set, info->pData);
+}
+
 static VKAPI_ATTR void VKAPI_CALL sm_CmdNextSubpass(VkCommandBuffer, VkSubpassContents) {}
 
 // =============================================================================
@@ -3474,9 +4077,28 @@ static PFN_vkVoidFunction sm_lookup_fn(const char* name) {
     MAP(CmdNextSubpass2);
     MAP(CmdBeginRendering);
     MAP(CmdEndRendering);
+    MAP(GetDescriptorSetLayoutSupport);
+    MAP(TrimCommandPool);
+    MAP(GetDeviceGroupPeerMemoryFeatures);
+    MAP(CmdSetDeviceMask);
+    MAP(CmdDispatchBase);
+    MAP(GetBufferOpaqueCaptureAddress);
+    MAP(GetDeviceMemoryOpaqueCaptureAddress);
+    MAP(GetDeviceImageSparseMemoryRequirements);
+    MAP(CreatePrivateDataSlot);
+    MAP(DestroyPrivateDataSlot);
+    MAP(SetPrivateData);
+    MAP(GetPrivateData);
+    MAP(AcquireNextImage2KHR);
+    MAP(CmdPushDescriptorSet2KHR);
+    MAP(CmdPushDescriptorSetWithTemplate2KHR);
     MAP(CmdBindPipeline);
     MAP(CmdBindDescriptorSets);
     MAP(CmdPushConstants);
+    MAP(CmdPushDescriptorSetKHR);
+    MAP(CmdPushDescriptorSetWithTemplateKHR);
+    MAP(CmdBeginConditionalRenderingEXT);
+    MAP(CmdEndConditionalRenderingEXT);
     MAP(CmdSetViewport);
     MAP(CmdSetViewportWithCount);
     MAP(CmdSetScissor);
@@ -3605,6 +4227,22 @@ static PFN_vkVoidFunction sm_lookup_fn(const char* name) {
     if (strcmp(name, "vkGetRenderingAreaGranularityKHR") == 0 || strcmp(name, "vkGetRenderingAreaGranularity") == 0) return (PFN_vkVoidFunction)sm_GetRenderingAreaGranularityKHR;
     if (strcmp(name, "vkGetImageSubresourceLayout2KHR") == 0 || strcmp(name, "vkGetImageSubresourceLayout2EXT") == 0 || strcmp(name, "vkGetImageSubresourceLayout2") == 0) return (PFN_vkVoidFunction)sm_GetImageSubresourceLayout2KHR;
     if (strcmp(name, "vkGetDeviceImageSubresourceLayoutKHR") == 0 || strcmp(name, "vkGetDeviceImageSubresourceLayout") == 0) return (PFN_vkVoidFunction)sm_GetDeviceImageSubresourceLayoutKHR;
+    if (strcmp(name, "vkGetDescriptorSetLayoutSupportKHR") == 0) return (PFN_vkVoidFunction)sm_GetDescriptorSetLayoutSupport;
+    if (strcmp(name, "vkTrimCommandPoolKHR") == 0) return (PFN_vkVoidFunction)sm_TrimCommandPool;
+    if (strcmp(name, "vkGetDeviceGroupPeerMemoryFeaturesKHR") == 0) return (PFN_vkVoidFunction)sm_GetDeviceGroupPeerMemoryFeatures;
+    if (strcmp(name, "vkCmdSetDeviceMaskKHR") == 0) return (PFN_vkVoidFunction)sm_CmdSetDeviceMask;
+    if (strcmp(name, "vkCmdDispatchBaseKHR") == 0) return (PFN_vkVoidFunction)sm_CmdDispatchBase;
+    if (strcmp(name, "vkGetBufferOpaqueCaptureAddressKHR") == 0) return (PFN_vkVoidFunction)sm_GetBufferOpaqueCaptureAddress;
+    if (strcmp(name, "vkGetDeviceMemoryOpaqueCaptureAddressKHR") == 0) return (PFN_vkVoidFunction)sm_GetDeviceMemoryOpaqueCaptureAddress;
+    if (strcmp(name, "vkGetDeviceImageSparseMemoryRequirementsKHR") == 0) return (PFN_vkVoidFunction)sm_GetDeviceImageSparseMemoryRequirements;
+    if (strcmp(name, "vkCreatePrivateDataSlotEXT") == 0) return (PFN_vkVoidFunction)sm_CreatePrivateDataSlot;
+    if (strcmp(name, "vkDestroyPrivateDataSlotEXT") == 0) return (PFN_vkVoidFunction)sm_DestroyPrivateDataSlot;
+    if (strcmp(name, "vkSetPrivateDataEXT") == 0) return (PFN_vkVoidFunction)sm_SetPrivateData;
+    if (strcmp(name, "vkGetPrivateDataEXT") == 0) return (PFN_vkVoidFunction)sm_GetPrivateData;
+    if (strcmp(name, "vkCmdPushDescriptorSet") == 0) return (PFN_vkVoidFunction)sm_CmdPushDescriptorSetKHR;
+    if (strcmp(name, "vkCmdPushDescriptorSetWithTemplate") == 0) return (PFN_vkVoidFunction)sm_CmdPushDescriptorSetWithTemplateKHR;
+    if (strcmp(name, "vkCmdPushDescriptorSet2") == 0) return (PFN_vkVoidFunction)sm_CmdPushDescriptorSet2KHR;
+    if (strcmp(name, "vkCmdPushDescriptorSetWithTemplate2") == 0) return (PFN_vkVoidFunction)sm_CmdPushDescriptorSetWithTemplate2KHR;
     if (getenv("SMRAST_LOG_MISSING")) fprintf(stderr, "[SmRast] MISSING FN: %s\n", name);
     return nullptr;
 }

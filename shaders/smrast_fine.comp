@@ -79,7 +79,7 @@ void main() {
         if (in_bounds) {
             for (uint k = 0u; k < count; ++k) {
                 TriSetup t = s_tris[k];
-                if (fx < t.area.y || fx > t.area.w + 1.0 || fy < t.area.z || fy > float(t.idx.w) + 1.0)
+                if (fx < t.area.y || fx > t.area.w + 1.0 || fy < t.area.z || fy > float(t.idx.w & 0x7FFFFFFFu) + 1.0)
                     continue;
                 vec2 s0 = t.v0.xy, s1 = t.v1.xy, s2 = t.v2.xy;
                 float e0 = (s2.x - s1.x) * (fy - s1.y) - (s2.y - s1.y) * (fx - s1.x);

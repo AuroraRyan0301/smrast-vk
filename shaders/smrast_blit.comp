@@ -4,7 +4,7 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer SrcBuf  { uint src_px[]; };
-layout(std430, set = 0, binding = 1) writeonly buffer DstBuf { uint dst_px[]; };
+layout(std430, set = 0, binding = 1) buffer DstBuf          { uint dst_px[]; };
 
 layout(push_constant) uniform BlitPC {
     uint src_w, src_h, dst_w, dst_h;
@@ -27,12 +27,22 @@ vec4 load_src(int x, int y) {
     uint fc = pc.src_fc;
     if (fc == 4u)  return vec4(unpackHalf2x16(src_px[idx*2u]), unpackHalf2x16(src_px[idx*2u+1u]));
     if (fc == 10u) return vec4(uintBitsToFloat(src_px[idx*2u]), uintBitsToFloat(src_px[idx*2u+1u]), 0.0, 1.0);
+    if (fc == 15u) return vec4(unpackUnorm2x16(src_px[idx*2u]), unpackUnorm2x16(src_px[idx*2u+1u]));
+    if (fc == 16u) return vec4(unpackSnorm2x16(src_px[idx*2u]), unpackSnorm2x16(src_px[idx*2u+1u]));
     if (fc == 8u)  return vec4(uintBitsToFloat(src_px[idx*4u]), uintBitsToFloat(src_px[idx*4u+1u]), uintBitsToFloat(src_px[idx*4u+2u]), uintBitsToFloat(src_px[idx*4u+3u]));
+    if (fc == 17u) { uint sh = (idx & 3u) << 3u; return vec4(float((src_px[idx >> 2u] >> sh) & 255u) / 255.0, 0.0, 0.0, 1.0); }
+    if (fc == 18u) { uint sh = (idx & 1u) << 4u; uint v = (src_px[idx >> 1u] >> sh) & 0xFFFFu; return vec4(float(v & 255u)/255.0, float((v>>8u)&255u)/255.0, 0.0, 1.0); }
+    if (fc == 19u) { uint sh = (idx & 1u) << 4u; uint v = (src_px[idx >> 1u] >> sh) & 0xFFFFu; return vec4(unpackHalf2x16(v).x, 0.0, 0.0, 1.0); }
+    if (fc == 20u) { uint sh = (idx & 1u) << 4u; uint v = (src_px[idx >> 1u] >> sh) & 0xFFFFu; return vec4(float(v)/65535.0, 0.0, 0.0, 1.0); }
     uint pk = src_px[idx];
-    if (fc == 5u) return vec4(sm_uf11_to_f32(pk & 0x7FFu), sm_uf11_to_f32((pk>>11u) & 0x7FFu), sm_uf10_to_f32((pk>>22u) & 0x3FFu), 1.0);
-    if (fc == 6u) return vec4(uintBitsToFloat(pk), 0.0, 0.0, 1.0);
-    if (fc == 7u) return vec4(unpackHalf2x16(pk), 0.0, 1.0);
-    if (fc == 9u) return vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0);
+    if (fc == 5u)  return vec4(sm_uf11_to_f32(pk & 0x7FFu), sm_uf11_to_f32((pk>>11u) & 0x7FFu), sm_uf10_to_f32((pk>>22u) & 0x3FFu), 1.0);
+    if (fc == 6u)  return vec4(uintBitsToFloat(pk), 0.0, 0.0, 1.0);
+    if (fc == 7u)  return vec4(unpackHalf2x16(pk), 0.0, 1.0);
+    if (fc == 9u)  return vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0);
+    if (fc == 11u) return vec4(float(pk), 0.0, 0.0, 1.0);
+    if (fc == 12u) return unpackSnorm4x8(pk);
+    if (fc == 13u) return vec4(unpackUnorm2x16(pk), 0.0, 1.0);
+    if (fc == 14u) return vec4(unpackSnorm2x16(pk), 0.0, 1.0);
     vec4 c = unpackUnorm4x8(pk);
     if (fc == 1u || fc == 3u) c = c.bgra;
     if (fc == 2u || fc == 3u) c.rgb = vec3(sm_srgb_to_lin(c.r), sm_srgb_to_lin(c.g), sm_srgb_to_lin(c.b));
@@ -41,13 +51,23 @@ vec4 load_src(int x, int y) {
 
 void store_dst(uint idx, vec4 c) {
     uint fc = pc.dst_fc;
-    if (fc == 4u) { dst_px[idx*2u] = packHalf2x16(c.rg); dst_px[idx*2u+1u] = packHalf2x16(c.ba); return; }
+    if (fc == 4u)  { dst_px[idx*2u] = packHalf2x16(c.rg); dst_px[idx*2u+1u] = packHalf2x16(c.ba); return; }
     if (fc == 10u) { dst_px[idx*2u] = floatBitsToUint(c.r); dst_px[idx*2u+1u] = floatBitsToUint(c.g); return; }
-    if (fc == 8u) { dst_px[idx*4u]=floatBitsToUint(c.r); dst_px[idx*4u+1u]=floatBitsToUint(c.g); dst_px[idx*4u+2u]=floatBitsToUint(c.b); dst_px[idx*4u+3u]=floatBitsToUint(c.a); return; }
-    if (fc == 5u) { dst_px[idx] = sm_f32_to_uf11(c.r) | (sm_f32_to_uf11(c.g) << 11u) | (sm_f32_to_uf10(c.b) << 22u); return; }
-    if (fc == 6u) { dst_px[idx] = floatBitsToUint(c.r); return; }
-    if (fc == 7u) { dst_px[idx] = packHalf2x16(c.rg); return; }
-    if (fc == 9u) { vec4 cl = clamp(c, 0.0, 1.0); dst_px[idx] = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u); return; }
+    if (fc == 15u) { dst_px[idx*2u] = packUnorm2x16(clamp(c.rg, 0.0, 1.0)); dst_px[idx*2u+1u] = packUnorm2x16(clamp(c.ba, 0.0, 1.0)); return; }
+    if (fc == 16u) { dst_px[idx*2u] = packSnorm2x16(clamp(c.rg, -1.0, 1.0)); dst_px[idx*2u+1u] = packSnorm2x16(clamp(c.ba, -1.0, 1.0)); return; }
+    if (fc == 8u)  { dst_px[idx*4u]=floatBitsToUint(c.r); dst_px[idx*4u+1u]=floatBitsToUint(c.g); dst_px[idx*4u+2u]=floatBitsToUint(c.b); dst_px[idx*4u+3u]=floatBitsToUint(c.a); return; }
+    if (fc == 17u) { uint sh = (idx & 3u) << 3u; uint b = uint(round(clamp(c.r, 0.0, 1.0) * 255.0)); atomicAnd(dst_px[idx >> 2u], ~(0xFFu << sh)); atomicOr(dst_px[idx >> 2u], b << sh); return; }
+    if (fc == 18u) { uint sh = (idx & 1u) << 4u; uint v = uint(round(clamp(c.r,0.0,1.0)*255.0)) | (uint(round(clamp(c.g,0.0,1.0)*255.0)) << 8u); atomicAnd(dst_px[idx >> 1u], ~(0xFFFFu << sh)); atomicOr(dst_px[idx >> 1u], v << sh); return; }
+    if (fc == 19u) { uint sh = (idx & 1u) << 4u; uint v = packHalf2x16(vec2(c.r, 0.0)) & 0xFFFFu; atomicAnd(dst_px[idx >> 1u], ~(0xFFFFu << sh)); atomicOr(dst_px[idx >> 1u], v << sh); return; }
+    if (fc == 20u) { uint sh = (idx & 1u) << 4u; uint v = uint(round(clamp(c.r, 0.0, 1.0) * 65535.0)); atomicAnd(dst_px[idx >> 1u], ~(0xFFFFu << sh)); atomicOr(dst_px[idx >> 1u], v << sh); return; }
+    if (fc == 5u)  { dst_px[idx] = sm_f32_to_uf11(c.r) | (sm_f32_to_uf11(c.g) << 11u) | (sm_f32_to_uf10(c.b) << 22u); return; }
+    if (fc == 6u)  { dst_px[idx] = floatBitsToUint(c.r); return; }
+    if (fc == 7u)  { dst_px[idx] = packHalf2x16(c.rg); return; }
+    if (fc == 9u)  { vec4 cl = clamp(c, 0.0, 1.0); dst_px[idx] = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u); return; }
+    if (fc == 11u) { dst_px[idx] = uint(c.r); return; }
+    if (fc == 12u) { dst_px[idx] = packSnorm4x8(clamp(c, -1.0, 1.0)); return; }
+    if (fc == 13u) { dst_px[idx] = packUnorm2x16(clamp(c.rg, 0.0, 1.0)); return; }
+    if (fc == 14u) { dst_px[idx] = packSnorm2x16(clamp(c.rg, -1.0, 1.0)); return; }
     c = clamp(c, 0.0, 1.0);
     if (fc == 2u || fc == 3u) c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b));
     if (fc == 1u || fc == 3u) c = c.bgra;

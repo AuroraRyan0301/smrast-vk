@@ -88,9 +88,19 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     dev->fn.EndCommandBuffer(sc->present_cmd);
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &sc->present_cmd};
-    {
-        std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
-        dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, VK_NULL_HANDLE);
+    if (sc->present_fence) {
+        dev->fn.ResetFences(dev->real_dev, 1, &sc->present_fence);
+        {
+            std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
+            dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, sc->present_fence);
+        }
+        // Wait WITHOUT holding main_queue->mtx so vkd3d-proton timeline-semaphore submits never deadlock!
+        dev->fn.WaitForFences(dev->real_dev, 1, &sc->present_fence, VK_TRUE, UINT64_MAX);
+    } else {
+        {
+            std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
+            dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, VK_NULL_HANDLE);
+        }
         dev->fn.QueueWaitIdle(dev->main_queue->real_q);
     }
 

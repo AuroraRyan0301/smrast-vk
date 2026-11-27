@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd .
-rm -f /tmp/smrast_cache_*
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+rm -f /tmp/smrast_cache_* /tmp/smrast_v4*_cache_*
 bash build.sh
 
 echo "=== 1. VULKAN 1.3 GAME ENGINE FEATURE TEST (DynamicRendering + ExtDynState + Sync2 + 256 Instancing + RTT->Strip) ==="
-VK_ICD_FILENAMES=$PWD/smrast_icd.json \
-SMRAST_SHADER_DIR=./build \
+VK_ICD_FILENAMES="$ROOT_DIR/smrast_icd.json" \
+SMRAST_SHADER_DIR="$ROOT_DIR/build" \
 ./build/test_vk13_game_features 2>&1
 
-echo "=== 2. H20 SmRast-VK v0.2 (78 SMs, pure Compute qf[2]) 1080p PBR BENCHMARK ==="
+echo "=== 2. H20 SmRast-VK (78 SMs, pure Compute qf[2]) 1080p PBR BENCHMARK ==="
 for T in 100000 500000 1000000 2000000; do
     OUTARG=""
     if [ "$T" -eq 1000000 ]; then OUTARG="--out /tmp/pbr_1m_h20.ppm"; fi
-    VK_ICD_FILENAMES=$PWD/smrast_icd.json \
-    SMRAST_SHADER_DIR=./build \
+    VK_ICD_FILENAMES="$ROOT_DIR/smrast_icd.json" \
+    SMRAST_SHADER_DIR="$ROOT_DIR/build" \
     ./build/smrast_stress_bench --tris "$T" --warmup 5 --frames 40 $OUTARG 2>&1 | grep -E "RESULT|ERROR|ERR"
 done
 

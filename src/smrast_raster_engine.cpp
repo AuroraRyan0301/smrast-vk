@@ -50,11 +50,22 @@ bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img) {
     if (!img || img->attach_buf != VK_NULL_HANDLE) return true;
     uint32_t bpp = img->is_depth ? 4u : sm_format_bpp(img->format);
     VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * bpp;
+    sz = (sz + 15ull) & ~15ull; // 16-byte aligned for 1B/2B u32 atomic words
     if (sz < 256) sz = 256;
     return create_buf(dev, sz,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                       img->attach_buf, img->attach_mem);
+}
+
+bool sm_ensure_image_stencil_buf(SmDevice* dev, SmImage* img) {
+    if (!img || img->stencil_buf != VK_NULL_HANDLE) return true;
+    VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * 4u;
+    if (sz < 256) sz = 256;
+    return create_buf(dev, sz,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                      img->stencil_buf, img->stencil_mem);
 }
 
 bool sm_ensure_geom_capacity(SmDevice* dev, uint32_t need_verts, uint32_t need_tris) {
@@ -109,12 +120,12 @@ bool sm_init_raster_engine(SmDevice* dev) {
     const char* shader_dir = getenv("SMRAST_SHADER_DIR");
     if (!shader_dir || !shader_dir[0]) shader_dir = "./build";
 
-    // 1. DescriptorSetLayouts for Clear (MRT 4+Depth+Vis+UBO), Bin, Fine, IndirectPrep, VS-int, FS-int (MRT 4)
+    // 1. DescriptorSetLayouts for Clear (8-MRT+Depth+Vis+Stencil+UBO), Bin, Fine, IndirectPrep(+Count), VS-int, FS-int (8-MRT+Stencil)
     {
-        VkDescriptorSetLayoutBinding b[7];
-        for (uint32_t i = 0; i < 6; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[6] = {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 7, b};
+        VkDescriptorSetLayoutBinding b[12];
+        for (uint32_t i = 0; i < 11; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[11] = {11, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 12, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.clear_dsl);
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.clear_dsl, 0, nullptr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.clear_pl);
@@ -138,11 +149,11 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.fine_pl);
     }
     {
-        VkDescriptorSetLayoutBinding b[4];
-        for (uint32_t i = 0; i < 4; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 4, b};
+        VkDescriptorSetLayoutBinding b[5];
+        for (uint32_t i = 0; i < 5; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 5, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.ind_prep_dsl);
-        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.ind_prep_dsl, 1, &pcr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.ind_prep_pl);
     }
@@ -165,19 +176,17 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.blit_pl);
     }
     {
-        // VS internal set: 0=ClipVert, 1=IdxBuf, 2..9=VB0..VB7, 10=VsParamsUBO
+        // VS internal set: 0=ClipVert, 1=IdxBuf, 2..9=VB0..VB7, 10=VsParams (SSBO to avoid NV535 set>=5 UBO bank aliasing!)
         VkDescriptorSetLayoutBinding b[11];
-        for (uint32_t i = 0; i < 10; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[10] = {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        for (uint32_t i = 0; i < 11; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 11, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.vs_int_dsl);
     }
     {
-        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..6=Color0..3, 7=DepthBuf, 8=FsParamsUBO
-        VkDescriptorSetLayoutBinding b[9];
-        for (uint32_t i = 0; i < 8; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[8] = {8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 9, b};
+        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf, 13=FsParams (SSBO!)
+        VkDescriptorSetLayoutBinding b[14];
+        for (uint32_t i = 0; i < 14; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 14, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.fs_int_dsl);
     }
 
@@ -205,47 +214,41 @@ bool sm_init_raster_engine(SmDevice* dev) {
     if (!create_buf(dev, 256, ssbo_u | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.ind_disp_buf, R.ind_disp_mem)) return false;
 
     VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    // VS UBO also has STORAGE_BUFFER_BIT so smrast_indirect_prep.comp can patch draw counts directly on GPU!
+    // VS & FS param buffers use STORAGE_BUFFER_BIT (zero UBO bank contention at set>=5 for vkd3d-proton!)
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmVsParamsUBO),
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.vs_ubo_buf, R.vs_ubo_mem, &R.vs_ubo_ptr)) return false;
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmFsParamsUBO),
-                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hv, R.fs_ubo_buf, R.fs_ubo_mem, &R.fs_ubo_ptr)) return false;
-    if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmClearUBO),
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.fs_ubo_buf, R.fs_ubo_mem, &R.fs_ubo_ptr)) return false;
+    if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_AUX_SLOTS * sizeof(SmClearUBO),
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hv, R.clr_ubo_buf, R.clr_ubo_mem, &R.clr_ubo_ptr)) return false;
 
-    // 4. Allocate descriptor pool & per-slot ring sets
-    uint32_t N = SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
+    // 4. Batch-allocate descriptor pool & per-slot ring sets (49,152 draw slots = 3+ full 15K-draw 3A open-world frames zero-collision!)
+    uint32_t ND = SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
+    uint32_t NI = SmRasterEngine::MAX_IND_SLOTS;
+    uint32_t NA = SmRasterEngine::MAX_AUX_SLOTS;
+    uint32_t total_sets = ND * 5 + NI + NA * 2;
+    uint32_t total_ssbo = ND * (11 + 14 + 6 + 5 + 3) + NI * 5 + NA * (11 + 2);
     VkDescriptorPoolSize ps[2] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, N * (6 + 6 + 5 + 4 + 3 + 2 + 10 + 8)},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, N * 3},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, total_ssbo},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NA},
     };
-    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, N * 8, 2, ps};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, total_sets, 2, ps};
     if (dev->fn.CreateDescriptorPool(dev->real_dev, &dpci, nullptr, &R.desc_pool) != VK_SUCCESS) return false;
 
-    auto alloc_ds = [&](VkDescriptorSetLayout dsl) {
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, R.desc_pool, 1, &dsl};
-        dev->fn.AllocateDescriptorSets(dev->real_dev, &ai, &ds);
-        return ds;
+    auto alloc_batch = [&](VkDescriptorSetLayout dsl, uint32_t count, std::vector<VkDescriptorSet>& out) -> bool {
+        out.resize(count, VK_NULL_HANDLE);
+        std::vector<VkDescriptorSetLayout> layouts(count, dsl);
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, R.desc_pool, count, layouts.data()};
+        return dev->fn.AllocateDescriptorSets(dev->real_dev, &ai, out.data()) == VK_SUCCESS;
     };
-    R.clear_ds.resize(N);
-    R.bin_ds.resize(N);
-    R.fine_ds.resize(N);
-    R.ind_prep_ds.resize(N);
-    R.depth_only_ds.resize(N);
-    R.blit_ds.resize(N);
-    R.vs_int_ds.resize(N);
-    R.fs_int_ds.resize(N);
-    for (uint32_t i = 0; i < N; ++i) {
-        R.clear_ds[i]      = alloc_ds(R.clear_dsl);
-        R.bin_ds[i]        = alloc_ds(R.bin_dsl);
-        R.fine_ds[i]       = alloc_ds(R.fine_dsl);
-        R.ind_prep_ds[i]   = alloc_ds(R.ind_prep_dsl);
-        R.depth_only_ds[i] = alloc_ds(R.depth_only_dsl);
-        R.blit_ds[i]       = alloc_ds(R.blit_dsl);
-        R.vs_int_ds[i]     = alloc_ds(R.vs_int_dsl);
-        R.fs_int_ds[i]     = alloc_ds(R.fs_int_dsl);
-    }
+    if (!alloc_batch(R.clear_dsl,      NA, R.clear_ds)      ||
+        !alloc_batch(R.blit_dsl,       NA, R.blit_ds)       ||
+        !alloc_batch(R.ind_prep_dsl,   NI, R.ind_prep_ds)   ||
+        !alloc_batch(R.bin_dsl,        ND, R.bin_ds)        ||
+        !alloc_batch(R.fine_dsl,       ND, R.fine_ds)       ||
+        !alloc_batch(R.depth_only_dsl, ND, R.depth_only_ds) ||
+        !alloc_batch(R.vs_int_dsl,     ND, R.vs_int_ds)     ||
+        !alloc_batch(R.fs_int_dsl,     ND, R.fs_int_ds)) return false;
 
     return sm_ensure_vis_size(dev, 1920, 1080);
 }

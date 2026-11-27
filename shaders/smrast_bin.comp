@@ -126,7 +126,7 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     ts.v1   = vec4(s1, z1, invw1);
     ts.v2   = vec4(s2, z2, invw2);
     ts.area = vec4(inv_area, float(minx), float(miny), float(maxx));
-    ts.idx  = uvec4(i0, i1, i2, uint(maxy));
+    ts.idx  = uvec4(i0, i1, i2, (uint(maxy) & 0x7FFFFFFFu) | (is_front ? 0x80000000u : 0u));
     tris[tid] = ts;
 
     int bw = maxx - minx + 1;

@@ -23,7 +23,7 @@
 #define ICD_LOADER_MAGIC 0x01CDC0DE
 #endif
 
-static constexpr uint32_t SM_MAX_MRT            = 4;
+static constexpr uint32_t SM_MAX_MRT            = 8;
 static constexpr uint32_t SM_MAX_VARYINGS       = 15;
 static constexpr uint32_t SM_VERT_STRIDE_VEC4   = 1 + SM_MAX_VARYINGS; // 16 vec4 = 256 bytes
 static constexpr uint32_t SM_MAX_DRAW_VERTS     = 6 * 1024 * 1024;     // 6.29M regular verts/draw (>2M tris!)
@@ -37,7 +37,9 @@ static constexpr uint32_t SM_MAX_VTX_BINDINGS   = 8;
 // 0=RGBA8_UNORM, 1=BGRA8_UNORM, 2=RGBA8_SRGB, 3=BGRA8_SRGB,
 // 4=RGBA16_SFLOAT (8B), 5=B10G11R11_UFLOAT (4B), 6=R32_SFLOAT (4B),
 // 7=RG16_SFLOAT (4B), 8=RGBA32_SFLOAT (16B), 9=A2B10G10R10_UNORM (4B),
-// 10=RG32_SFLOAT (8B), 11=R32_UINT/SINT (4B)
+// 10=RG32_SFLOAT (8B), 11=R32_UINT/SINT (4B), 12=RGBA8_SNORM (4B),
+// 13=RG16_UNORM (4B), 14=RG16_SNORM (4B), 15=RGBA16_UNORM (8B), 16=RGBA16_SNORM (8B),
+// 17=R8_UNORM/UINT (1B), 18=RG8_UNORM (2B), 19=R16_SFLOAT (2B), 20=R16_UNORM/UINT (2B)
 static inline uint32_t sm_format_code(VkFormat f) {
     switch (f) {
         case VK_FORMAT_B8G8R8A8_UNORM:          return 1u;
@@ -52,17 +54,39 @@ static inline uint32_t sm_format_code(VkFormat f) {
         case VK_FORMAT_R32G32_SFLOAT:           return 10u;
         case VK_FORMAT_R32_UINT:
         case VK_FORMAT_R32_SINT:                return 11u;
+        case VK_FORMAT_R8G8B8A8_SNORM:          return 12u;
+        case VK_FORMAT_R16G16_UNORM:            return 13u;
+        case VK_FORMAT_R16G16_SNORM:            return 14u;
+        case VK_FORMAT_R16G16B16A16_UNORM:      return 15u;
+        case VK_FORMAT_R16G16B16A16_SNORM:      return 16u;
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8_SRGB:
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8_SINT:                 return 17u;
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8_SNORM:              return 18u;
+        case VK_FORMAT_R16_SFLOAT:              return 19u;
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16_SINT:                return 20u;
         default:                                return 0u;
     }
 }
-static inline uint32_t sm_format_u32_stride(VkFormat f) {
+static inline uint32_t sm_format_bpp_code(VkFormat f) {
     uint32_t c = sm_format_code(f);
-    if (c == 4u || c == 10u) return 2u; // 8 bytes/px
-    if (c == 8u)             return 4u; // 16 bytes/px
-    return 1u;                          // 4 bytes/px
+    if (c == 4u || c == 10u || c == 15u || c == 16u) return 1u; // 8 bytes/px (2 u32)
+    if (c == 8u)                                     return 2u; // 16 bytes/px (4 u32)
+    if (c == 17u)                                    return 3u; // 1 byte/px
+    if (c == 18u || c == 19u || c == 20u)            return 4u; // 2 bytes/px
+    return 0u;                                                  // 4 bytes/px (1 u32)
 }
 static inline uint32_t sm_format_bpp(VkFormat f) {
-    return sm_format_u32_stride(f) * 4u;
+    uint32_t bc = sm_format_bpp_code(f);
+    if (bc == 1u) return 8u;
+    if (bc == 2u) return 16u;
+    if (bc == 3u) return 1u;
+    if (bc == 4u) return 2u;
+    return 4u;
 }
 static inline uint32_t sm_format_exact_bpp(VkFormat f) {
     switch (f) {
@@ -180,6 +204,7 @@ struct BackendDevFns {
     PFN_vkCmdBindPipeline CmdBindPipeline = nullptr;
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets = nullptr;
     PFN_vkCmdPushConstants CmdPushConstants = nullptr;
+    PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR = nullptr;
     PFN_vkCmdDispatch CmdDispatch = nullptr;
     PFN_vkCmdDispatchIndirect CmdDispatchIndirect = nullptr;
     PFN_vkCmdCopyBuffer CmdCopyBuffer = nullptr;
@@ -215,6 +240,7 @@ struct SmShaderModule {
 };
 
 struct SmDescriptorUpdateTemplate {
+    VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
     std::vector<VkDescriptorUpdateTemplateEntry> entries;
 };
 
@@ -234,9 +260,14 @@ struct SmImage {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool is_swapchain = false;
     bool is_depth = false;
+    bool has_stencil = false;
     bool attach_dirty = false;
+    int32_t attach_mip = -1;
+    int32_t attach_layer = -1;
     VkBuffer attach_buf = VK_NULL_HANDLE;
     VkDeviceMemory attach_mem = VK_NULL_HANDLE;
+    VkBuffer stencil_buf = VK_NULL_HANDLE;
+    VkDeviceMemory stencil_mem = VK_NULL_HANDLE;
     VkBuffer host_buf = VK_NULL_HANDLE;
     VkDeviceMemory host_mem = VK_NULL_HANDLE;
     void* host_ptr = nullptr;
@@ -254,7 +285,7 @@ struct SmImageView {
 
 struct SmRenderPass {
     std::vector<VkAttachmentDescription> attachments;
-    int color_attach_idxs[SM_MAX_MRT] = {-1, -1, -1, -1};
+    int color_attach_idxs[SM_MAX_MRT] = {-1,-1,-1,-1,-1,-1,-1,-1};
     uint32_t color_attach_count = 0;
     int depth_attach_idx = -1;
 };
@@ -295,13 +326,32 @@ struct SmPipeline {
     bool depth_test = false;
     bool depth_write = false;
     VkCompareOp depth_op = VK_COMPARE_OP_LESS;
+    bool stencil_test = false;
+    VkStencilOpState stencil_front{};
+    VkStencilOpState stencil_back{};
 
-    // Per-MRT blending state (up to 4 independent RTs!)
-    bool blend_enable[SM_MAX_MRT] = {false, false, false, false};
-    VkBlendFactor src_color_blend[SM_MAX_MRT] = {VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA};
-    VkBlendFactor dst_color_blend[SM_MAX_MRT] = {VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA};
-    VkBlendOp color_blend_op[SM_MAX_MRT] = {VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD};
-    uint32_t color_write_mask[SM_MAX_MRT] = {0xFu, 0xFu, 0xFu, 0xFu};
+    // Per-MRT blending & write-mask state (up to 8 independent RTs!)
+    bool blend_enable[SM_MAX_MRT] = {false,false,false,false,false,false,false,false};
+    VkBlendFactor src_color_blend[SM_MAX_MRT] = {
+        VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA,
+        VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA};
+    VkBlendFactor dst_color_blend[SM_MAX_MRT] = {
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA};
+    VkBlendOp color_blend_op[SM_MAX_MRT] = {
+        VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD,
+        VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD};
+    VkBlendFactor src_alpha_blend[SM_MAX_MRT] = {
+        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
+        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE};
+    VkBlendFactor dst_alpha_blend[SM_MAX_MRT] = {
+        VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO,
+        VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO};
+    VkBlendOp alpha_blend_op[SM_MAX_MRT] = {
+        VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD,
+        VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD};
+    uint32_t color_write_mask[SM_MAX_MRT] = {0xFu,0xFu,0xFu,0xFu,0xFu,0xFu,0xFu,0xFu};
+    float blend_constants[4] = {0.f, 0.f, 0.f, 0.f};
     bool has_static_vp = false;
     VkViewport static_vp{};
     bool has_static_scissor = false;
@@ -325,6 +375,7 @@ struct SmSwapchain {
     uint32_t next_image = 0;
     VkCommandPool present_pool = VK_NULL_HANDLE;
     VkCommandBuffer present_cmd = VK_NULL_HANDLE;
+    VkFence present_fence = VK_NULL_HANDLE;
     uint64_t present_frames = 0;
     // Zero-Copy MIT-SHM XCB presentation state
     bool shm_checked = false;
@@ -355,27 +406,38 @@ struct alignas(256) SmVsParamsUBO {
     uint32_t vtx_strides_hi[4];  // VB 4..7
 };
 
-struct alignas(256) SmFsParamsUBO {
+struct alignas(512) SmFsParamsUBO {
     uint32_t width;
     uint32_t height;
     uint32_t vert_stride_vec4;
     uint32_t depth_write;
-    uint32_t rt_active_mask;     // bits 0..3 = RT0..3 attached
+    uint32_t rt_active_mask;     // bits 0..7 = RT0..7 attached
+    uint32_t stencil_enable;     // bit0=stencil_test, bit1=has_stencil_buf
+    uint32_t stencil_front_cfg;  // [0..2]=cmpOp, [3..5]=failOp, [6..8]=passOp, [9..11]=depthFailOp, [16..23]=cmpMask, [24..31]=writeMask
+    uint32_t stencil_back_cfg;   // same layout for back faces
+    uint32_t stencil_refs;       // [0..7]=frontRef, [8..15]=backRef
     uint32_t pad0, pad1, pad2;
-    uint32_t rt_fmt[4];          // sm_format_code() for RT0..3
-    uint32_t rt_blend_en[4];
-    uint32_t rt_src_blend[4];
-    uint32_t rt_dst_blend[4];
-    uint32_t rt_blend_op[4];
+    float    blend_const[4];     // vec4 blend_const
+    uint32_t rt_fmt[8];          // uvec4 rt_fmt[2]
+    uint32_t rt_blend_en[8];     // uvec4 rt_blend_en[2]
+    uint32_t rt_src_blend[8];    // uvec4 rt_src_blend[2]
+    uint32_t rt_dst_blend[8];    // uvec4 rt_dst_blend[2]
+    uint32_t rt_blend_op[8];     // uvec4 rt_blend_op[2]
+    uint32_t rt_src_alpha[8];    // uvec4 rt_src_alpha[2]
+    uint32_t rt_dst_alpha[8];    // uvec4 rt_dst_alpha[2]
+    uint32_t rt_alpha_op[8];     // uvec4 rt_alpha_op[2]
+    uint32_t rt_write_mask[8];   // uvec4 rt_write_mask[2]
 };
 
 struct alignas(256) SmClearUBO {
     uint32_t width;
     uint32_t height;
-    uint32_t clear_mask;         // bits 0..3=RT0..3, bit4=depth, bit5=vis
+    uint32_t clear_mask;         // bits 0..7=RT0..7, bit8=depth, bit9=vis, bit10=stencil
     float    clear_depth;
-    uint32_t rt_u32_stride[4];
-    uint32_t rt_clear[4][4];
+    uint32_t clear_stencil;
+    uint32_t pad0, pad1, pad2;
+    uint32_t rt_bpp_code[8];     // uvec4[2]: 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
+    uint32_t rt_clear[8][4];     // uvec4[8]
 };
 
 struct SmRasterEngine {
@@ -417,7 +479,9 @@ struct SmRasterEngine {
     VkBuffer ind_disp_buf = VK_NULL_HANDLE;    VkDeviceMemory ind_disp_mem = VK_NULL_HANDLE;
     VkBuffer dummy_buf = VK_NULL_HANDLE;       VkDeviceMemory dummy_mem = VK_NULL_HANDLE;
 
-    static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 2048;
+    static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 49152;
+    static constexpr uint32_t MAX_IND_SLOTS       = 16384;
+    static constexpr uint32_t MAX_AUX_SLOTS       = 4096;
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
     VkBuffer fs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory fs_ubo_mem = VK_NULL_HANDLE; void* fs_ubo_ptr = nullptr;
     VkBuffer clr_ubo_buf = VK_NULL_HANDLE;     VkDeviceMemory clr_ubo_mem = VK_NULL_HANDLE; void* clr_ubo_ptr = nullptr;
@@ -432,6 +496,9 @@ struct SmRasterEngine {
     std::vector<VkDescriptorSet> vs_int_ds;
     std::vector<VkDescriptorSet> fs_int_ds;
     uint32_t draw_cursor = 0;
+    uint32_t ind_cursor = 0;
+    uint32_t clear_cursor = 0;
+    uint32_t blit_cursor = 0;
 
     uint32_t cur_w = 0, cur_h = 0;
     uint32_t tiles_x = 0, tiles_y = 0;
@@ -459,6 +526,14 @@ struct SmDevice {
     std::mutex mtx;
 };
 
+struct SmPushDescSet {
+    bool active = false;
+    std::vector<VkWriteDescriptorSet> writes;
+    std::vector<std::vector<VkDescriptorBufferInfo>> bufs;
+    std::vector<std::vector<VkDescriptorImageInfo>>  imgs;
+    std::vector<std::vector<VkBufferView>>           bvs;
+};
+
 struct SmCommandBuffer {
     VK_LOADER_DATA loader_data;
     SmDevice* dev = nullptr;
@@ -468,9 +543,9 @@ struct SmCommandBuffer {
     bool in_dyn_rendering = false;
     SmRenderPass* cur_rp = nullptr;
     SmFramebuffer* cur_fb = nullptr;
-    SmImage* dyn_col_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
-    SmImageView* dyn_col_views[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
-    SmImage* dyn_res_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    SmImage* dyn_col_imgs[SM_MAX_MRT] = {nullptr};
+    SmImageView* dyn_col_views[SM_MAX_MRT] = {nullptr};
+    SmImage* dyn_res_imgs[SM_MAX_MRT] = {nullptr};
     uint32_t dyn_col_count = 0;
     SmImage* dyn_dep_img = nullptr;
     SmImageView* dyn_dep_view = nullptr;
@@ -489,12 +564,24 @@ struct SmCommandBuffer {
     bool has_dyn_depth_test = false;  bool dyn_depth_test = false;
     bool has_dyn_depth_write = false; bool dyn_depth_write = false;
     bool has_dyn_depth_op = false;    VkCompareOp dyn_depth_op = VK_COMPARE_OP_LESS;
+    bool has_dyn_blend_const = false; float dyn_blend_const[4] = {0.f, 0.f, 0.f, 0.f};
+
+    bool has_dyn_stencil_test = false;       bool dyn_stencil_test = false;
+    bool has_dyn_stencil_op[2] = {false, false};
+    VkStencilOp dyn_stencil_fail[2] = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP};
+    VkStencilOp dyn_stencil_pass[2] = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP};
+    VkStencilOp dyn_stencil_dfail[2] = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP};
+    VkCompareOp dyn_stencil_cmp[2] = {VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_ALWAYS};
+    bool has_dyn_stencil_ref[2] = {false, false};  uint32_t dyn_stencil_ref[2] = {0, 0};
+    bool has_dyn_stencil_cmask[2] = {false, false}; uint32_t dyn_stencil_cmask[2] = {0xFF, 0xFF};
+    bool has_dyn_stencil_wmask[2] = {false, false}; uint32_t dyn_stencil_wmask[2] = {0xFF, 0xFF};
 
     static constexpr uint32_t MAX_DYN_OFFS_PER_SET = 32;
     VkDescriptorSet gfx_sets[16] = {VK_NULL_HANDLE};
     uint32_t gfx_set_mask = 0;
     uint32_t gfx_dyn_counts[16] = {0};
     uint32_t gfx_dyn_offs[16][MAX_DYN_OFFS_PER_SET] = {{0}};
+    SmPushDescSet gfx_push_descs[16];
     uint8_t push_data[256] = {0};
     uint32_t push_size = 0;
 
@@ -503,6 +590,7 @@ struct SmCommandBuffer {
     uint32_t comp_set_mask = 0;
     uint32_t comp_dyn_counts[16] = {0};
     uint32_t comp_dyn_offs[16][MAX_DYN_OFFS_PER_SET] = {{0}};
+    SmPushDescSet comp_push_descs[16];
     uint8_t comp_push_data[256] = {0};
     uint32_t comp_push_size = 0;
     bool comp_state_dirty = false;
@@ -518,6 +606,7 @@ struct SmCommandBuffer {
 
 uint32_t sm_find_mem_type(SmPhysicalDevice* pd, uint32_t bits, VkMemoryPropertyFlags req);
 bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img);
+bool sm_ensure_image_stencil_buf(SmDevice* dev, SmImage* img);
 bool sm_ensure_geom_capacity(SmDevice* dev, uint32_t need_verts, uint32_t need_tris);
 bool sm_init_raster_engine(SmDevice* dev);
 void sm_destroy_raster_engine(SmDevice* dev);
@@ -531,8 +620,10 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            std::string& err);
 
 struct SmFsCompileHints {
-    int  rt_fmt[SM_MAX_MRT]   = {-1, -1, -1, -1}; // -1 = dynamic via UBO, >=0 = exact sm_format_code()
-    bool blend_en[SM_MAX_MRT] = {true, true, true, true};
+    int      rt_fmt[SM_MAX_MRT]     = {-1,-1,-1,-1,-1,-1,-1,-1};
+    bool     blend_en[SM_MAX_MRT]   = {true,true,true,true,true,true,true,true};
+    uint32_t write_mask[SM_MAX_MRT] = {0xFu,0xFu,0xFu,0xFu,0xFu,0xFu,0xFu,0xFu};
+    bool     stencil_en             = false;
 };
 
 bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
@@ -541,6 +632,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              const SmFsCompileHints& hints,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err);
+
+bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
+                                  std::vector<uint32_t>& out_comp_spv,
+                                  std::string& err);
 
 void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img);
 void sm_wsi_cleanup_swapchain(SmSwapchain* sc);

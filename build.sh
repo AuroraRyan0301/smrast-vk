@@ -21,4 +21,7 @@ if [ -f bench/test_vk13_game_features.cpp ]; then
     done
     g++ -O3 -std=c++17 bench/test_vk13_game_features.cpp -o build/test_vk13_game_features -lvulkan -lm
 fi
-echo "Built SmRast-VK v0.3 (libvulkan_smrast.so + 6 compute shaders + benchmarks) successfully!"
+if [ -f bench/test_v04_features.cpp ]; then
+    g++ -O3 -std=c++17 bench/test_v04_features.cpp -o build/test_v04_features -lvulkan -lm
+fi
+echo "Built SmRast-VK v0.4.0 (libvulkan_smrast.so + 6 compute shaders + benchmarks) successfully!"
