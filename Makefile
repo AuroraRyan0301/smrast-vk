@@ -23,7 +23,10 @@ $(TARGET): $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/%.comp.spv: shaders/%.comp | $(BUILD_DIR)
 	$(GLSLANG) --target-env vulkan1.3 -V $< -o $@
 
-bench: $(BUILD_DIR)/smrast_stress_bench $(BUILD_DIR)/test_vk13_game_features $(BUILD_DIR)/test_v04_features $(BUILD_DIR)/test_v05_features $(BUILD_DIR)/test_v06_features $(BUILD_DIR)/test_v07_features $(BUILD_DIR)/test_v08_features
+bench: $(BUILD_DIR)/smrast_stress_bench $(BUILD_DIR)/test_vk13_game_features $(BUILD_DIR)/test_v04_features $(BUILD_DIR)/test_v05_features $(BUILD_DIR)/test_v06_features $(BUILD_DIR)/test_v07_features $(BUILD_DIR)/test_v08_features $(BUILD_DIR)/test_v09_features
+
+$(BUILD_DIR)/test_v09_features: bench/test_v09_features.cpp | $(BUILD_DIR)
+	$(CXX) -O3 -std=c++17 bench/test_v09_features.cpp -o $@ -lvulkan -lm
 
 $(BUILD_DIR)/test_v04_features: bench/test_v04_features.cpp | $(BUILD_DIR)
 	$(CXX) -O3 -std=c++17 bench/test_v04_features.cpp -o $@ -lvulkan -lm

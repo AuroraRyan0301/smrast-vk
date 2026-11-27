@@ -13,6 +13,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 static uint64_t wsi_now_us() {
     using namespace std::chrono;
@@ -173,7 +176,36 @@ void sm_wsi_cleanup_swapchain(SmSwapchain* sc) {
 static uint64_t g_prof_last_report_us = 0;
 static uint64_t g_prof_last_frames = 0;
 
+#if defined(__x86_64__) && defined(__GNUC__)
+__attribute__((target("avx2")))
+static void sm_copy_rgba_to_bgra_avx2(uint8_t* __restrict dst, const uint8_t* __restrict src, size_t bytes) {
+    const __m256i shuf = _mm256_setr_epi8(
+        2, 1, 0, 3,  6, 5, 4, 7,  10, 9, 8, 11,  14, 13, 12, 15,
+        2, 1, 0, 3,  6, 5, 4, 7,  10, 9, 8, 11,  14, 13, 12, 15);
+    const __m256i alpha = _mm256_set1_epi32((int)0xFF000000u);
+    size_t i = 0;
+    for (; i + 64 <= bytes; i += 64) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i*)(src + i));
+        __m256i v1 = _mm256_loadu_si256((const __m256i*)(src + i + 32));
+        v0 = _mm256_or_si256(_mm256_shuffle_epi8(v0, shuf), alpha);
+        v1 = _mm256_or_si256(_mm256_shuffle_epi8(v1, shuf), alpha);
+        _mm256_storeu_si256((__m256i*)(dst + i), v0);
+        _mm256_storeu_si256((__m256i*)(dst + i + 32), v1);
+    }
+    for (; i + 4 <= bytes; i += 4) {
+        uint32_t p; memcpy(&p, src + i, 4);
+        uint32_t q = (p & 0x0000FF00u) | ((p & 0x000000FFu) << 16) | ((p >> 16) & 0x000000FFu) | 0xFF000000u;
+        memcpy(dst + i, &q, 4);
+    }
+}
+#endif
+
 static inline void sm_copy_rgba_to_bgra_fast(uint8_t* __restrict dst, const uint8_t* __restrict src, size_t bytes) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    static int has_avx2 = -1;
+    if (has_avx2 < 0) has_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    if (has_avx2) { sm_copy_rgba_to_bgra_avx2(dst, src, bytes); return; }
+#endif
     uint32_t* __restrict d32 = reinterpret_cast<uint32_t*>(dst);
     const uint32_t* __restrict s32 = reinterpret_cast<const uint32_t*>(src);
     const size_t n = bytes >> 2;
@@ -183,7 +215,8 @@ static inline void sm_copy_rgba_to_bgra_fast(uint8_t* __restrict dst, const uint
     }
 }
 
-void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
+void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
+                            uint32_t wait_sem_cnt, const VkSemaphore* wait_sems) {
     if (!sc || !sc->surface || !img || !img->host_ptr) return;
     SmDevice* dev = sc->dev;
     uint32_t w = sc->extent.width;
@@ -226,7 +259,10 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     }
     dev->fn.EndCommandBuffer(sc->present_cmds[cur]);
 
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &sc->present_cmds[cur]};
+    VkPipelineStageFlags wait_stages[8];
+    uint32_t nw = std::min(wait_sem_cnt, 8u);
+    for (uint32_t i = 0; i < nw; ++i) wait_stages[i] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, nw, nw ? wait_sems : nullptr, nw ? wait_stages : nullptr, 1, &sc->present_cmds[cur]};
     if (sc->present_fences[cur]) {
         dev->fn.ResetFences(dev->real_dev, 1, &sc->present_fences[cur]);
         {
@@ -265,13 +301,14 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     if (surf->is_xcb && surf->xcb_conn) {
         if (!sc->shm_checked) init_xcb_shm(sc, bytes);
         if (sc->use_shm && sc->shm_ptrs[sidx] && sc->shm_bytes >= bytes) {
-            if (sc->shm_in_flight)
-                free(xcb_get_input_focus_reply(surf->xcb_conn, xcb_get_input_focus(surf->xcb_conn), nullptr));
+            // Ping-pong overlap: shm_ptrs[sidx] is already idle (from Frame N-2) -> swizzle concurrently with Frame N-1 Xvfb blit!
             if (!need_swap) {
                 memcpy(sc->shm_ptrs[sidx], src, bytes);
             } else {
                 sm_copy_rgba_to_bgra_fast(sc->shm_ptrs[sidx], src, bytes);
             }
+            if (sc->shm_in_flight)
+                free(xcb_get_input_focus_reply(surf->xcb_conn, xcb_get_input_focus(surf->xcb_conn), nullptr));
             xcb_shm_put_image(surf->xcb_conn, surf->xcb_win, sc->xcb_gc,
                               (uint16_t)w, (uint16_t)h, 0, 0, (uint16_t)w, (uint16_t)h,
                               0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, sc->shm_segs[sidx], 0);
@@ -299,13 +336,13 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     } else if (!surf->is_xcb && surf->xlib_dpy) {
         if (!sc->shm_checked) init_xlib_shm(sc, w, h);
         if (sc->use_shm && sc->shm_ptrs[sidx] && sc->xlib_shm_imgs[sidx] && sc->xlib_gc && sc->shm_bytes >= bytes) {
-            // Ping-pong sync BEFORE writing next SHM slot: hides previous frame's Xvfb blit 100% behind GPU compute!
-            if (sc->shm_in_flight) XSync(surf->xlib_dpy, False);
+            // Ping-pong overlap: shm_ptrs[sidx] is already idle (from Frame N-2) -> AVX2 swizzle overlaps with Frame N-1 Xvfb blit!
             if (!need_swap) {
                 memcpy(sc->shm_ptrs[sidx], src, bytes);
             } else {
                 sm_copy_rgba_to_bgra_fast(sc->shm_ptrs[sidx], src, bytes);
             }
+            if (sc->shm_in_flight) XSync(surf->xlib_dpy, False);
             XShmPutImage(surf->xlib_dpy, surf->xlib_win, (GC)sc->xlib_gc, (XImage*)sc->xlib_shm_imgs[sidx],
                          0, 0, 0, 0, w, h, False);
             XFlush(surf->xlib_dpy);

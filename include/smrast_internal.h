@@ -275,6 +275,9 @@ struct SmImage {
     bool linear_aliased = false;
     bool ever_bound_in_ds = false;
     bool real_layout_inited = false;
+    // v0.9 Empty-clear SyncA2I elimination (tracks uniform cleared state on real_img)
+    bool real_uniform_cleared = false;
+    uint32_t real_clear_words[4] = {0, 0, 0, 0};
     uint32_t row_stride_px = 0;
     VkDeviceSize row_pitch_bytes = 0;
     uint32_t pending_mip = 0;
@@ -348,6 +351,7 @@ struct SmPipeline {
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     bool prim_restart = false;
     bool vs_writes_point_size = false;
+    uint32_t vert_stride_vec4 = SM_VERT_STRIDE_VEC4; // v0.9 dynamic ClipVertBuf stride (2..16 vec4)
     bool fs_uses_push_constants = true;
     bool fs_batched_push_ok = false;
     bool fs_batched_dyn_ubo_ok = false;
@@ -480,6 +484,12 @@ struct alignas(512) SmFsParamsUBO {
     uint32_t rt_alpha_op[8];     // uvec4 rt_alpha_op[2]
     uint32_t rt_write_mask[8];   // uvec4 rt_write_mask[2]
     uint32_t rt_stride_px[8];    // uvec4 rt_stride[2] (v0.8: rowPitch/bpp for zero-copy linear-aliased RTs!)
+    // v0.9 Zero-Bin Inline-Setup Fused Quad FS params (fits inside existing 512B alignas padding!)
+    float    quad_vp[4];         // vp.x, vp.y, vp.width, vp.height
+    int32_t  quad_sc[4];         // sc_x0, sc_y0, sc_x1, sc_y1
+    float    quad_z[2];          // vp.minDepth, vp.maxDepth
+    uint32_t quad_meta;          // bits 0..3=total_tris, 4..6=topo, 8=cull_back, 9=cull_front, 10=front_cw, 11=no_depth_clip
+    uint32_t quad_pad;
 };
 
 struct alignas(256) SmClearUBO {
@@ -663,6 +673,7 @@ struct SmDrawBatch {
     bool is_indirect = false;
     SmPipeline* fs_owner_pipe = nullptr;
     uint32_t W = 0, H = 0, tx = 0, ty = 0;
+    uint32_t vert_stride_vec4 = SM_VERT_STRIDE_VEC4;
     uint32_t fs_slot = 0;
     uint32_t fine_rflags = 0;
     uint32_t extra_v_base = 0, extra_t_base = 0;
@@ -705,6 +716,10 @@ struct SmCommandBuffer {
     bool pass_wrote_col[SM_MAX_MRT] = {false,false,false,false,false,false,false,false};
     bool pass_wrote_dep = false;
     bool pass_wrote_stn = false;
+    bool pass_drew_col[SM_MAX_MRT] = {false,false,false,false,false,false,false,false};
+    bool pass_drew_dep = false;
+    uint32_t pass_clear_col_words[SM_MAX_MRT][4] = {{0}};
+    uint32_t pass_clear_dep_bits = 0;
     uint32_t dyn_col_count = 0;
     SmImage* dyn_dep_img = nullptr;
     SmImageView* dyn_dep_view = nullptr;
@@ -788,7 +803,8 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
                            std::string& err,
-                           bool* out_writes_point_size = nullptr);
+                           bool* out_writes_point_size = nullptr,
+                           uint32_t* out_stride_vec4 = nullptr);
 
 struct SmFsCompileHints {
     int      rt_fmt[SM_MAX_MRT]     = {-1,-1,-1,-1,-1,-1,-1,-1};
@@ -807,13 +823,15 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              bool* out_fs_has_discard_or_depth = nullptr,
                              const std::vector<SmDynUboDesc>* dyn_ubos = nullptr,
                              bool* out_fs_batched_push_ok = nullptr,
-                             SmDynUboDesc* out_batched_dyn_ubo = nullptr);
+                             SmDynUboDesc* out_batched_dyn_ubo = nullptr,
+                             uint32_t* out_stride_vec4 = nullptr);
 
 bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
                                   std::vector<uint32_t>& out_comp_spv,
                                   std::string& err);
 
-void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img);
+void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
+                            uint32_t wait_sem_cnt = 0, const VkSemaphore* wait_sems = nullptr);
 void sm_wsi_cleanup_swapchain(SmSwapchain* sc);
 
 struct SmProfCounters {

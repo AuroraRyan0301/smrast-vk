@@ -94,6 +94,9 @@ void main() {
     vs_ubo_raw[b + 19u] = v_base;
 
     if (pc.batch_slot == 0xFFFFFFFFu) {
+        // v0.9 Zero-DMA reset of clip-tail + active-tile indirect header directly on-GPU!
+        tile_counts[pc.meta_idx + 0u] = 0u;
+        tile_counts[pc.meta_idx + 1u] = 0u;
         tile_counts[pc.meta_idx + 2u] = total_tris;
         tile_counts[pc.meta_idx + 3u] = max(tpi, 1u);
         tile_counts[pc.meta_idx + 4u] = max(vpi, 1u);
@@ -107,6 +110,11 @@ void main() {
         disp_cmds[5u] = (total_tris > 0u) ? 1u : 0u;
         disp_cmds[6u] = (total_tris > 0u) ? 1u : 0u;
         disp_cmds[7u] = 0u;
+
+        disp_cmds[8u]  = 0u;
+        disp_cmds[9u]  = 1u;
+        disp_cmds[10u] = 1u;
+        disp_cmds[11u] = 0u;
     } else {
         uint d = 16u + pc.batch_slot * 16u;
         disp_cmds[d + 0u]  = (total_verts + 63u) / 64u;

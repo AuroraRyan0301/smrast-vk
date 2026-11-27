@@ -75,7 +75,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v8d_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v9b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -874,13 +874,29 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
                            std::string& err,
-                           bool* out_writes_point_size) {
+                           bool* out_writes_point_size,
+                           uint32_t* out_stride_vec4) {
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
 
     bool writes_ps = (glsl.find("gl_PointSize") != std::string::npos);
     if (out_writes_point_size) *out_writes_point_size = writes_ps;
+    if (out_stride_vec4) {
+        if (writes_ps) {
+            *out_stride_vec4 = SM_VERT_STRIDE_VEC4;
+        } else {
+            uint32_t max_slot = 1u; // slot 0 = gl_Position
+            for (const auto& io : outputs) {
+                uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+                for (uint32_t a = 0; a < elems; ++a) {
+                    uint32_t loc = io.location + a;
+                    if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
+                }
+            }
+            *out_stride_vec4 = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
+        }
+    }
 
     std::string user_exts;
     std::string body = strip_version_and_stage_io(glsl, user_exts);
@@ -1021,11 +1037,24 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              bool* out_fs_has_discard_or_depth,
                              const std::vector<SmDynUboDesc>* dyn_ubos,
                              bool* out_fs_batched_push_ok,
-                             SmDynUboDesc* out_batched_dyn_ubo) {
+                             SmDynUboDesc* out_batched_dyn_ubo,
+                             uint32_t* out_stride_vec4) {
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     ReflectedBlock push_blk, dyn_ubo_blk;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err, dyn_ubos, &push_blk, &dyn_ubo_blk)) return false;
+
+    if (out_stride_vec4) {
+        uint32_t max_slot = 1u;
+        for (const auto& io : inputs) {
+            uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+            for (uint32_t a = 0; a < elems; ++a) {
+                uint32_t loc = io.location + a;
+                if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
+            }
+        }
+        *out_stride_vec4 = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
+    }
 
     if (out_fs_uses_push) *out_fs_uses_push = (glsl.find("push_constant") != std::string::npos);
     if (out_fs_batched_push_ok) *out_fs_batched_push_ok = false;
@@ -1121,7 +1150,18 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    uvec4 rt_alpha_op[2];\n"
        << "    uvec4 rt_write_mask[2];\n"
        << "    uvec4 rt_stride[2];\n"
+       << "    vec4  quad_vp;\n"
+       << "    ivec4 quad_sc;\n"
+       << "    vec2  quad_z;\n"
+       << "    uint  quad_meta;\n"
+       << "    uint  quad_pad;\n"
        << "} sm_fs;\n";
+    ss << "shared SmTriSetup sm_fq_tris[16];\n";
+    ss << "shared vec3 sm_fq_u0[16];\n";
+    ss << "shared vec3 sm_fq_u1[16];\n";
+    ss << "shared vec3 sm_fq_u2[16];\n";
+    ss << "shared uint sm_fq_cnt;\n";
+    ss << "shared uint sm_fq_clipped;\n";
     ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n";
     if (batched_push)
         ss << "layout(std430, set = " << sm_set_idx << ", binding = 15) readonly buffer SmBatchPushBuf   { uint sm_bp_raw[]; };\n";
@@ -1432,7 +1472,135 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    uint pidx;\n";
     ss << "    bool active_px;\n";
     ss << "    uint my_tri;\n";
-    ss << "    if (sm_fs.direct_2d == 2u) {\n";
+    ss << "    if (sm_fs.direct_2d == 3u) {\n";
+    ss << "        p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
+    ss << "        in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
+    ss << "        pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
+    ss << "        uint n_in = min(sm_fs.quad_meta & 15u, 2u);\n";
+    ss << "        if (tid == 0u) { sm_fq_cnt = 0u; sm_fq_clipped = 0u; }\n";
+    ss << "        barrier();\n";
+    ss << "        if (tid < n_in) {\n";
+    ss << "            uint topo = (sm_fs.quad_meta >> 4u) & 7u;\n";
+    ss << "            uint qi0, qi1, qi2;\n";
+    ss << "            if (topo == 0u) { qi0 = tid * 3u; qi1 = qi0 + 1u; qi2 = qi0 + 2u; }\n";
+    ss << "            else if ((tid & 1u) == 0u) { qi0 = tid; qi1 = tid + 1u; qi2 = tid + 2u; }\n";
+    ss << "            else { qi0 = tid + 1u; qi1 = tid; qi2 = tid + 2u; }\n";
+    ss << "            vec4 c0 = sm_clip_verts[qi0 * sm_fs.vert_stride_vec4];\n";
+    ss << "            vec4 c1 = sm_clip_verts[qi1 * sm_fs.vert_stride_vec4];\n";
+    ss << "            vec4 c2 = sm_clip_verts[qi2 * sm_fs.vert_stride_vec4];\n";
+    ss << "            bool no_dc = (sm_fs.quad_meta & 2048u) != 0u;\n";
+    ss << "            bool ok_tri = !any(isnan(c0)) && !any(isnan(c1)) && !any(isnan(c2)) &&\n";
+    ss << "                          !any(isinf(c0)) && !any(isinf(c1)) && !any(isinf(c2)) &&\n";
+    ss << "                          !(c0.w <= 1e-5 && c1.w <= 1e-5 && c2.w <= 1e-5) &&\n";
+    ss << "                          !(c0.x + c0.w < 0.0 && c1.x + c1.w < 0.0 && c2.x + c2.w < 0.0) &&\n";
+    ss << "                          !(c0.w - c0.x < 0.0 && c1.w - c1.x < 0.0 && c2.w - c2.x < 0.0) &&\n";
+    ss << "                          !(c0.y + c0.w < 0.0 && c1.y + c1.w < 0.0 && c2.y + c2.w < 0.0) &&\n";
+    ss << "                          !(c0.w - c0.y < 0.0 && c1.w - c1.y < 0.0 && c2.w - c2.y < 0.0) &&\n";
+    ss << "                          (no_dc || (!(c0.z < 0.0 && c1.z < 0.0 && c2.z < 0.0) && !(c0.z > c0.w && c1.z > c1.w && c2.z > c2.w)));\n";
+    ss << "            if (ok_tri) {\n";
+    ss << "                vec4 poly_pos[10]; vec3 poly_u[10]; uint n_poly = 3u;\n";
+    ss << "                poly_pos[0] = c0; poly_pos[1] = c1; poly_pos[2] = c2;\n";
+    ss << "                poly_u[0] = vec3(1.0, 0.0, 0.0); poly_u[1] = vec3(0.0, 1.0, 0.0); poly_u[2] = vec3(0.0, 0.0, 1.0);\n";
+    ss << "                const float GB = 4.0;\n";
+    ss << "                bool in0 = (c0.w > 1e-4) && (abs(c0.x) <= GB * c0.w) && (abs(c0.y) <= GB * c0.w) && (no_dc || (c0.z >= 0.0 && c0.z <= c0.w));\n";
+    ss << "                bool in1 = (c1.w > 1e-4) && (abs(c1.x) <= GB * c1.w) && (abs(c1.y) <= GB * c1.w) && (no_dc || (c1.z >= 0.0 && c1.z <= c1.w));\n";
+    ss << "                bool in2 = (c2.w > 1e-4) && (abs(c2.x) <= GB * c2.w) && (abs(c2.y) <= GB * c2.w) && (no_dc || (c2.z >= 0.0 && c2.z <= c2.w));\n";
+    ss << "                if (!(in0 && in1 && in2)) {\n";
+    ss << "                    atomicOr(sm_fq_clipped, 1u);\n";
+    ss << "                    for (uint pl = 0u; pl < 7u && n_poly >= 3u; ++pl) {\n";
+    ss << "                        if (no_dc && (pl == 1u || pl == 2u)) continue;\n";
+    ss << "                        bool all_in = true, any_in = false; float ds[10];\n";
+    ss << "                        for (uint e = 0u; e < n_poly; ++e) {\n";
+    ss << "                            vec4 vp = poly_pos[e]; float d;\n";
+    ss << "                            if (pl == 0u) d = vp.w - 1e-4; else if (pl == 1u) d = vp.z; else if (pl == 2u) d = vp.w - vp.z;\n";
+    ss << "                            else if (pl == 3u) d = vp.x + GB * vp.w; else if (pl == 4u) d = GB * vp.w - vp.x;\n";
+    ss << "                            else if (pl == 5u) d = vp.y + GB * vp.w; else d = GB * vp.w - vp.y;\n";
+    ss << "                            ds[e] = d; if (d < 0.0) all_in = false; else any_in = true;\n";
+    ss << "                        }\n";
+    ss << "                        if (all_in) continue;\n";
+    ss << "                        if (!any_in) { n_poly = 0u; break; }\n";
+    ss << "                        vec4 opos[10]; vec3 ou[10]; uint no = 0u;\n";
+    ss << "                        for (uint e = 0u; e < n_poly; ++e) {\n";
+    ss << "                            uint ne = (e + 1u == n_poly) ? 0u : (e + 1u);\n";
+    ss << "                            float da = ds[e], db = ds[ne]; bool ai = (da >= 0.0), bi = (db >= 0.0);\n";
+    ss << "                            if (ai && no < 10u) { opos[no] = poly_pos[e]; ou[no] = poly_u[e]; no++; }\n";
+    ss << "                            if (ai != bi && no < 10u) {\n";
+    ss << "                                float tt = (abs(da - db) > 1e-12) ? clamp(da / (da - db), 0.0, 1.0) : 0.5;\n";
+    ss << "                                vec4 np = mix(poly_pos[e], poly_pos[ne], tt);\n";
+    ss << "                                if (pl == 0u) np.w = max(np.w, 1e-4); else if (pl == 1u) np.z = max(np.z, 0.0);\n";
+    ss << "                                else if (pl == 2u) { np.w = max(np.w, 1e-4); np.z = min(np.z, np.w); }\n";
+    ss << "                                opos[no] = np; ou[no] = mix(poly_u[e], poly_u[ne], tt); no++;\n";
+    ss << "                            }\n";
+    ss << "                        }\n";
+    ss << "                        for (uint k = 0u; k < no; ++k) { poly_pos[k] = opos[k]; poly_u[k] = ou[k]; }\n";
+    ss << "                        n_poly = no;\n";
+    ss << "                    }\n";
+    ss << "                }\n";
+    ss << "                for (uint f = 2u; f < n_poly; ++f) {\n";
+    ss << "                    vec4 p0 = poly_pos[0], p1 = poly_pos[f - 1u], p2 = poly_pos[f];\n";
+    ss << "                    vec3 u0 = poly_u[0],   u1 = poly_u[f - 1u],   u2 = poly_u[f];\n";
+    ss << "                    if (!(p0.w > 1e-6 && p1.w > 1e-6 && p2.w > 1e-6)) continue;\n";
+    ss << "                    float iw0 = 1.0 / p0.w, iw1 = 1.0 / p1.w, iw2 = 1.0 / p2.w;\n";
+    ss << "                    vec2 qs0 = round(vec2(sm_fs.quad_vp.x + (p0.x * iw0 * 0.5 + 0.5) * sm_fs.quad_vp.z, sm_fs.quad_vp.y + (p0.y * iw0 * 0.5 + 0.5) * sm_fs.quad_vp.w) * 16.0) * 0.0625;\n";
+    ss << "                    vec2 qs1 = round(vec2(sm_fs.quad_vp.x + (p1.x * iw1 * 0.5 + 0.5) * sm_fs.quad_vp.z, sm_fs.quad_vp.y + (p1.y * iw1 * 0.5 + 0.5) * sm_fs.quad_vp.w) * 16.0) * 0.0625;\n";
+    ss << "                    vec2 qs2 = round(vec2(sm_fs.quad_vp.x + (p2.x * iw2 * 0.5 + 0.5) * sm_fs.quad_vp.z, sm_fs.quad_vp.y + (p2.y * iw2 * 0.5 + 0.5) * sm_fs.quad_vp.w) * 16.0) * 0.0625;\n";
+    ss << "                    float qz0 = sm_fs.quad_z.x + (p0.z * iw0) * (sm_fs.quad_z.y - sm_fs.quad_z.x);\n";
+    ss << "                    float qz1 = sm_fs.quad_z.x + (p1.z * iw1) * (sm_fs.quad_z.y - sm_fs.quad_z.x);\n";
+    ss << "                    float qz2 = sm_fs.quad_z.x + (p2.z * iw2) * (sm_fs.quad_z.y - sm_fs.quad_z.x);\n";
+    ss << "                    float qa = (qs1.x - qs0.x) * (qs2.y - qs0.y) - (qs1.y - qs0.y) * (qs2.x - qs0.x);\n";
+    ss << "                    if (!(abs(qa) >= 1e-6)) continue;\n";
+    ss << "                    bool fcw = (sm_fs.quad_meta & 1024u) != 0u;\n";
+    ss << "                    bool is_f = fcw ? (qa > 0.0) : (qa < 0.0);\n";
+    ss << "                    bool cb = (sm_fs.quad_meta & 256u) != 0u, cf = (sm_fs.quad_meta & 512u) != 0u;\n";
+    ss << "                    if ((cb && !is_f) || (cf && is_f)) continue;\n";
+    ss << "                    if (qa < 0.0) { vec2 t2 = qs1; qs1 = qs2; qs2 = t2; float tf = qz1; qz1 = qz2; qz2 = tf; tf = iw1; iw1 = iw2; iw2 = tf; vec3 tu = u1; u1 = u2; u2 = tu; qa = -qa; }\n";
+    ss << "                    int x0 = max(sm_fs.quad_sc.x, int(floor(clamp(min(qs0.x, min(qs1.x, qs2.x)), -1e6, 1e6))));\n";
+    ss << "                    int y0 = max(sm_fs.quad_sc.y, int(floor(clamp(min(qs0.y, min(qs1.y, qs2.y)), -1e6, 1e6))));\n";
+    ss << "                    int x1 = min(sm_fs.quad_sc.z - 1, int(ceil(clamp(max(qs0.x, max(qs1.x, qs2.x)), -1e6, 1e6))));\n";
+    ss << "                    int y1 = min(sm_fs.quad_sc.w - 1, int(ceil(clamp(max(qs0.y, max(qs1.y, qs2.y)), -1e6, 1e6))));\n";
+    ss << "                    if (x0 > x1 || y0 > y1) continue;\n";
+    ss << "                    uint sl = atomicAdd(sm_fq_cnt, 1u);\n";
+    ss << "                    if (sl < 16u) {\n";
+    ss << "                        SmTriSetup qts;\n";
+    ss << "                        qts.v0 = vec4(qs0, qz0, iw0); qts.v1 = vec4(qs1, qz1, iw1); qts.v2 = vec4(qs2, qz2, iw2);\n";
+    ss << "                        qts.area = vec4(1.0 / qa, float(x0), float(y0), float(x1));\n";
+    ss << "                        qts.idx = uvec4(qi0, qi1, qi2, (uint(y1) & 0xFFFFu) | ((tid & 0x7Fu) << 24u) | (is_f ? 0x80000000u : 0u));\n";
+    ss << "                        sm_fq_tris[sl] = qts; sm_fq_u0[sl] = u0; sm_fq_u1[sl] = u1; sm_fq_u2[sl] = u2;\n";
+    ss << "                    }\n";
+    ss << "                }\n";
+    ss << "            }\n";
+    ss << "        }\n";
+    ss << "        barrier();\n";
+    ss << "        uint ntri = min(sm_fq_cnt, 16u);\n";
+    ss << "        if (ntri == 0u) return;\n";
+    ss << "        float tx0 = float(gl_WorkGroupID.x * 16u), ty0 = float(gl_WorkGroupID.y * 16u);\n";
+    ss << "        float tx1 = tx0 + 16.0, ty1 = ty0 + 16.0;\n";
+    ss << "        bool any_ov = false;\n";
+    ss << "        for (uint k = 0u; k < ntri; ++k) {\n";
+    ss << "            SmTriSetup qt = sm_fq_tris[k];\n";
+    ss << "            if (!(tx1 <= qt.area.y || tx0 > qt.area.w + 1.0 || ty1 <= qt.area.z || ty0 > float(qt.idx.w & 0xFFFFu) + 1.0)) { any_ov = true; break; }\n";
+    ss << "        }\n";
+    ss << "        if (!any_ov) return;\n";
+    ss << "        float qfx = float(p.x) + 0.5, qfy = float(p.y) + 0.5;\n";
+    ss << "        my_tri = 0xFFFFFFFFu;\n";
+    ss << "        if (in_bounds) {\n";
+    ss << "            uint best_ord = 0u;\n";
+    ss << "            for (uint k = 0u; k < ntri; ++k) {\n";
+    ss << "                SmTriSetup qt = sm_fq_tris[k];\n";
+    ss << "                if (qfx < qt.area.y || qfx > qt.area.w + 1.0 || qfy < qt.area.z || qfy > float(qt.idx.w & 0xFFFFu) + 1.0) continue;\n";
+    ss << "                vec2 a0 = qt.v0.xy, a1 = qt.v1.xy, a2 = qt.v2.xy;\n";
+    ss << "                float e0 = sm_edge_eval(a1, a2, qfx, qfy);\n";
+    ss << "                float e1 = sm_edge_eval(a2, a0, qfx, qfy);\n";
+    ss << "                float e2 = sm_edge_eval(a0, a1, qfx, qfy);\n";
+    ss << "                if ((sm_is_top_left(a2 - a1) ? (e0 < 0.0) : (e0 <= 0.0)) ||\n";
+    ss << "                    (sm_is_top_left(a0 - a2) ? (e1 < 0.0) : (e1 <= 0.0)) ||\n";
+    ss << "                    (sm_is_top_left(a1 - a0) ? (e2 < 0.0) : (e2 <= 0.0))) continue;\n";
+    ss << "                uint ord = ((qt.idx.w >> 24u) & 0x7Fu) + 1u;\n";
+    ss << "                if (ord >= best_ord) { best_ord = ord; my_tri = k; }\n";
+    ss << "            }\n";
+    ss << "        }\n";
+    ss << "        active_px = (my_tri != 0xFFFFFFFFu);\n";
+    ss << "    } else if (sm_fs.direct_2d == 2u) {\n";
     ss << "        p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
     ss << "        in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
     ss << "        pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
@@ -1487,7 +1655,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    uint eff_tri = active_px ? my_tri : min(min(t0, t1), min(t2, t3));\n";
     ss << "    if (eff_tri == 0xFFFFFFFFu) return;\n\n";
 
-    ss << "    SmTriSetup ts = sm_tris[eff_tri];\n";
+    ss << "    SmTriSetup ts = (sm_fs.direct_2d == 3u) ? sm_fq_tris[eff_tri] : sm_tris[eff_tri];\n";
     ss << "    uint sm_draw_id = (ts.idx.w >> 16u) & 0xFFu;\n";
     if (batched_push)    ss << push_init_code;
     if (batched_dyn_ubo) ss << dyn_ubo_init_code;
@@ -1503,6 +1671,17 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    float wsum = w0 + w1 + w2;\n";
     ss << "    float inv_wsum = 1.0 / max(1e-20, wsum);\n";
     ss << "    float b0 = w0 * inv_wsum, b1 = w1 * inv_wsum, b2 = w2 * inv_wsum;\n";
+    ss << "    if (sm_fs.direct_2d == 3u && sm_fq_clipped != 0u) {\n";
+    ss << "        vec3 ob = b0 * sm_fq_u0[eff_tri] + b1 * sm_fq_u1[eff_tri] + b2 * sm_fq_u2[eff_tri];\n";
+    ss << "        b0 = ob.x; b1 = ob.y; b2 = ob.z;\n";
+    ss << "        vec3 ol = l0 * sm_fq_u0[eff_tri] + l1 * sm_fq_u1[eff_tri] + l2 * sm_fq_u2[eff_tri];\n";
+    ss << "        l0 = ol.x; l1 = ol.y; l2 = ol.z;\n";
+    ss << "    } else if (sm_fs.direct_2d == 3u) {\n";
+    ss << "        vec3 ob = b0 * sm_fq_u0[eff_tri] + b1 * sm_fq_u1[eff_tri] + b2 * sm_fq_u2[eff_tri];\n";
+    ss << "        b0 = ob.x; b1 = ob.y; b2 = ob.z;\n";
+    ss << "        vec3 ol = l0 * sm_fq_u0[eff_tri] + l1 * sm_fq_u1[eff_tri] + l2 * sm_fq_u2[eff_tri];\n";
+    ss << "        l0 = ol.x; l1 = ol.y; l2 = ol.z;\n";
+    ss << "    }\n";
     ss << "    sm_gl_FragCoord = vec4(fx, fy, pz, wsum);\n";
     ss << "    sm_gl_FragDepth = pz;\n";
     ss << "    uint vi0 = ts.idx.x * sm_fs.vert_stride_vec4;\n";

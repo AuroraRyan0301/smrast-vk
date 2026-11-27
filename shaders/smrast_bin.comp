@@ -110,6 +110,32 @@ float edge_eval(vec2 a, vec2 b, float fx, float fy) {
     }
 }
 
+vec4 make_edge(vec2 a, vec2 b) {
+    if (a.y < b.y || (a.y == b.y && a.x < b.x)) {
+        vec2 d = b - a;
+        return vec4(a.x, a.y, d.x, d.y);
+    } else {
+        vec2 d = a - b;
+        return vec4(b.x, b.y, -d.x, -d.y);
+    }
+}
+
+// Conservative CUDARaster triangle-vs-tile edge trivial-reject (skips empty diagonal tiles before atomicAdd!)
+bool tri_overlaps_tile(vec4 e0, vec4 e1, vec4 e2, uint tx, uint ty) {
+    float x0 = float(tx * 16u), x1 = x0 + 16.0;
+    float y0 = float(ty * 16u), y1 = y0 + 16.0;
+    float r0x = (e0.w < 0.0) ? x1 : x0;
+    float r0y = (e0.z > 0.0) ? y1 : y0;
+    if (e0.z * (r0y - e0.y) - e0.w * (r0x - e0.x) < 0.0) return false;
+    float r1x = (e1.w < 0.0) ? x1 : x0;
+    float r1y = (e1.z > 0.0) ? y1 : y0;
+    if (e1.z * (r1y - e1.y) - e1.w * (r1x - e1.x) < 0.0) return false;
+    float r2x = (e2.w < 0.0) ? x1 : x0;
+    float r2y = (e2.z > 0.0) ? y1 : y0;
+    if (e2.z * (r2y - e2.y) - e2.w * (r2x - e2.x) < 0.0) return false;
+    return true;
+}
+
 void mark_tile_active(uint tile_id) {
     uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
     if (tile_counts[flag_idx] == 0u) {
@@ -235,8 +261,12 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
 
     int bw = maxx - minx + 1;
     int bh = maxy - miny + 1;
+    vec4 e0 = make_edge(s1, s2);
+    vec4 e1 = make_edge(s2, s0);
+    vec4 e2 = make_edge(s0, s1);
 
-    if (bw * bh <= 64) {
+    // v0.9 CuRast Micro-Triangle Fast-Path (raised <=64 -> <=128 px with branchless precomputed canonical edges!)
+    if (bw * bh <= 128) {
         if (use_hiz) {
             bool any_pass = false;
             for (uint ty = ty0; ty <= ty1 && !any_pass; ++ty) {
@@ -257,14 +287,14 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
             float fy = float(py) + 0.5;
             for (int px = minx; px <= maxx; ++px) {
                 float fx = float(px) + 0.5;
-                float e0 = edge_eval(s1, s2, fx, fy);
-                float e1 = edge_eval(s2, s0, fx, fy);
-                float e2 = edge_eval(s0, s1, fx, fy);
-                if ((tl0 ? (e0 < 0.0) : (e0 <= 0.0)) ||
-                    (tl1 ? (e1 < 0.0) : (e1 <= 0.0)) ||
-                    (tl2 ? (e2 < 0.0) : (e2 <= 0.0))) continue;
-                float l0 = e0 * inv_area;
-                float l1 = e1 * inv_area;
+                float ev0 = e0.z * (fy - e0.y) - e0.w * (fx - e0.x);
+                if (tl0 ? (ev0 < 0.0) : (ev0 <= 0.0)) continue;
+                float ev1 = e1.z * (fy - e1.y) - e1.w * (fx - e1.x);
+                if (tl1 ? (ev1 < 0.0) : (ev1 <= 0.0)) continue;
+                float ev2 = e2.z * (fy - e2.y) - e2.w * (fx - e2.x);
+                if (tl2 ? (ev2 < 0.0) : (ev2 <= 0.0)) continue;
+                float l0 = ev0 * inv_area;
+                float l1 = ev1 * inv_area;
                 float l2 = 1.0 - l0 - l1;
                 float d = clamp(l0 * z0 + l1 * z1 + l2 * z2, 0.0, 1.0);
                 uint pidx = uint(py) * pc.width + uint(px);
@@ -306,6 +336,7 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     bool wrote_ts = (ntiles > 32u);
     for (uint ty = ty0; ty <= ty1; ++ty) {
         for (uint tx = tx0; tx <= tx1; ++tx) {
+            if (!tri_overlaps_tile(e0, e1, e2, tx, ty)) continue;
             uint tile_id = ty * pc.tiles_x + tx;
             if (use_hiz && !hiz_tile_pass(tri_min_z, tri_max_z, tile_hiz[tile_id], dop)) continue;
             if (!wrote_ts) { tris[tid] = ts; wrote_ts = true; }
@@ -527,12 +558,17 @@ void main() {
                 uint btid = s_big_tid[b];
                 uvec4 bb  = s_big_bb[b];
                 vec2 bz   = s_big_z[b];
+                TriSetup bts = tris[btid];
+                vec4 be0 = make_edge(bts.v1.xy, bts.v2.xy);
+                vec4 be1 = make_edge(bts.v2.xy, bts.v0.xy);
+                vec4 be2 = make_edge(bts.v0.xy, bts.v1.xy);
                 uint bw   = bb.z - bb.x + 1u;
                 uint bh   = bb.w - bb.y + 1u;
                 uint tot  = bw * bh;
                 for (uint idx = gl_LocalInvocationIndex; idx < tot; idx += 64u) {
                     uint tx = bb.x + (idx % bw);
                     uint ty = bb.y + (idx / bw);
+                    if (!tri_overlaps_tile(be0, be1, be2, tx, ty)) continue;
                     uint tile_id = ty * pc.tiles_x + tx;
                     if (use_hiz && !hiz_tile_pass(bz.x, bz.y, tile_hiz[tile_id], dop)) continue;
                     uint slot = atomicAdd(tile_counts[tile_id], 1u);

@@ -2,7 +2,7 @@
 
 > **Living technical memory** for **SmRast-VK** — a pure-Compute **Vulkan 1.3 (+ emulated Vulkan 1.4)** Software Rasterizer Wrapper ICD (`libvulkan_smrast.so`) designed for compute-only datacenter GPUs (**NVIDIA H20 / H100**, **AMD MI300X**).
 >
-> *Last updated: `v0.8.0`.*
+> *Last updated: `v0.9.0`.*
 
 ---
 
@@ -15,7 +15,7 @@ However, a compute-only H20 retains massive graphics-capable silicon on its pure
 - **96 GB HBM3** (~4 TB/s bandwidth)
 - **Hardware 64-bit buffer atomics** (`VK_KHR_shader_atomic_int64`)
 - **1-cycle Subgroup Quad Shuffles** (`VK_KHR_shader_subgroup_quad`)
-- **Functional Hardware Texture Mapping Units (TMUs)** supporting `textureGrad()` anisotropic / mipmapped sampling inside Compute Shaders — including native `VK_IMAGE_TILING_LINEAR | VK_IMAGE_CREATE_ALIAS_BIT` sampling across all 14 standard color formats (`offset=0`, 32B-aligned `rowPitch`).
+- **Functional Hardware Texture Mapping Units (TMUs)** supporting `textureGrad()` anisotropic / mipmapped sampling inside Compute Shaders — including native `VK_IMAGE_TILING_LINEAR | VK_IMAGE_CREATE_ALIAS_BIT` sampling across all 14 standard single-mip color formats (`offset=0`, 32B-aligned `rowPitch`). *(Hardware probe confirms NVIDIA H20 returns `linMipMax=1` for color and `linMipMax=0` for `D32F`/`D32S8`.)*
 
 **SmRast-VK's Hybrid Principle**:
 1. **Pass through everything silicon already does natively**: Compute Shaders (`vkCmdDispatch`), HBM3 allocations, DMA transfers (`vkCmdFillBuffer` / `vkCmdCopyBuffer`), hardware TMU sampling (zero-copy over linear-aliased G-Buffers), Timeline Semaphores, and Sync2 events run natively on `qf[2]`.
@@ -23,93 +23,74 @@ However, a compute-only H20 retains massive graphics-capable silicon on its pure
 
 ---
 
-## 2. Architecture & Reference Lineage (`v0.8.0`)
+## 2. Architecture & Reference Lineage (`v0.9.0`)
 
 SmRast-VK fuses four classic GPU software rasterization architectures with a production Vulkan 1.3/1.4 ICD, live SPIR-V lowering compiler, zero-copy linear-aliased G-Buffers, and cross-material GPU multi-draw uber-batching:
 
-| Classic Reference | Technique Adapted | SmRast-VK v0.8 Implementation |
+| Classic Reference | Technique Adapted | SmRast-VK v0.9 Implementation |
 |---|---|---|
-| **CUDARaster** (Laine & Karras, NVIDIA Research) | Homogeneous guard-band clipping, coarse `16×16` tile binning, watertight Top-Left fill rule | `shaders/smrast_bin.comp` + `v0.8` **7-Plane Homogeneous Guard-Band Clipping** (`w>=1e-4`, `z>=0`, `w-z>=0`, `±4w` XY) + **`VK_EXT_depth_clip_enable`**, **64-Way Warp-Cooperative Big-Tri Binning**, **Zero-Atomic Coop Small-Tri Binner**, **Pre-Binning Coarse Hi-Z** (`shaders/smrast_hiz_update.comp`), & **GPU Active-Tile Compaction** |
-| **CuRast / compute_rasterizer** (Schütz / UE5 Nanite) | Lock-free 64-bit `atomicMin(depth << 32 \| tri_id)` direct visibility-buffer fast-path for micro-triangles (`bbox ≤ 64 px`) | `shaders/smrast_bin.comp` micro-triangle fast-path with deterministic **Vulkan Painter's Order** `(uint64_t(~tid) << 32) \| tid`, driving **`556–934 FPS`** on 1M-tri 1080p PBR, with `discard;`-safe self-clearing `VisBuf` |
-| **cuRE & RetroWarp** (Kenzel / Themaister) | 100% pure Vulkan Compute graphics pipeline (zero ROPs), `16×16` shared-memory Tile Fine rasterizer, subgroup quad derivatives | `shaders/smrast_fine.comp` (2-level Tile Hi-Z + Painter's Order + self-clearing `tile_counts`) + `src/spirv_lower.cpp` (**Fused Quad FS** with Painter's order, **Per-Draw Push-Constant / Dynamic-UBO SSBO Unpacking**, `flat`/`noperspective` varyings, branchless `subgroupQuadSwap` `dFdx`/`dFdy`, native TMU `textureGrad` over linear-aliased G-Buffers) |
-| **Original ICD, Uber-Batcher & Compiler Layer** | Drop-in Khronos ICD + in-process SPIR-V → Compute compiler + Cross-Material Direct/Indirect Uber-Batching + Zero-Copy Linear-Aliased G-Buffers + Double-Buffered MIT-SHM WSI | `src/smrast_icd.cpp`, `src/spirv_lower.cpp`, `src/smrast_raster_engine.cpp`, `src/smrast_wsi.cpp` |
+| **CUDARaster** (Laine & Karras, NVIDIA Research) | Homogeneous guard-band clipping, exact triangle-vs-tile edge trivial-reject, coarse `16×16` tile binning, watertight Top-Left fill rule | `shaders/smrast_bin.comp` + `v0.9` **7-Plane Homogeneous Guard-Band Clipping** (`w>=1e-4`, `z>=0`, `w-z>=0`, `±4w` XY) + **`VK_EXT_depth_clip_enable`**, **Exact 3-Edge Tile Trivial-Reject**, **64-Way Warp-Cooperative Big-Tri Binning**, **Pre-Binning Coarse Hi-Z**, & **GPU Active-Tile Compaction** |
+| **CuRast / compute_rasterizer** (Schütz / UE5 Nanite) | Lock-free 64-bit `atomicMin(depth << 32 \| tri_id)` direct visibility-buffer fast-path for micro-triangles | `shaders/smrast_bin.comp` **`≤128 px` Branchless Precomputed-Edge Micro-Tri Fast-Path** with deterministic **Vulkan Painter's Order** `(uint64_t(~tid) << 32) \| tid`, driving **`1,299.0 FPS` / `1.293 Gtris/s`** on 1M-tri 1080p PBR, with `discard;`-safe self-clearing `VisBuf` |
+| **cuRE & RetroWarp** (Kenzel / Themaister) | 100% pure Vulkan Compute graphics pipeline (zero ROPs), `16×16` shared-memory Tile Fine rasterizer, subgroup quad derivatives | `shaders/smrast_fine.comp` (**Loader-Time Hi-Z Compaction + Precomputed Branchless Canonical Edges + Warp-Uniform Y-Band Skip + Intra-Tile Early-Z + Inter-Batch Live Hi-Z Tightening**) + `src/spirv_lower.cpp` (**Zero-Bin Inline-Setup Fused Quad FS** with inline 7-plane clip + barycentric remap, **Dynamic Compact `vert_stride_vec4`**, Per-Draw Push-Constant / Dynamic-UBO SSBO unpacking, `flat`/`noperspective`, branchless `subgroupQuadSwap` `dFdx`/`dFdy`) |
+| **Original ICD, Uber-Batcher & Compiler Layer** | Drop-in Khronos ICD + in-process SPIR-V → Compute compiler + Cross-Material Uber-Batching + Zero-Copy Linear-Aliased G-Buffers + AVX2 Overlapped MIT-SHM WSI | `src/smrast_icd.cpp`, `src/spirv_lower.cpp`, `src/smrast_raster_engine.cpp`, `src/smrast_wsi.cpp` |
 
-### 2.1 End-to-End Cross-Material Multi-Draw Uber-Batched Compute Pipeline (`v0.8.0`)
+### 2.1 End-to-End Cross-Material Multi-Draw Compute Pipeline (`v0.9.0`)
 
 ```
 RenderPass Begin (LOAD_OP_CLEAR / LOAD_OP_LOAD / LOAD_OP_DONT_CARE)
-  ├─ LOAD_OP_CLEAR / DONT_CARE immediately cancels stale attach_pending_sync (0 wasted copies!)
+  ├─ LOAD_OP_CLEAR / DONT_CARE immediately cancels stale attach_pending_sync
   └─ [0] Hardware DMA Fast-Clear (vkCmdFillBuffer)  [fallback: smrast_clear.comp w/ rt_stride_px]
-         • Uniform 4B/8B/16B color, D32 depth + Hi-Z, and packed stencil cleared via DMA
-           (0 descriptor updates, 0 compute shader launch; 15 clears = 0.13 ms total)
+         • Empty-clear tracking (real_uniform_cleared) skips repeated 0-draw shadow/RT SyncA2I!
          • VisBuf & tile_counts remain invariant-clean via self-clearing (skips ~75% of RP clears)
 
 Cross-Material Multi-Draw Uber-Batcher (src/smrast_icd.cpp):
   • Direct Batch:   coalesces up to 256 consecutive draws — INCLUDING draws with differing
-                    FS Push Constants or Dynamic UBO offsets! Each sub-draw writes its 128B
-                    push block into batch_push_buf[base+draw_id] and dynamic UBO offset into
-                    batch_dyn_off_buf[base+draw_id], packing draw_id (0..255) into TriSetup.idx.w[16..23].
-  • Indirect Batch: coalesces up to 128 consecutive vkCmdDraw[Indexed]Indirect[Count] draws
-                    inside 32 KB ind_disp_buf using GPU atomic vert/tri slice allocators.
-  • Fused Quad FS:  for <=2-tri draws without depth test/write, skips Fine & VisBuf completely
-                    while preserving exact Painter's Order via TriSetup.idx.w[24..30]!
+                    FS Push Constants, Dynamic UBO offsets, or no-op identity blends (ONE/ZERO/ADD)!
+  • Indirect Batch: coalesces up to 128 consecutive vkCmdDraw[Indexed]Indirect[Count] draws.
+  • Zero-Bin Inline Fused Quad FS (direct_2d == 3u): for <=2-tri draws without depth test/write,
+                    COMPLETELY SKIPS smrast_bin.comp, smrast_fine.comp, VisBuf, and 2 GPU barriers!
 
-Per Flushed Batch (1..256 Direct OR 1..128 Indirect Draws):
-  ├─ [0b] smrast_indirect_prep.comp  (indirect batch only, cached via ind_prep_ds_cache)
-  │       Allocates contiguous ClipVertBuf / TriVerts slices on-GPU via atomicAdd(disp_cmds[12..13])
-  │       and populates per-draw VS & Bin VkDispatchIndirectCommand structs.
+Per Flushed Batch / Single Draw:
+  ├─ [0b] Zero-DMA smrast_indirect_prep.comp  (indirect draws only)
+  │       Single indirect draws zero clip-tail & active-tile headers directly on-GPU (0 DMA updates!).
   ├─ [1] K Barrier-Free Parallel Lowered Compute Vertex Shaders  (src/spirv_lower.cpp)
-  │       • Up to 8 Vertex Buffers + VK_EXT_vertex_attribute_divisor (0 / >1)
-  │       • Full vertex format unpackers (incl. unaligned R16_* load_u(0), USCALED/SSCALED/A2R10G10B10)
-  │       • UINT8 / UINT16 / UINT32 indices + exact 0x7FC0DEAD NaN Primitive Restart sentinel
-  │       • Writes Clip-Space position + varyings into 4.0M-vert HBM3 ClipVertBuf
-  ├─ [2] K Parallel smrast_bin.comp Dispatches  (OR smrast_prim_bin.comp for Lines/Points)
-  │       • Discards 0x7FC0DEAD restart sentinels & NaN/Inf vertices before clipping
-  │       • 7-Plane CUDARaster Homogeneous Guard-Band Clipping:
-  │           w >= 1e-4, z >= 0 (if depth_clip), w - z >= 0 (if depth_clip),
-  │           and ±4w XY guard-band (eliminates 4-bit fixed-point integer overflow!)
+  │       • Dynamic compact vert_stride_vec4 (2..16 vec4 reflected per pipeline -> 3x-5x less HBM3!)
+  │       • Up to 8 VBs + VK_EXT_vertex_attribute_divisor + unaligned R16_* + 0x7FC0DEAD restart
+  ├─ [2] K Parallel smrast_bin.comp Dispatches  (SKIPPED on Zero-Bin Inline Fused Quad FS!)
+  │       • 7-Plane CUDARaster Homogeneous Guard-Band Clipping (±4w XY + w>=1e-4 + z∈[0,w])
   │       • VK_EXT_depth_clip_enable decoupled from depthClampEnable + Hardware Depth Bias
-  │       • Pre-Binning Persistent Coarse Hi-Z early-reject per 16×16 tile (Standard-Z & Reverse-Z)
   │       • 3-Tier Work Distribution:
-  │           1) Micro-tris (bbox <= 64 px): direct 64-bit atomicMin into VisBuf (CuRast)
-  │              using Painter's Order (uint64_t(~tid)<<32 | tid) when depth test disabled
-  │           2) Normal tris (<= 32 tiles): per-thread 16×16 tile_bins[] append
-  │           3) Giant tris (> 32 tiles): 64-Way Warp-Cooperative shared-memory binning
-  │              (s_big_tid/bb/z[64] -> all 64 threads cooperate row-major, 64× speedup!)
-  │       • Packs draw_id into TriSetup.idx.w[16..23] and fused_quad order into bits [24..30]
-  ├─ [3] 1× smrast_fine.comp  (SKIPPED completely in Fused Quad FS mode!)
-  │       • 1 workgroup = 1 active 16×16 tile (256 threads), Indirect OR Coherent-2D grid
-  │       • 1-read Persistent Tile Hi-Z + Watertight Top-Left Fill-Rule & 4-bit snapping
+  │           1) Micro-tris (bbox <= 128 px): branchless precomputed-edge CuRast 64-bit atomicMin
+  │           2) Normal tris (<= 32 tiles): exact 3-edge tile trivial-reject + Hi-Z -> tile_bins[]
+  │           3) Giant tris (> 32 tiles): 64-Way Warp-Cooperative binning w/ exact tile trivial-reject
+  ├─ [3] 1× smrast_fine.comp  (SKIPPED on Fused Quad FS!)
+  │       • Loader threads compact Hi-Z-passing tris & precompute branchless canonical edges ONCE
+  │       • Warp-Uniform Y-Band Early-Out (subgroupMin/Max(fy), portable Warp32/Wave64)
+  │       • Intra-Tile Early-Z (best_d) + Inter-Batch Live Hi-Z Tightening across 64-tri batches!
   │       • Deterministic Painter's Order tie-breaking; self-clears tile_counts/active
   ├─ [4] 1× Lowered Quad-Swizzled Compute FS  OR  smrast_depth_only.comp
-  │       • Fused Quad FS (direct_2d == 2u): uniform tile AABB early-out + max-order Painter's
-  │         Order inline edge testing directly from ClipVertBuf — zero Fine pass, zero VisBuf R/W!
-  │       • Cross-Material SSBO Unpacking: extracts sm_draw_id = (ts.idx.w >> 16) & 0xFF and reads
-  │         per-draw push constants (binding 15) and dynamic UBO fields (bindings 16/17)!
-  │       • flat (provoking-vertex) & noperspective (linear screen-space) varying interpolation
-  │       • Spec-exact gl_FragCoord.w = 1 / w_clip, exact gl_FrontFacing, subgroupQuadSwap dFdx/dFdy
-  │       • Native hardware TMU textureGrad() directly on Zero-Copy Linear-Aliased G-Buffers!
-  │       • 8 MRTs × 21 RT formats w/ per-RT rt_stride_px[8] linear-alias addressing + 8-bit Stencil
-  └─ [5] 1× smrast_hiz_update.comp  (depth-writing batches only)
-          Incrementally refreshes persistent 16×16 Coarse Hi-Z (tile_zmin, tile_zmax).
+  │       • Zero-Bin Inline Fused Quad FS (direct_2d == 3u): 1-2 threads run 7-plane clip + setup
+  │         into shared sm_fq_tris[16] + barycentric remap u0/u1/u2 (0 Bin dispatch, 0 TriSetupBuf!)
+  │       • Cross-Material SSBO Unpacking (bindings 15/16/17 indexed by batch_push_base + sm_draw_id)
+  │       • flat & noperspective varyings, spec-exact gl_FragCoord.w = 1/w_clip, hardware TMUs
+  │       • 8 MRTs × 21 RT formats w/ per-RT rt_stride_px[8] + 8-bit Stencil + unified end barrier
+  └─ [5] 1× smrast_hiz_update.comp  (depth-writing draws only)
 
-Zero-Copy Linear-Aliased Sync & Double-Buffered MIT-SHM Present:
-  ├─ Eligible 2D 1-mip 1-layer color RTs (14 H20 formats): real_img (LINEAR | ALIAS_BIT) and
-  │  attach_buf share the EXACT same VkDeviceMemory + offset -> ZERO SyncA2I / SyncI2A copies!
-  ├─ Non-aliased images (mipmapped bloom/depth): exact ds_bound_imgs / ever_bound_in_ds lazy flush
-  ├─ [6] smrast_blit.comp — pure-compute scaled & bilinear vkCmdBlitImage (rt_stride_px aware)
-  └─ src/smrast_wsi.cpp — 2-slot Async DMA Ring (present_cmds[2]/fences[2]) + HOST_CACHED
-                          + 32-bit R<->B swizzle + Double-Buffered XCB/Xlib MIT-SHM Ping-Pong!
+Zero-Copy Linear-Aliased Sync & AVX2 Overlapped MIT-SHM Present:
+  ├─ 14 single-mip color formats alias real_img & attach_buf memory -> ZERO SyncA2I / SyncI2A!
+  ├─ Empty-clear SyncA2I skip eliminates repeated 0-draw 2048x2048 shadow map transfers
+  └─ src/smrast_wsi.cpp — Fused wait-semaphore DMA Submit + HOST_CACHED + runtime AVX2
+                          _mm256_shuffle_epi8 R<->B swizzle overlapped with Xvfb XShmPutImage!
 ```
 
 ### 2.2 Key Internal Memory & Slot Capacities (`include/smrast_internal.h`)
 
-| Resource | Capacity (`v0.8.0`) | Purpose |
+| Resource | Capacity (`v0.9.0`) | Purpose |
 |---|---:|---|
 | Draw parameter UBO/SSBO ring | **49,152 slots** | Supports full 3A open-world frames (`~14.6K` draws / `~215` render passes without wrap) |
-| Direct / Indirect Uber-Batch width | **256 direct / 128 indirect** | Collapses consecutive draws (even across differing FS Push Constants / Dynamic UBOs!) |
+| Direct / Indirect Uber-Batch width | **256 direct / 128 indirect** | Collapses consecutive draws across differing FS Push Constants / Dynamic UBOs / no-op blends |
 | Per-Draw Metadata SSBO Rings | **65,536 × 128B Push (`8 MB`) + 65,536 × 4B DynOff (`256 KB`)** | Host-coherent per-draw FS Push-Constant & Dynamic-UBO offset rings indexed by `batch_push_base + sm_draw_id` |
-| `ClipVertBuf` / `TriVerts` (HBM3) | **4.0M verts / 1.8M tris** | Headroom for uber-batched mega-meshes + 900K-vert / 390K-tri 7-plane clip tail |
+| `ClipVertBuf` / `TriVerts` (HBM3) | **4.0M verts / 1.8M tris** (dynamic `2..16` vec4 stride!) | Up to `8×` higher L2 efficiency via reflected per-pipeline `vert_stride_vec4` |
 | Indirect dispatch buffer (`ind_disp_buf`) | **32 KB / slot (`16,384` slots)** | Holds up to 128 indirect sub-draw headers + GPU atomic slice allocators |
 | Clear / Blit slots | **4,096 slots** | High-pass-count deferred/bloom/shadow cascades |
 | `tile_hiz` (per Depth Image) | **64 KB @ 1080p** | `120 × 68` tiles × 8 bytes (`(zmin, zmax)`), L2-resident |
@@ -119,7 +100,7 @@ Zero-Copy Linear-Aliased Sync & Double-Buffered MIT-SHM Present:
 
 ## 3. Why DX11 (`DXVK`) and DX12 (`vkd3d-proton`) Behave Differently on a Unified Vulkan ICD
 
-SmRast-VK implements **one single Vulkan ICD** — there are no separate DX11 or DX12 rasterizers. The stark difference in bring-up difficulty comes from the **Vulkan API surface and SPIR-V complexity** emitted by the two Windows translation layers:
+SmRast-VK implements **one single Vulkan ICD** — there are no separate DX11 or DX12 rasterizers. The difference in bring-up difficulty comes from the **Vulkan API surface and SPIR-V complexity** emitted by the two Windows translation layers:
 
 | Dimension | DX11 (`DXVK`) | DX12 (`vkd3d-proton`) | Engineering Impact on SmRast-VK |
 |---|---|---|---|
@@ -130,66 +111,34 @@ SmRast-VK implements **one single Vulkan ICD** — there are no separate DX11 or
 
 ---
 
-## 4. `v0.7.0 → v0.8.0` GPU Profiling & Visual Bug Case Study: `3.7 FPS → 59 FPS → 81.3 FPS` (Zero Flicker)
+## 4. `v0.6.0 → v0.9.0` GPU Profiling Case Study: `3.7 FPS → 108.6 FPS` & `1.293 Gtris/s`
 
-Starting from `v0.6.0` (`3.71 FPS`), our systematic GPU timestamp profiling (`SmXrayGpuScope` inside `SMRAST_XRAY=1`) and frame-by-frame visual root-cause analysis drove both **22× real-game performance gains** and **zero-artifact rendering**:
+Every single performance leap from `3.71 FPS` (`v0.6.0`) → `58.8–70.1 FPS` (`v0.7.0`) → `76.0–81.3 FPS` (`v0.8.0`) → **`85.5–108.6 FPS` (`v0.9.0`)** was guided by live `vkCmdWriteTimestamp` (`SmXrayGpuScope`) profiling:
 
-| Stage / Defect Diagnosed on Live 1M-Tri 3D Scene (`1280×720`) | Before (`v0.6.0` / `v0.7.0`) | Fix Implemented (`v0.7.0` / `v0.8.0`) | After (`v0.8.0`) |
+| Stage / Bottleneck Diagnosed on Live 1M-Tri 3D Scene | Before | Fix Implemented | After (`v0.9.0`) |
 |---|---|---|---|
-| **Giant White Blocks & Screen-Wide Flickering** (`v0.7.0` visual defects) | `diff_max = 4.9`, severe white trapezoids / needles | **7-Plane CUDARaster Guard-Band Clipping (`±4w`)** + **`VK_EXT_depth_clip_enable`** + **Painter's Order** (Fine + Fused Quad) + `flat`/`noperspective` varyings | **`diff_max = 1.00–2.02` (`0` spikes > 3.0), ZERO white blocks** |
-| **1,000-Draw Per-Draw Push-Constant / Dyn-UBO Draws** | `42.53 ms` (`23.5 FPS`, unbatchable in `v0.7.0`) | **Per-Draw Push-Constant & Dynamic-UBO Metadata SSBO Uber-Batching** (`draw_id` in `TriSetup.idx.w[16..23]`, SPIRV-Cross SSBO unpacker) | **`2.54–2.92 ms` (`342–394 FPS`, `14.6×` speedup!)** |
-| **52/83 Redundant `SyncA2I` G-Buffer Copies/Frame** | `WSI gpu = 14.0 ms`, `SyncA2I = 83/f` (`v0.7.0`) | **Zero-Copy Linear-Aliased Color G-Buffers** (`VK_IMAGE_TILING_LINEAR \| ALIAS_BIT`, 14 H20 formats, `rt_stride_px[8]`) + exact `ds_bound_imgs` lazy sync | **`WSI gpu = 9.1–10.0 ms`, `SyncA2I = 27–31/f` (`52` copies/f skipped!)** |
-| **WSI X11 Readback & Xvfb Blit Stall** | `76–99 ms` (`v0.6`) → `2.4 ms` (`v0.7`) | **Double-Buffered MIT-SHM Ping-Pong Ring** (`shm_ptrs[2]`, `xlib_shm_imgs[2]`) + 2-slot Async DMA Ring + `HOST_CACHED` + 32-bit swizzle | **`0.3–0.8 ms`** (`WSI x11`) |
-| **Single-Thread Giant-Triangle Binning** (`3,555` tiles) | `7.7 ms` (`v0.6`) | **64-Way Warp-Cooperative Big-Tri Binning** (`s_big_*[64]`) | **`< 0.3 ms`** |
-| **48 Post-Process / UI Quads + 15 RP Clears** | `~30 ms` (`v0.6`) | **Fused Quad FS** (Painter's order) + **DMA `vkCmdFillBuffer`** | **`2.05 ms` combined** |
-| **End-to-End Live Commercial 3D 1M-Tri Scene** (shared H20) | `269.5 ms` (`3.71 FPS`, `v0.6`) / `17.0 ms` (`58.8 FPS`, `v0.7`) | All `v0.8.0` visual + zero-copy + SHM optimizations combined | **`12.3–13.1 ms` (`76.0–81.3 FPS`, `677×` vs CPU Lavapipe)** |
+| **Hot Horizon Tile Serialization in `smrast_fine.comp`** (1M-tri instanced buildings) | `1.31–3.61 ms` (`v0.8.0`, #1 GPU bottleneck!) | **Loader-Time Hi-Z Compaction + Precomputed Branchless Canonical Edges + Warp-Uniform Y-Skip + Intra-Tile Early-Z + Inter-Batch Live Hi-Z + `128 px` CuRast + Exact Tile-Edge Trivial-Reject** | **`512`-layer overdraw = `1.014 ms`; 1M PBR = `0.77 ms` (`1,299 FPS`)** |
+| **`ClipVertBuf` Fixed 256B/Vert Stride (`770 MB`/draw!)** | `VS = 0.77 ms` (`v0.8.0`) | **Dynamic Per-Pipeline `vert_stride_vec4` (`2..16` vec4)** | **`3×–5×` less HBM3 traffic** across VS, Bin & FS |
+| **48 Post-Process / Mipmap Quads (`3` dispatches + `3` barriers each)** | `~18 ms` (`v0.6`) → `2.02 ms` (`v0.8`) | **Zero-Bin Inline-Setup `Fused Quad FS` (`direct_2d == 3u`)** + unified end barrier | **48 Bin dispatches + 48+ barriers eliminated!** |
+| **36 Menu Indirect Draws (`2` DMA updates + `7` barriers each)** | `4.36 ms` (`v0.8.0`) | **Zero-DMA `smrast_indirect_prep.comp` + unified end barrier** | **Menu jumped `67–71 FPS → 76–80 FPS` (+16%)** |
+| **52/83 Redundant `SyncA2I` Copies + Empty-Clear Shadow Maps** | `SyncA2I = 83/f` (`v0.7`) → `31/f` (`v0.8`) | **Linear-Aliased Color G-Buffers (`14` formats) + `real_uniform_cleared` Empty-Clear Skip** | **`SyncA2I = 23–28/f` (`54–55` skipped/frame!)** |
+| **1,000-Draw Per-Draw Push-Constant / Dynamic-UBO Draws** | `42.53 ms` (`v0.7.0`) | **Per-Draw Push-Constant & Dynamic-UBO Metadata SSBO Uber-Batching** | **`2.35–2.75 ms` (`364–426 FPS`, `15.5×` speedup)** |
+| **WSI Readback, Swizzle & X11 Present** | `76–99 ms` (`v0.6`) → `2.4 ms` (`v0.7`) | **Fused Wait-Sem DMA Ring + Runtime AVX2 `_mm256_shuffle_epi8` + Overlapped Ping-Pong MIT-SHM** | **`0.5–1.3 ms`**, Intro **`324.7 FPS`** |
+| **Giant White Blocks & Screen-Wide Flickering** | `diff_max = 4.9` (`v0.7.0`) | **7-Plane CUDARaster Guard-Band Clipping (`±4w`) + `VK_EXT_depth_clip_enable` + Painter's Order** | **`diff_max = 0.40–1.45` (`0` spikes > 3.0), ZERO white blocks** |
+| **End-to-End Live Commercial 3D 1M-Tri Scene** (shared H20) | **`3.71 FPS`** (`v0.6.0`) | All `v0.7–v0.9` optimizations combined | **`85.5–108.6 FPS` (`9.2–11.7 ms`, up to `905×` vs CPU Lavapipe)** |
 
 ---
 
-## 5. Hard-Won Engineering Lessons & Pitfall Log (`v0.1 → v0.8.0`)
+## 5. Hard-Won Engineering Lessons & Pitfall Log (`v0.1 → v0.9.0`)
 
-Record of every major bug, silicon/driver quirk, and architectural bottleneck encountered so future iterations never re-learn these the hard way:
-
-### 5.1 Driver & Silicon Quirks (NVIDIA Hopper / Driver `535.x`)
-1. **Compute UBO Constant-Bank Aliasing at `DescriptorSet >= 5`**:
-   - *Fix*: Permanently use `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC` (`std430 readonly buffer`) for all internal SmRast parameter blocks (`SmVsParams` / `SmFsParams`). Never use `UNIFORM_BUFFER` on high set indices.
-2. **H20 Graphics Queue DMA Hang (`Xid 69 / 109`)**:
-   - *Fix*: Strictly bind all internal and pass-through submissions to pure Compute `qf[2]` (`VK_QUEUE_COMPUTE_BIT`), while advertising virtual `qf[0]` (`GRAPHICS | COMPUTE | TRANSFER`).
-3. **H20 `VK_IMAGE_TILING_LINEAR` + `VK_IMAGE_CREATE_ALIAS_BIT` Native Capabilities (`v0.8.0`)**:
-   - *Discovery*: All 14 standard color formats (`RGBA8`/`BGRA8` UNORM & SRGB, `RGBA16F`, `B10G11R11F`, `R32F`, `R16F`, `R8`, `RG8`, `RG16F`, `RG32F`, `RGBA32F`, `A2B10G10R10`) natively support `LINEAR` + `SAMPLED_IMAGE` + `FILTER_LINEAR` + `MUTABLE_FORMAT` + `ALIAS_BIT` with `subresourceLayout.offset == 0`, 32B-aligned `rowPitch`, and `imr.memoryTypeBits & bmr.memoryTypeBits == 0x1f` on H20 — allowing `attach_buf` and `real_img` to alias the exact same `VkDeviceMemory` with zero copies!
-   - *Caution*: Always compute `row_stride_px = rowPitch / bpp` (NOT `width`, which fails for odd/non-aligned render target widths like `1257×707`!) and propagate `rt_stride_px[8]` into FS, Clear, Blit, Copy, and MSAA resolve.
-4. **Background Thread Teardown `SIGSEGV` in `libnvidia-eglcore.so.535`**:
-   - *Fix*: Always perform explicit `vkDeviceWaitIdle` → `vkDestroyDevice` → `vkDestroyInstance` teardown in test binaries and WSI shutdown paths.
-5. **Portable Backend ICD Probing**:
-   - *Fix*: Probe `SMRAST_BACKEND_ICD` first, then standard `ld.so` names (`libGLX_nvidia.so.0`, system paths, `libvulkan_radeon.so`). Never hardcode container paths.
-
-### 5.2 Correctness & Spec Traps
-6. **Giant White-Block Polygons & Grazing Near-Plane Fixed-Point Overflow (`v0.8.0`)**:
-   - *Trap*: 2-plane clipping (`z >= 0` & `w - z >= 0`) alone allowed triangles with tiny `w` (`1e-7`) or off-screen vertices (`|x/w| > 10^5`) to overflow 4-bit subpixel `int32` fixed-point coordinates in `smrast_fine.comp`, inverting edge function signs and painting massive white/grey screen-spanning trapezoids! Additionally, failing to parse `VkPipelineRasterizationDepthClipStateCreateInfoEXT` (`VK_EXT_depth_clip_enable`) falsely clipped shadow/skybox passes that disable depth clip independently of `depthClampEnable`.
-   - *Fix*: Implement full **7-Plane CUDARaster Homogeneous Guard-Band Clipping** (`w >= 1e-4`, `z >= 0`, `w - z >= 0`, `±4w` XY guard-band) and independently parse `pipe->depth_clip` (`rflags |= 2048u` from `!pipe->depth_clip`).
-7. **Non-Deterministic Tie-Breaking / Painter's Order Flickering (`v0.8.0`)**:
-   - *Trap*: For depth-test-disabled or equal-depth overlapping UI/decal triangles, `atomicMin` on `(0 << 32) | tid` picked the *smallest* `tid` (first-drawn wins instead of last-drawn wins), and `fused_quad` broke on the first matching triangle (`k=0`), causing flickering and inverted UI layering.
-   - *Fix*: Pack `(uint64_t(~tid) << 32) | uint64_t(tid)` so `atomicMin` deterministically selects the **largest `tid` (last-drawn)** in `smrast_bin.comp`/`smrast_fine.comp`, and pack `(tid & 0x7Fu) << 24u` into `TriSetup.idx.w` for max-order tie-breaking in `fused_quad`.
-8. **`flat` / `noperspective` Varyings & Unaligned `R16_*` Vertex Loads (`v0.8.0`)**:
-   - *Trap*: Perspective-correct interpolation corrupted `flat` float IDs/attributes and `noperspective` screen-space gradients; `R16_*` vertex formats with 2-byte offset alignment dropped the lower half-word when using word-aligned loads.
-   - *Fix*: Reflect `spvc_compiler_has_decoration(..., SpvDecorationFlat / NoPerspective)` in `spirv_lower.cpp` and emit exact unaligned `load_u(0)` shifts for `R16_*`.
-9. **Iterator Invalidation in `sm_CmdPipelineBarrier2` (`v0.8.0`)**:
-   - *Trap*: Iterating `scb->pending_sync_imgs` while calling `sm_flush_pending_syncs` erased elements from the same vector during iteration.
-   - *Fix*: Copy `pending_sync_imgs` into a local vector before selective flushing.
-10. **`gl_FragCoord.w` Spec Inversion (`v0.7.0`)**:
-    - *Fix*: Set `sm_gl_FragCoord = vec4(fx, fy, pz, wsum)` matching Vulkan spec §15.4 (`1 / w_c`).
-11. **Uber-Batching Correctness Hazards (`v0.7.0 / v0.8.0`)**:
-    - *Fix*: Reflect `fs_uses_push_constants`, `fs_batched_push_ok`, `fs_batched_dyn_ubo_ok`, and `fs_has_discard_or_depth` in `spirv_lower.cpp`; flush open draw batches in `sm_CmdClearAttachments`; guard `is_single_small = (!B.is_indirect && K == 1u && B.draws[0].total_tris <= 8u)`.
-12. **Discard/Demote Immunity, sRGB Blend Decode, Read-Only Stencil Sync & Ring Sizing (`v0.5–v0.7`)**:
-    - Self-clear `sm_vis_px[pidx]` before user FS code; decode `sm_srgb_to_lin()` before blending; clamp half-floats via `sm_safe_f16()`; maintain companion `R32_UINT` stencil SRV image + `stn_can_write` tracking; preserve `49,152` draw slots and invalidate DS caches on `vkDestroyBuffer`/`vkDestroyImage`.
-
-### 5.3 Performance Optimization Lessons (`v0.5 → v0.8`)
-13. **Always Profile GPU Timestamps Before Optimizing**:
-    - `SmXrayGpuScope` (`vkCmdWriteTimestamp`) pinpointed giant-triangle serialization (`6.33 ms`) in `v0.7.0`, and `[SmRast-PROF]` pinpointed `83` `SyncA2I` copies/frame (`~4.5 ms`) and `2.4 ms` X11 single-SHM wait in `v0.8.0`.
-14. **Eliminate Data Movement Before Micro-Tuning Shaders**:
-    - Zero-copy linear-aliased color G-Buffers removed 52 GPU-to-GPU image copies/frame (`WSI gpu`: `14.0 ms → 9.1 ms`, `+37%` live FPS), and Per-Draw Metadata SSBOs collapsed 1,000 cross-material barriers into 4 batches (`42.53 ms → 2.92 ms`, `14.6×` speedup).
-15. **Double-Buffer Host Presentation to Eliminate X11 Bubbles**:
-    - Combining a 2-slot async GPU→Host DMA ring (`present_cmds[2]`/`present_fences[2]`) with a 2-slot MIT-SHM ping-pong ring (`shm_ptrs[2]`) shrank `WSI x11` from `76–99 ms` (`v0.6`) → `2.4 ms` (`v0.7`) → **`0.3–0.8 ms`** (`v0.8`).
+1. **Compute UBO Constant-Bank Aliasing at `DescriptorSet >= 5`**: Permanently use `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC` for internal parameter blocks.
+2. **H20 Graphics Queue DMA Hang (`Xid 69 / 109`)**: Strictly route all work to pure Compute `qf[2]` while exposing virtual `qf[0]`.
+3. **H20 `VK_IMAGE_TILING_LINEAR` Capabilities (`v0.8 / v0.9`)**: Single-mip 2D color attachments (`14` formats) natively support `LINEAR | ALIAS_BIT | MUTABLE_FORMAT` (`offset=0`, 32B-aligned `rowPitch`), whereas mipmapped images (`linMipMax=1`) and depth formats (`linMipMax=0`) require `OPTIMAL` tiling. Always propagate per-RT `rt_stride_px[8] = rowPitch / bpp`.
+4. **Always Probe Silicon & Profile Timestamps Before Optimizing (`v0.9.0`)**: A 5-second H20 `vkGetPhysicalDeviceImageFormatProperties` probe proved mipmapped/depth linear aliasing is unsupported in hardware, while `SMRAST_XRAY=1` immediately revealed `smrast_fine.comp` (`1.31–3.61 ms`) and `ClipVertBuf` `16`-vec4 stride (`770 MB`/draw) as the true bottlenecks — unlocking `1,299 FPS` PBR and `108.6 FPS` live 3D!
+5. **Inline `Fused Quad FS` Must Still Support 7-Plane Clipping (`v0.9.0`)**: Depth-less 2-triangle draws (`!dtest && !dwrite`) can still contain 3D near-plane/negative-`w` vertices (caught immediately by `test_v07_features [1]`). Clipping `poly_pos[10]` + original-vertex barycentric weights `poly_u[10]` in shared memory gives 100% spec-exact 7-plane clipping with zero `ClipVertBuf` writes and zero `smrast_bin.comp` dispatches!
+6. **IEEE-754 Bit-Exact Branchless Edge Equations (`v0.9.0`)**: Precomputing canonical `vec4(ax, ay, sgn*dx, sgn*dy)` in loader threads yields `e.z*(fy - e.y) - e.w*(fx - e.x)` which is IEEE-754 bit-identical to branching `edge_eval()` while removing 3 branches + 3 vector subtractions from every inner pixel iteration (preserving `6400/6400` and `2304/2304` watertightness).
+7. **Overlapped Double-Buffered MIT-SHM Ping-Pong (`v0.9.0`)**: Because `shm_ptrs[sidx]` belonged to Frame `N-2` (already synchronized during Frame `N-1`), writing the AVX2 R↔B swizzle into `shm_ptrs[sidx]` *before* `XSync` overlaps CPU swizzle 100% with Xvfb's `XShmPutImage` compositing of Frame `N-1`.
+8. **Giant White Blocks, Painter's Order, `gl_FragCoord.w`, Self-Clearing `VisBuf` & Lifecycle Safety (`v0.5–v0.8`)**: Always preserve 7-plane `±4w` guard-band clipping + `VK_EXT_depth_clip_enable`, `(uint64_t(~tid) << 32) | tid` Painter's order, `gl_FragCoord.w = 1/w_clip`, `0x7FC0DEAD` NaN restart, immediate `VisBuf` self-clear before user FS code, local-copy iteration before `sm_flush_pending_syncs`, and explicit `vkDeviceWaitIdle` teardown.
 
 ---
 
@@ -197,27 +146,19 @@ Record of every major bug, silicon/driver quirk, and architectural bottleneck en
 
 | Version | Major Milestone | Verified H20 Metrics (`qf[2]`, 78 SMs) |
 |---|---|---|
-| `v0.1 – v0.2` | Initial Vulkan Compute Rasterizer ICD + SPIR-V lowerer + CuRast micro-tri + CUDARaster tile binning | 1M-tri 1080p PBR **470–680 FPS** vs CPU Lavapipe **10 FPS** (`PSNR = 46.54 dB`); `vkcube` 60/60 via MIT-SHM WSI |
+| `v0.1 – v0.2` | Initial Vulkan Compute Rasterizer ICD + SPIR-V lowerer + CuRast micro-tri + CUDARaster tile binning | 1M-tri 1080p PBR **470–680 FPS** vs CPU Lavapipe **10 FPS** (`PSNR = 46.54 dB`); `vkcube` 60/60 |
 | `v0.3.0` | Commercial DX11 3A bring-up (DXVK 3.1.1), `smrast_depth_only.comp`, `smrast_blit.comp`, Vulkan 1.4 emulation | 60+ commercial DX11 pipelines 0 failures; 1,260+ continuous frames |
-| `v0.4.0` | DX12 (`vkd3d-proton 3.1.0`, SM 6.6) end-to-end, 8-MRT × 21 formats, 8-bit Stencil, `VK_KHR_push_descriptor`, `DrawIndirectCount`, 49K draw slots | `DX12_VKD3D_TEST PASS`, `DEFERRED_MRT_PIXEL PASS`; 230+ commercial DX11 & 20+ commercial DX12 pipelines 0 failures |
-| `v0.5.0` | Sampled Stencil Aspect SRVs, watertight Top-Left + 4-bit snapping, Depth Bias / Depth Clamp / Rasterizer Discard, 2-Level Tile Hi-Z, `vertex_attribute_divisor` | `V05_FEATURE_TEST PASS` (`2304/2304` watertight pixels); 1M PBR `477–681 FPS` |
+| `v0.4.0` | DX12 (`vkd3d-proton 3.1.0`, SM 6.6) end-to-end, 8-MRT × 21 formats, 8-bit Stencil, `VK_KHR_push_descriptor`, `DrawIndirectCount`, 49K draw slots | `DX12_VKD3D_TEST PASS`, `DEFERRED_MRT_PIXEL PASS`; 230+ DX11 & 20+ DX12 pipelines 0 failures |
+| `v0.5.0` | Sampled Stencil Aspect SRVs, watertight Top-Left + 4-bit snapping, Depth Bias / Depth Clamp / Rasterizer Discard, 2-Level Tile Hi-Z, `vertex_attribute_divisor` | `V05_FEATURE_TEST PASS` (`2304/2304` watertight); 1M PBR `477–681 FPS` |
 | `v0.6.0` | Hybrid Active-Tile Indirect Dispatch, Self-Clearing `VisBuf`/`tile_counts`, Zero-Update Dynamic SSBO DS Cache, Persistent Pre-Binning Coarse Hi-Z, Primitive Restart, Lines/Points | `V06_FEATURE_TEST PASS`; 1,000-Draw 1080p `56.72–61.07 ms` (`16–18 FPS`); AAA 3D scene `3.71 FPS` |
-| `v0.7.0` | Direct (≤256) & Indirect (≤128) Multi-Draw Uber-Batching, 64-Way Warp-Coop Big-Tri Binning, Fused Quad FS, DMA Fast-Clear, Lazy Attachment Sync + `stn_can_write`, 1-Frame Pipelined MIT-SHM Ring, `gl_FragCoord.w` & 2-Plane Clipping, `vkCmdWriteTimestamp` X-Ray | `V07_FEATURE_TEST PASS`; 1,000-Draw Uber-Batch `2.84 ms` Direct (`352.7 FPS`) / `5.03 ms` Indirect (`198.7 FPS`); 1M-Tri PBR `934.4 FPS`; AAA 3D Scene `58.8–70.1 FPS` |
-| **`v0.8.0`** | **7-Plane CUDARaster Guard-Band Clipping (`±4w`) + `VK_EXT_depth_clip_enable`, Painter's Order (Fine + Fused Quad), `flat`/`noperspective` Varyings, Per-Draw Push-Constant & Dynamic-UBO SSBO Cross-Material Uber-Batching, Zero-Copy Linear-Aliased Color G-Buffers (`14` H20 formats, `rt_stride_px[8]`) + Exact Bound-Set Lazy Sync, Double-Buffered MIT-SHM Ping-Pong Ring** | **`V08_FEATURE_TEST PASS` (10/10 suites PASS, 0 warnings)**; **1,000-Draw Per-Draw Push-Constant: `2.57–2.92 ms` (`342–389 FPS`, `14.6×` vs v0.7)**; **1,000-Draw Per-Draw Dynamic-UBO: `2.54 ms` (`393.6 FPS`)**; **1,000-Draw Direct/Indirect: `2.50 ms` (`399.9 FPS`) / `4.20 ms` (`238.2 FPS`)**; **Commercial AAA 3D 1M-Tri Scene: `76.0–81.3 FPS` (`+37%` vs v0.7, `633×–677×` vs 48-Core CPU Lavapipe, `0` flicker spikes, `0` white blocks)**; **3D Menu: `67.6–71.1 FPS`** (`WSI x11=0.3–0.8 ms`) |
+| `v0.7.0` | Direct (≤256) & Indirect (≤128) Multi-Draw Uber-Batching, 64-Way Warp-Coop Big-Tri Binning, Fused Quad FS, DMA Fast-Clear, Lazy Attachment Sync + `stn_can_write`, Pipelined MIT-SHM, `vkCmdWriteTimestamp` X-Ray | `V07_FEATURE_TEST PASS`; 1,000-Draw Uber-Batch `2.84 ms` Direct / `5.03 ms` Indirect; 1M PBR `934.4 FPS`; AAA 3D Scene `58.8–70.1 FPS` |
+| `v0.8.0` | 7-Plane CUDARaster Guard-Band Clipping (`±4w`) + `VK_EXT_depth_clip_enable`, Painter's Order, `flat`/`noperspective`, Per-Draw Push-Constant & Dynamic-UBO SSBO Uber-Batching, Zero-Copy Linear-Aliased Color G-Buffers (`14` formats), Double-Buffered MIT-SHM | `V08_FEATURE_TEST PASS`; 1,000-Draw Push-Constant/Dyn-UBO `2.54–2.92 ms` (`342–394 FPS`); AAA 3D Scene `76.0–81.3 FPS` (`0` flicker spikes, `0` white blocks); 3D Menu `67.6–71.1 FPS` |
+| **`v0.9.0`** | **Precomputed Branchless `smrast_fine.comp` (Loader-Time Hi-Z Compaction + Warp-Uniform Y-Skip + Intra-Tile Early-Z + Inter-Batch Live Hi-Z Tightening), Exact 3-Edge Tile Trivial-Reject + `128 px` Branchless CuRast Fast-Path, Dynamic Per-Pipeline `vert_stride_vec4` (`2..16` vec4), Zero-Bin Inline-Setup `Fused Quad FS` (w/ 7-Plane Clip + Bary Remap), Zero-DMA `smrast_indirect_prep.comp` + Unified End Barriers, Empty-Clear `SyncA2I` Skip, Fused-Sem Present + Runtime AVX2 Overlapped MIT-SHM** | **`V09_FEATURE_TEST PASS` (11/11 suites PASS, 0 warnings)**; **1M-Tri 1080p PBR: `0.77 ms` (`1,299.0 FPS`, `1.293 Gtris/s`, `125×` vs CPU)**; **1,000-Draw Dyn-UBO: `2.35 ms` (`426.1 FPS`) / Push-Const: `2.75 ms` (`364.1 FPS`)**; **512-Layer Overdraw: `1.014 ms`**; **Commercial AAA 3D 1M-Tri Scene: `85.5–108.6 FPS` (`9.2–11.7 ms`, up to `905×` vs CPU Lavapipe, `0` flicker spikes)**; **3D Menu: `76.0–80.0 FPS`**; **DoF Intro: `324.7 FPS`** |
 
 ---
 
-## 7. Technical Roadmap (`v0.9.0+`)
+## 7. Technical Roadmap (`v1.0.0+`)
 
-### Phase 1 — `v0.9.0`: Mipmapped Linear Aliasing & Depth-SRV Zero-Copy (Target: `100+ FPS` Heavy Open-World)
-1. **Mipmapped Linear-Aliased Pyramids & Zero-Copy Depth SRV**: Extend zero-copy linear aliasing to multi-mip bloom/Hi-Z chains and native linear/storage depth buffers to eliminate the remaining `~27–31` `SyncA2I` and `~11` `SyncI2A` copies per frame.
-2. **Multi-Pipeline Indirect Draw Fusion**: Fuse adjacent indirect draws sharing identical FS binary across varying vertex strides/bindings via GPU descriptor indexing.
-
-### Phase 2 — `v0.9.x`: Full Commercial DX12 3A Presentation & Modern Vulkan Coverage
-1. **Out-of-Order Timeline Semaphore Scheduler**: Handle `vkd3d-proton`'s cross-thread wait-before-signal `vkQueueSubmit2` patterns cleanly on multiplexed `qf[2]` without blocking the Present thread.
-2. **`VK_EXT_descriptor_buffer` & BDA Support**: Lower buffer-device-address descriptor reads or safely advertise optimal fallback profile for `vkd3d-proton`.
-3. **Compute-Emulated Geometry & Tessellation Stages + 4× MSAA Resolve**: Unblock engines relying on GS particle expansion / hull-domain terrain tessellation and native MSAA render targets (`AlphaToCoverage`, `SampleMask`).
-
-### Phase 3 — `v1.0.0`: Zero-Copy Streaming & Cross-Vendor Compute GPUs
-1. **Zero-Copy HBM3 → NVENC / DMA-BUF Output**: Bypass X11 MIT-SHM CPU readback completely for low-latency cloud game streaming and high-throughput RGB capture.
-2. **AMD MI300X (`RADV` / `AMDVLK`, Wave64) Validation**: Audit subgroup quad shuffle masks, 64-way warp-cooperative bin assumptions, and LDS tile layouts for Wave64 parity on CDNA3 silicon.
+1. **Full Commercial DX12 3A Live Presentation**: Out-of-order cross-thread timeline semaphore scheduler on multiplexed `qf[2]`, `VK_EXT_descriptor_buffer` / BDA lowering, compute-emulated Geometry & Tessellation stages, and 4× MSAA resolve.
+2. **Vertex-Reuse Indexed Shading Cache (`VS` Deduplication)**: Shade unique index-buffer vertices once per meshlet/draw instead of per-index expansion (`3×–5×` fewer VS invocations on high-poly instanced meshes).
+3. **Zero-Copy Streaming & Cross-Vendor Compute GPUs**: Direct HBM3 → NVENC / DMA-BUF hardware video encoding bridge and Wave64 verification on AMD MI300X (`RADV` / `AMDVLK`).

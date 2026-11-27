@@ -1,8 +1,10 @@
 #version 460
-// smrast_fine.comp — SmRast-VK v0.6:
-//   - Hybrid Active-Tile Indirect Dispatch (small/medium draws) + Coherent 2D Grid Mode (giant 1M+ meshes)
-//   - Self-Clearing tile_counts & tile_active_flags (ZERO per-draw CmdFillBuffer!)
-//   - 1-Read Persistent Tile Hi-Z with Automatic Live Subgroup Fallback + Watertight Top-Left Fill-Rule
+// smrast_fine.comp — SmRast-VK v0.9:
+//   - Loader-Time Tile Hi-Z Compaction + Precomputed Branchless Canonical Edge Equations (256x less redundant math!)
+//   - Warp-Uniform Y-Band Early-Out (portable Warp32/Wave64 via subgroupMin/Max)
+//   - Intra-Tile Early-Z (best_d) + Inter-Batch Live Hi-Z Tightening (occludes deep horizon piles!)
+//   - Hybrid Active-Tile Indirect Dispatch + Coherent 2D Grid + Self-Clearing tile_counts
+//   - Watertight Top-Left Fill-Rule + Deterministic Painter's Order
 #extension GL_ARB_gpu_shader_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -14,7 +16,7 @@ struct TriSetup {
     vec4 v1;     // sx, sy, ndc_z, inv_w
     vec4 v2;     // sx, sy, ndc_z, inv_w
     vec4 area;   // inv_area, minx, miny, maxx
-    uvec4 idx;   // i0, i1, i2, maxy | (is_front << 31)
+    uvec4 idx;   // i0, i1, i2, maxy[0..15] | draw_id[16..23] | is_front[31]
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer TriSetupBuf    { TriSetup tris[]; };
@@ -35,8 +37,13 @@ layout(push_constant) uniform FineParams {
 } pc;
 
 const uint BATCH = 64u;
-shared TriSetup s_tris[BATCH];
-shared uint s_tids[BATCH];
+shared vec4  s_e0[BATCH];     // canonical edge s1->s2: (ax, ay, sgn_dx, sgn_dy)
+shared vec4  s_e1[BATCH];     // canonical edge s2->s0
+shared vec4  s_e2[BATCH];     // canonical edge s0->s1
+shared vec4  s_bbox[BATCH];   // (minx, miny, maxx + 1.0, maxy + 1.0)
+shared vec4  s_zinv[BATCH];   // (z0, z1, z2, inv_area)
+shared uint  s_tid_tl[BATCH]; // (tid & 0x1FFFFFFFu) | (tl_mask << 29u)
+shared uint  s_valid_cnt;
 shared float s_warp_zmin[32];
 shared float s_warp_zmax[32];
 shared float s_tile_zmin;
@@ -57,14 +64,29 @@ bool is_top_left(vec2 d) {
     return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0);
 }
 
-float edge_eval(vec2 a, vec2 b, float fx, float fy) {
+// IEEE-754 bit-exact canonical edge equation:
+// E(fx, fy) = e.z * (fy - e.y) - e.w * (fx - e.x)  (ZERO branches inside pixel loop!)
+vec4 make_edge(vec2 a, vec2 b) {
     if (a.y < b.y || (a.y == b.y && a.x < b.x)) {
         vec2 d = b - a;
-        return d.x * (fy - a.y) - d.y * (fx - a.x);
+        return vec4(a.x, a.y, d.x, d.y);
     } else {
         vec2 d = a - b;
-        return -(d.x * (fy - b.y) - d.y * (fx - b.x));
+        return vec4(b.x, b.y, -d.x, -d.y);
     }
+}
+
+void pack_tri_to_shared(uint slot, uint tid, TriSetup t) {
+    vec2 s0 = t.v0.xy, s1 = t.v1.xy, s2 = t.v2.xy;
+    s_e0[slot]   = make_edge(s1, s2);
+    s_e1[slot]   = make_edge(s2, s0);
+    s_e2[slot]   = make_edge(s0, s1);
+    s_bbox[slot] = vec4(t.area.y, t.area.z, t.area.w + 1.0, float(t.idx.w & 0xFFFFu) + 1.0);
+    s_zinv[slot] = vec4(t.v0.z, t.v1.z, t.v2.z, t.area.x);
+    uint tl_mask = (is_top_left(s2 - s1) ? 1u : 0u) |
+                   (is_top_left(s0 - s2) ? 2u : 0u) |
+                   (is_top_left(s1 - s0) ? 4u : 0u);
+    s_tid_tl[slot] = (tid & 0x1FFFFFFFu) | (tl_mask << 29u);
 }
 
 void main() {
@@ -83,28 +105,26 @@ void main() {
 
     uint local_tid = gl_LocalInvocationIndex; // 0..255
     uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
+    float tx0 = float(tile_x * 16u), ty0 = float(tile_y * 16u);
+    float tx1 = tx0 + 16.0, ty1 = ty0 + 16.0;
+
     uint total;
     if (small_tri_direct) {
         total = min(tile_counts[pc.tiles_x * pc.tiles_y + 5u], BATCH);
         if (total == 0u) return;
+        if (local_tid == 0u) s_valid_cnt = 0u;
+        barrier();
         if (local_tid < total) {
             uint tid = tile_bins[local_tid];
-            s_tids[local_tid] = tid;
-            s_tris[local_tid] = tris[tid];
-        }
-        barrier();
-        // Uniform tile-level AABB reject BEFORE touching HBM3 depth_px / vis_px!
-        float tx0 = float(tile_x * 16u), ty0 = float(tile_y * 16u);
-        float tx1 = tx0 + 16.0, ty1 = ty0 + 16.0;
-        bool any_ov = false;
-        for (uint k = 0u; k < total; ++k) {
-            TriSetup t = s_tris[k];
-            if (!(tx1 <= t.area.y || tx0 > t.area.w + 1.0 || ty1 <= t.area.z || ty0 > float(t.idx.w & 0x7FFFFFFFu) + 1.0)) {
-                any_ov = true;
-                break;
+            TriSetup t = tris[tid];
+            float maxy_f = float(t.idx.w & 0xFFFFu);
+            if (!(tx1 <= t.area.y || tx0 > t.area.w + 1.0 || ty1 <= t.area.z || ty0 > maxy_f + 1.0)) {
+                uint slot = atomicAdd(s_valid_cnt, 1u);
+                pack_tri_to_shared(slot, tid, t);
             }
         }
-        if (!any_ov) return;
+        barrier();
+        if (s_valid_cnt == 0u) return; // Zero overlap -> skip HBM3 depth_px / vis_px completely!
     } else {
         total = min(tile_counts[tile_id], pc.max_tris_per_tile);
         if (total == 0u) {
@@ -118,6 +138,9 @@ void main() {
     uint pidx = in_bounds ? (p.y * pc.width + p.x) : 0u;
     float fx = float(p.x) + 0.5;
     float fy = float(p.y) + 0.5;
+    // Warp-uniform Y band (portable Warp32 & Wave64): skips non-overlapping tris for entire warp in 1 cycle!
+    float wy_lo = subgroupMin(fy);
+    float wy_hi = subgroupMax(fy);
 
     bool dtest = (pc.flags & 8u) != 0u;
     uint dop = (pc.flags >> 4u) & 7u;
@@ -130,6 +153,14 @@ void main() {
     uint64_t best = in_bounds ? vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;
     uint bin_base = tile_id * pc.max_tris_per_tile;
 
+    // Intra-tile Early-Z best_d (accounts for existing CuRast micro-tri hit in vis_px!)
+    float best_d = ref_d;
+    if (in_bounds && best != 0xFFFFFFFFFFFFFFFFul && (hiz_less || hiz_greater)) {
+        float vis_d = uintBitsToFloat(uint(best >> 32));
+        if (greater_wins) vis_d = 1.0 - vis_d;
+        best_d = hiz_less ? min(ref_d, vis_d) : max(ref_d, vis_d);
+    }
+
     // 1-read persistent Tile Hi-Z (fast path) or 2-level live subgroup+shared reduction fallback!
     float tile_zmin = 0.0, tile_zmax = 1.0;
     if (hiz_less || hiz_greater) {
@@ -138,8 +169,8 @@ void main() {
             tile_zmin = hz.x;
             tile_zmax = hz.y;
         } else {
-            float wmin = subgroupMin(in_bounds ? ref_d : 1e30);
-            float wmax = subgroupMax(in_bounds ? ref_d : -1e30);
+            float wmin = subgroupMin(in_bounds ? best_d : 1e30);
+            float wmax = subgroupMax(in_bounds ? best_d : -1e30);
             if (subgroupElect()) {
                 s_warp_zmin[gl_SubgroupID] = wmin;
                 s_warp_zmax[gl_SubgroupID] = wmax;
@@ -160,54 +191,118 @@ void main() {
         }
     }
 
+    bool tightened = false;
     for (uint base = 0u; base < total; base += BATCH) {
         uint count = min(BATCH, total - base);
+        uint vc;
         if (!small_tri_direct) {
+            if (local_tid == 0u) s_valid_cnt = 0u;
+            barrier();
             if (local_tid < count) {
                 uint tid = tile_bins[bin_base + base + local_tid];
-                s_tids[local_tid] = tid;
-                s_tris[local_tid] = tris[tid];
+                TriSetup t = tris[tid];
+                bool pass = true;
+                if (hiz_less) {
+                    float tri_min_z = clamp(min(t.v0.z, min(t.v1.z, t.v2.z)), 0.0, 1.0);
+                    if ((!tightened && dop == 1u) ? (tri_min_z >= tile_zmax) : (tri_min_z > tile_zmax)) pass = false;
+                } else if (hiz_greater) {
+                    float tri_max_z = clamp(max(t.v0.z, max(t.v1.z, t.v2.z)), 0.0, 1.0);
+                    if ((!tightened && dop == 4u) ? (tri_max_z <= tile_zmin) : (tri_max_z < tile_zmin)) pass = false;
+                }
+                if (pass) {
+                    float maxy_f = float(t.idx.w & 0xFFFFu);
+                    if (!(tx1 <= t.area.y || tx0 > t.area.w + 1.0 || ty1 <= t.area.z || ty0 > maxy_f + 1.0)) {
+                        uint slot = atomicAdd(s_valid_cnt, 1u);
+                        pack_tri_to_shared(slot, tid, t);
+                    }
+                }
             }
             barrier();
+            vc = s_valid_cnt;
+            if (vc == 0u) continue;
+        } else {
+            vc = s_valid_cnt;
         }
 
         if (in_bounds) {
-            for (uint k = 0u; k < count; ++k) {
-                TriSetup t = s_tris[k];
-                if (hiz_less) {
-                    float tri_min_z = clamp(min(t.v0.z, min(t.v1.z, t.v2.z)), 0.0, 1.0);
-                    if (dop == 1u ? (tri_min_z >= tile_zmax) : (tri_min_z > tile_zmax)) continue;
-                } else if (hiz_greater) {
-                    float tri_max_z = clamp(max(t.v0.z, max(t.v1.z, t.v2.z)), 0.0, 1.0);
-                    if (dop == 4u ? (tri_max_z <= tile_zmin) : (tri_max_z < tile_zmin)) continue;
-                }
-                if (fx < t.area.y || fx > t.area.w + 1.0 || fy < t.area.z || fy > float(t.idx.w & 0xFFFFu) + 1.0)
-                    continue;
-                vec2 s0 = t.v0.xy, s1 = t.v1.xy, s2 = t.v2.xy;
-                float e0 = edge_eval(s1, s2, fx, fy);
-                float e1 = edge_eval(s2, s0, fx, fy);
-                float e2 = edge_eval(s0, s1, fx, fy);
-                if ((is_top_left(s2 - s1) ? (e0 < 0.0) : (e0 <= 0.0)) ||
-                    (is_top_left(s0 - s2) ? (e1 < 0.0) : (e1 <= 0.0)) ||
-                    (is_top_left(s1 - s0) ? (e2 < 0.0) : (e2 <= 0.0))) continue;
+            for (uint k = 0u; k < vc; ++k) {
+                vec4 bb = s_bbox[k];
+                if (wy_hi < bb.y || wy_lo > bb.w) continue;
+                if (fx < bb.x || fx > bb.z || fy < bb.y || fy > bb.w) continue;
 
-                float l0 = e0 * t.area.x;
-                float l1 = e1 * t.area.x;
+                vec4 ep0 = s_e0[k];
+                float e0 = ep0.z * (fy - ep0.y) - ep0.w * (fx - ep0.x);
+                uint tt = s_tid_tl[k];
+                if (((tt & 0x20000000u) != 0u) ? (e0 < 0.0) : (e0 <= 0.0)) continue;
+
+                vec4 ep1 = s_e1[k];
+                float e1 = ep1.z * (fy - ep1.y) - ep1.w * (fx - ep1.x);
+                if (((tt & 0x40000000u) != 0u) ? (e1 < 0.0) : (e1 <= 0.0)) continue;
+
+                vec4 ep2 = s_e2[k];
+                float e2 = ep2.z * (fy - ep2.y) - ep2.w * (fx - ep2.x);
+                if (((tt & 0x80000000u) != 0u) ? (e2 < 0.0) : (e2 <= 0.0)) continue;
+
+                vec4 zi = s_zinv[k];
+                float l0 = e0 * zi.w;
+                float l1 = e1 * zi.w;
                 float l2 = 1.0 - l0 - l1;
-                float d = clamp(l0 * t.v0.z + l1 * t.v1.z + l2 * t.v2.z, 0.0, 1.0);
-                if (dtest && !depth_pass(d, ref_d, dop)) continue;
+                float d = clamp(l0 * zi.x + l1 * zi.y + l2 * zi.z, 0.0, 1.0);
 
+                // Intra-tile Early-Z reject against tightest winning depth so far!
+                if (hiz_less) {
+                    if (d > best_d || (dop == 1u && d >= ref_d)) continue;
+                } else if (hiz_greater) {
+                    if (d < best_d || (dop == 4u && d <= ref_d)) continue;
+                } else if (dtest && !depth_pass(d, ref_d, dop)) {
+                    continue;
+                }
+
+                uint tid = tt & 0x1FFFFFFFu;
                 uint64_t cand;
                 if (!dtest || dop == 7u) {
-                    cand = (uint64_t(~s_tids[k]) << 32) | uint64_t(s_tids[k]);
+                    cand = (uint64_t(~tid) << 32) | uint64_t(tid);
                 } else {
                     uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
-                    cand = (uint64_t(d_u32) << 32) | uint64_t(s_tids[k]);
+                    cand = (uint64_t(d_u32) << 32) | uint64_t(tid);
                 }
-                if (cand < best) best = cand;
+                if (cand < best) {
+                    best = cand;
+                    best_d = d;
+                }
             }
         }
-        if (!small_tri_direct) barrier();
+
+        // Inter-Batch Live Hi-Z Tightening: front geometry in batch B immediately Hi-Z-culls occluded tris in batch B+1!
+        if (!small_tri_direct && (base + BATCH < total) && (hiz_less || hiz_greater)) {
+            if (hiz_less) {
+                float wmax = subgroupMax(in_bounds ? best_d : -1e30);
+                if (subgroupElect()) s_warp_zmax[gl_SubgroupID] = wmax;
+                barrier();
+                if (local_tid == 0u) {
+                    float mx = -1e30;
+                    for (uint w = 0u; w < gl_NumSubgroups; ++w) mx = max(mx, s_warp_zmax[w]);
+                    s_tile_zmax = min(tile_zmax, mx);
+                }
+                barrier();
+                tile_zmax = s_tile_zmax;
+                tightened = true;
+            } else {
+                float wmin = subgroupMin(in_bounds ? best_d : 1e30);
+                if (subgroupElect()) s_warp_zmin[gl_SubgroupID] = wmin;
+                barrier();
+                if (local_tid == 0u) {
+                    float mn = 1e30;
+                    for (uint w = 0u; w < gl_NumSubgroups; ++w) mn = min(mn, s_warp_zmin[w]);
+                    s_tile_zmin = max(tile_zmin, mn);
+                }
+                barrier();
+                tile_zmin = s_tile_zmin;
+                tightened = true;
+            }
+        } else if (!small_tri_direct) {
+            barrier();
+        }
     }
 
     // Self-clear tile_counts & active flag for this tile (ZERO per-draw CmdFillBuffer!)

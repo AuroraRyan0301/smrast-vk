@@ -1678,10 +1678,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
         const std::vector<uint32_t>* fs_spv_ptr = fs_mod ? &fs_mod->spirv : (!fs_inline_spv.empty() ? &fs_inline_spv : nullptr);
 
         bool ok = true;
+        uint32_t vs_stride = 2u, fs_stride = 2u;
         if (vs_spv_ptr) {
             std::vector<uint32_t> vs_comp_spv;
             std::string err;
-            if (!sm_lower_vertex_spirv(*vs_spv_ptr, sp->vtx_input, vs_spec, sp->layout->sm_set_index, vs_comp_spv, err, &sp->vs_writes_point_size)) {
+            if (!sm_lower_vertex_spirv(*vs_spv_ptr, sp->vtx_input, vs_spec, sp->layout->sm_set_index, vs_comp_spv, err, &sp->vs_writes_point_size, &vs_stride)) {
                 fprintf(stderr, "[SmRast] VS lowering failed: %s\n", err.c_str());
                 ok = false;
             } else {
@@ -1737,7 +1738,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
             if (!sm_lower_fragment_spirv(*fs_spv_ptr, fs_spec, sp->layout->sm_set_index, hints, fs_comp_spv, err,
                                          &sp->fs_uses_push_constants, &sp->fs_has_discard_or_depth,
                                          pipe_dyn_ubos.empty() ? nullptr : &pipe_dyn_ubos,
-                                         &sp->fs_batched_push_ok, &batched_du)) {
+                                         &sp->fs_batched_push_ok, &batched_du, &fs_stride)) {
                 fprintf(stderr, "[SmRast] FS lowering failed: %s\n", err.c_str());
                 ok = false;
             } else {
@@ -1771,6 +1772,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
                 dev->fn.DestroyShaderModule(dev->real_dev, csm, nullptr);
                 sp->is_null_fs_stencil = true;
             }
+        }
+        if (ok) {
+            sp->vert_stride_vec4 = sp->vs_writes_point_size
+                                   ? SM_VERT_STRIDE_VEC4
+                                   : std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, std::max(vs_stride, fs_stride)));
         }
         if (!ok) {
             if (sp->vs_comp_pipe) { dev->fn.DestroyPipeline(dev->real_dev, sp->vs_comp_pipe, nullptr); sp->vs_comp_pipe = VK_NULL_HANDLE; }
@@ -2232,10 +2238,14 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearAttachments(VkCommandBuffer cb, uin
         if ((a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) && a.colorAttachment < SM_MAX_MRT && col_imgs[a.colorAttachment]) {
             clear_mask |= (1u << a.colorAttachment);
             pack_clear_words(a.clearValue.color, col_imgs[a.colorAttachment]->format, clear_words[a.colorAttachment]);
+            col_imgs[a.colorAttachment]->real_uniform_cleared = false;
+            scb->pass_drew_col[a.colorAttachment] = true;
         }
         if ((a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) && dep_img) {
             clear_mask |= 256u;
             clear_depth = a.clearValue.depthStencil.depth;
+            dep_img->real_uniform_cleared = false;
+            scb->pass_drew_dep = true;
         }
         if ((a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && dep_img && dep_img->has_stencil) {
             clear_mask |= 1024u;
@@ -2508,7 +2518,11 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
     for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
         if (col_imgs[i]) {
             sm_ensure_image_attach_buf(dev, col_imgs[i]);
-            if (clear_mask & (1u << i)) { col_imgs[i]->attach_dirty = true; scb->pass_wrote_col[i] = true; }
+            if (clear_mask & (1u << i)) {
+                col_imgs[i]->attach_dirty = true;
+                scb->pass_wrote_col[i] = true;
+                for (int k = 0; k < 4; ++k) scb->pass_clear_col_words[i][k] = clear_words[i][k];
+            }
         }
     }
     uint32_t clr_tx = (W + 15u) / 16u;
@@ -2519,6 +2533,7 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
         if (clear_mask & 256u) {
             dep_img->attach_dirty = true;
             scb->pass_wrote_dep = true;
+            memcpy(&scb->pass_clear_dep_bits, &clear_depth, 4);
             if (dep_img->hiz_buf) {
                 dep_img->hiz_valid = true;
                 dep_img->hiz_has_occluders = false;
@@ -2906,8 +2921,8 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRenderPass(
     scb->in_dyn_rendering = false;
     scb->cur_rp = rp;
     scb->cur_fb = fb;
-    for (uint32_t i = 0; i < SM_MAX_MRT; ++i) scb->pass_wrote_col[i] = false;
-    scb->pass_wrote_dep = false;
+    for (uint32_t i = 0; i < SM_MAX_MRT; ++i) { scb->pass_wrote_col[i] = false; scb->pass_drew_col[i] = false; }
+    scb->pass_wrote_dep = false; scb->pass_drew_dep = false;
     scb->pass_wrote_stn = false;
     scb->last_draw_pipe = nullptr;
 
@@ -3044,10 +3059,10 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginRendering(VkCommandBuffer cb, const
     scb->in_dyn_rendering = true;
     for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
         scb->dyn_col_imgs[i] = nullptr; scb->dyn_col_views[i] = nullptr; scb->dyn_res_imgs[i] = nullptr;
-        scb->dyn_col_store[i] = true; scb->pass_wrote_col[i] = false;
+        scb->dyn_col_store[i] = true; scb->pass_wrote_col[i] = false; scb->pass_drew_col[i] = false;
     }
     scb->dyn_dep_store = true; scb->dyn_stn_store = true;
-    scb->pass_wrote_dep = false; scb->pass_wrote_stn = false;
+    scb->pass_wrote_dep = false; scb->pass_wrote_stn = false; scb->pass_drew_dep = false;
     scb->last_draw_pipe = nullptr;
     scb->dyn_col_count = 0;
     scb->dyn_dep_img = nullptr;
@@ -3213,8 +3228,22 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRendering(VkCommandBuffer cb) {
                 bool readable = ((col->usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) ||
                                  col->array_layers > 1 || col->mip_levels > 1);
                 if (!col->is_swapchain && col->real_img && col->attach_buf && scb->pass_wrote_col[i] && scb->dyn_col_store[i] && readable) {
-                    // v0.7 Lazy Sync: defer attach_buf -> real_img until actually transitioned to READ/TRANSFER or CB end!
-                    sm_mark_pending_sync(scb, col, true, false, mip, lay, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    bool skip_empty_clr = (!col->linear_aliased && !scb->pass_drew_col[i] &&
+                                           col->mip_levels == 1 && col->array_layers == 1 &&
+                                           col->real_uniform_cleared &&
+                                           memcmp(col->real_clear_words, scb->pass_clear_col_words[i], 16) == 0);
+                    if (skip_empty_clr) {
+                        if (g_sm_prof_en) g_sm_prof.sync_a2i_skip.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        if (!scb->pass_drew_col[i] && col->mip_levels == 1 && col->array_layers == 1) {
+                            col->real_uniform_cleared = true;
+                            memcpy(col->real_clear_words, scb->pass_clear_col_words[i], 16);
+                        } else {
+                            col->real_uniform_cleared = false;
+                        }
+                        // v0.7 Lazy Sync: defer attach_buf -> real_img until actually transitioned to READ/TRANSFER or CB end!
+                        sm_mark_pending_sync(scb, col, true, false, mip, lay, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    }
                 } else if (!col->is_swapchain && g_sm_prof_en) {
                     g_sm_prof.sync_a2i_skip.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -3261,6 +3290,20 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdEndRendering(VkCommandBuffer cb) {
             bool want_d = scb->dyn_dep_img->real_img && scb->dyn_dep_img->attach_buf && scb->pass_wrote_dep && scb->dyn_dep_store &&
                           ((scb->dyn_dep_img->usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ||
                            scb->dyn_dep_img->array_layers > 1 || scb->dyn_dep_img->mip_levels > 1);
+            if (want_d) {
+                auto* di = scb->dyn_dep_img;
+                bool skip_empty_clr = (!scb->pass_drew_dep && di->mip_levels == 1 && di->array_layers == 1 &&
+                                       di->real_uniform_cleared && di->real_clear_words[0] == scb->pass_clear_dep_bits);
+                if (skip_empty_clr) {
+                    want_d = false;
+                    if (g_sm_prof_en) g_sm_prof.sync_a2i_skip.fetch_add(1, std::memory_order_relaxed);
+                } else if (!scb->pass_drew_dep && di->mip_levels == 1 && di->array_layers == 1) {
+                    di->real_uniform_cleared = true;
+                    di->real_clear_words[0] = scb->pass_clear_dep_bits;
+                } else {
+                    di->real_uniform_cleared = false;
+                }
+            }
             bool want_s = scb->pass_wrote_stn && scb->dyn_stn_store && scb->dyn_dep_img->has_stencil && scb->dyn_dep_img->stencil_buf && scb->dyn_dep_img->real_stencil_img;
             if (want_d || want_s) {
                 sm_mark_pending_sync(scb, scb->dyn_dep_img, want_d, want_s, dmip, dlay, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -3408,7 +3451,7 @@ static void sm_flush_draw_batch(SmCommandBuffer* scb) {
         const auto& d = B.draws[i];
         uint32_t dflags = d.bin_rflags | ((i & 0xFFu) << 20u) | (is_single_small ? 65536u : 0u);
         uint32_t tc = B.is_indirect ? (0xFFFFFF00u | i) : d.total_tris;
-        SmBinPC bpc = { tc, SM_VERT_STRIDE_VEC4, B.W, B.H, B.tx, B.ty, SM_MAX_TRIS_PER_TILE, dflags,
+        SmBinPC bpc = { tc, B.vert_stride_vec4, B.W, B.H, B.tx, B.ty, SM_MAX_TRIS_PER_TILE, dflags,
                         d.vp.x, d.vp.y, d.vp.width, d.vp.height, d.vp.minDepth, d.vp.maxDepth,
                         d.sc_x0, d.sc_y0, d.sc_x1, d.sc_y1,
                         d.tris_per_inst, d.verts_per_inst, B.extra_v_base, B.extra_t_base,
@@ -3585,7 +3628,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     bool eff_prim_restart    = scb->has_dyn_prim_restart ? scb->dyn_prim_restart : pipe->prim_restart;
     float eff_line_width     = scb->has_dyn_line_width ? scb->dyn_line_width : pipe->line_width;
     if (!pipe->fs_comp_pipe && (!eff_dwrite || dep_img == nullptr)) return; // No-op draw keeps VisBuf untouched!
-    if (eff_dwrite && dep_img) { dep_img->attach_dirty = true; scb->pass_wrote_dep = true; }
+    if (eff_dwrite && dep_img) { dep_img->attach_dirty = true; dep_img->real_uniform_cleared = false; scb->pass_wrote_dep = true; scb->pass_drew_dep = true; }
     bool can_use_hiz = (dep_img != nullptr && dep_img->hiz_valid && dep_img->hiz_buf != VK_NULL_HANDLE &&
                         dep_img->hiz_tx == tx && dep_img->hiz_ty == ty);
     bool use_prebin_hiz = can_use_hiz && dep_img->hiz_has_occluders && eff_dtest &&
@@ -3593,7 +3636,15 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
                            eff_dop == VK_COMPARE_OP_GREATER || eff_dop == VK_COMPARE_OP_GREATER_OR_EQUAL);
     bool any_blend = false;
     for (uint32_t r = 0; r < SM_MAX_MRT; ++r) {
-        if (col_imgs[r] && pipe->blend_enable[r]) { any_blend = true; break; }
+        if (col_imgs[r] && pipe->blend_enable[r] && pipe->color_write_mask[r] != 0u) {
+            bool noop_blend = (pipe->src_color_blend[r] == VK_BLEND_FACTOR_ONE &&
+                               pipe->dst_color_blend[r] == VK_BLEND_FACTOR_ZERO &&
+                               pipe->color_blend_op[r]  == VK_BLEND_OP_ADD &&
+                               pipe->src_alpha_blend[r] == VK_BLEND_FACTOR_ONE &&
+                               pipe->dst_alpha_blend[r] == VK_BLEND_FACTOR_ZERO &&
+                               pipe->alpha_blend_op[r]  == VK_BLEND_OP_ADD);
+            if (!noop_blend) { any_blend = true; break; }
+        }
     }
     bool has_push_desc = false;
     bool dyn_off_fit = (pipe->layout->sm_set_index <= 8u && scb->push_size <= 128u);
@@ -3610,6 +3661,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     bool fused_quad     = (!is_indirect && topo_code <= 2u && total_tris <= 2u &&
                            pipe->fs_comp_pipe != nullptr && !pipe->is_null_fs_stencil &&
                            (!eff_dtest || dep_img == nullptr) && (!eff_dwrite || dep_img == nullptr));
+    bool fused_quad_inline = (fused_quad && topo_code <= 1u && !eff_prim_restart && !eff_dbias_en);
     bool small_tri_coop = (!is_indirect && !fused_quad && topo_code <= 2u && total_tris <= 8u);
     bool direct_2d      = (!is_indirect && total_tris >= 65536u);
     if (!can_batch) sm_flush_draw_batch(scb);
@@ -3698,7 +3750,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         vs_ubo->indexed      = indexed ? (scb->idx_type == VK_INDEX_TYPE_UINT16 ? 1u : (scb->idx_type == VK_INDEX_TYPE_UINT8_EXT ? 3u : 2u)) : 0u;
         vs_ubo->first_index  = indexed ? first_vert_or_idx : 0;
         vs_ubo->vertex_offset = vertex_offset;
-        vs_ubo->vert_stride_vec4 = SM_VERT_STRIDE_VEC4;
+        vs_ubo->vert_stride_vec4 = pipe->vert_stride_vec4;
         vs_ubo->idx_buf_offset = (uint32_t)scb->idx_offset;
         vs_ubo->verts_per_instance = verts_per_inst;
         vs_ubo->vtx_inst_rate_mask = 0;
@@ -3722,7 +3774,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         auto* fs_ubo = reinterpret_cast<SmFsParamsUBO*>((uint8_t*)dev->rast.fs_ubo_ptr + slot * sizeof(SmFsParamsUBO));
         fs_ubo->width = W;
         fs_ubo->height = H;
-        fs_ubo->vert_stride_vec4 = SM_VERT_STRIDE_VEC4;
+        fs_ubo->vert_stride_vec4 = pipe->vert_stride_vec4;
         fs_ubo->depth_write = (eff_dwrite && dep_img != nullptr) ? 1u : 0u;
         fs_ubo->rt_active_mask = 0;
         fs_ubo->stencil_enable = (eff_stest ? 1u : 0u) | ((dep_img && dep_img->stencil_buf) ? 2u : 0u);
@@ -3730,14 +3782,16 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         fs_ubo->stencil_back_cfg  = sm_pack_stencil_cfg(eff_sb);
         fs_ubo->stencil_refs = (eff_sf.reference & 0xFFu) | ((eff_sb.reference & 0xFFu) << 8u);
         fs_ubo->tiles_x = tx;
-        fs_ubo->direct_2d = fused_quad ? 2u : (direct_2d ? 1u : 0u);
+        fs_ubo->direct_2d = fused_quad_inline ? 3u : (fused_quad ? 2u : (direct_2d ? 1u : 0u));
         fs_ubo->batch_push_base = single_bp_slot;
         for (int k = 0; k < 4; ++k)
             fs_ubo->blend_const[k] = scb->has_dyn_blend_const ? scb->dyn_blend_const[k] : pipe->blend_constants[k];
         for (uint32_t r = 0; r < SM_MAX_MRT; ++r) {
             if (col_imgs[r] && pipe->color_write_mask[r] != 0u) {
                 col_imgs[r]->attach_dirty = true;
+                col_imgs[r]->real_uniform_cleared = false;
                 scb->pass_wrote_col[r] = true;
+                scb->pass_drew_col[r] = true;
                 fs_ubo->rt_active_mask |= (1u << r);
                 VkFormat rf = (scb->in_dyn_rendering && scb->dyn_col_views[r] && scb->dyn_col_views[r]->format != VK_FORMAT_UNDEFINED)
                               ? scb->dyn_col_views[r]->format : col_imgs[r]->format;
@@ -3754,6 +3808,17 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             fs_ubo->rt_alpha_op[r]   = (uint32_t)pipe->alpha_blend_op[r];
             fs_ubo->rt_write_mask[r] = pipe->color_write_mask[r] & 0xFu;
             fs_ubo->rt_stride_px[r]  = (col_imgs[r] && col_imgs[r]->linear_aliased) ? col_imgs[r]->row_stride_px : W;
+        }
+        if (fused_quad_inline) {
+            fs_ubo->quad_vp[0] = vp.x; fs_ubo->quad_vp[1] = vp.y; fs_ubo->quad_vp[2] = vp.width; fs_ubo->quad_vp[3] = vp.height;
+            fs_ubo->quad_sc[0] = sc_x0; fs_ubo->quad_sc[1] = sc_y0; fs_ubo->quad_sc[2] = sc_x1; fs_ubo->quad_sc[3] = sc_y1;
+            fs_ubo->quad_z[0]  = vp.minDepth; fs_ubo->quad_z[1] = vp.maxDepth;
+            fs_ubo->quad_meta  = (total_tris & 15u) | ((topo_code & 7u) << 4u) |
+                                 ((eff_cull & VK_CULL_MODE_BACK_BIT) ? 256u : 0u) |
+                                 ((eff_cull & VK_CULL_MODE_FRONT_BIT) ? 512u : 0u) |
+                                 ((eff_ff == VK_FRONT_FACE_CLOCKWISE) ? 1024u : 0u) |
+                                 (!pipe->depth_clip ? 2048u : 0u);
+            fs_ubo->quad_pad   = 0u;
         }
 
         // Zero-Update Cached Descriptor Set Resolver (99.9% cache hit rate -> 0 vkUpdateDescriptorSets/draw!)
@@ -3860,7 +3925,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         mix64((uint64_t)(uintptr_t)cur_bin_ds);
         mix64((uint64_t)(uintptr_t)cur_fine_ds);
         mix64((uint64_t)(uintptr_t)(pipe->fs_comp_pipe ? cur_fs_ds : cur_dep_ds));
-        mix64(((uint64_t)eff_dwrite << 1) | ((uint64_t)can_use_hiz << 2) | ((uint64_t)eff_dop << 3));
+        mix64(((uint64_t)eff_dwrite << 1) | ((uint64_t)can_use_hiz << 2) | ((uint64_t)eff_dop << 3) | ((uint64_t)pipe->vert_stride_vec4 << 8));
         if (pipe->fs_comp_pipe) {
             mix64((uint64_t)(uintptr_t)pipe->layout->sm_fs_layout);
             mix64((uint64_t)scb->gfx_set_mask);
@@ -3895,6 +3960,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             B.is_indirect = is_indirect;
             B.fs_owner_pipe = pipe;
             B.W = W; B.H = H; B.tx = tx; B.ty = ty;
+            B.vert_stride_vec4 = pipe->vert_stride_vec4;
             B.fs_slot = slot;
             B.fine_rflags = rflags;
             B.extra_v_base = extra_v_base;
@@ -3962,7 +4028,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         rflags |= 131072u;
     } else if (small_tri_coop) {
         rflags |= 65536u;
-    } else {
+    } else if (!is_indirect) {
+        // Indirect draws reset clip-tail + active-tile header directly inside smrast_indirect_prep.comp (0 DMA, 0 barrier!)
         static const uint32_t kZeroMeta[2] = {0u, 0u};
         dev->fn.CmdUpdateBuffer(scb->real_cb, dev->rast.tile_count_buf, (VkDeviceSize)(tx * ty) * 4, 8, kZeroMeta);
         if (!direct_2d) {
@@ -3972,7 +4039,6 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     }
 
     if (is_indirect) {
-        emit_compute_barrier(scb);
         struct { uint32_t ind_w_off, vs_w_off, meta_idx, indexed, topo, max_v, max_t, count_w_off, draw_idx, batch_slot; } ipc = {
             (uint32_t)(indirect_offset >> 2),
             (uint32_t)((slot * sizeof(SmVsParamsUBO)) >> 2),
@@ -4018,25 +4084,28 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         if (is_indirect) dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 0);
         else             dev->fn.CmdDispatch(scb->real_cb, (total_verts + 63) / 64, 1, 1);
     }
-    if (fused_quad || small_tri_coop) emit_pure_compute_barrier(scb);
-    else                              emit_compute_barrier(scb);
+    if (fused_quad || small_tri_coop || is_indirect) emit_pure_compute_barrier(scb);
+    else                                             emit_compute_barrier(scb);
 
     // --- PASS 2: CUDARaster Binning + Fused Quad + Cooperative Small-Tri + Pre-Bin Hi-Z + CuRast Fast-Path + Clip + Lines/Points ---
-    SmBinPC bpc = { is_indirect ? 0xFFFFFFFFu : total_tris, SM_VERT_STRIDE_VEC4, W, H, tx, ty, SM_MAX_TRIS_PER_TILE, rflags,
-                    vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc_x0, sc_y0, sc_x1, sc_y1,
-                    tris_per_inst, verts_per_inst, extra_v_base, extra_t_base,
-                    eff_dbias_const, eff_dbias_slope, eff_dbias_clamp, eff_line_width, 0u, 0u };
+    // v0.9 Zero-Bin Inline-Setup Fused Quad FS (direct_2d == 3u) skips Pass 2 + its GPU barrier completely!
+    if (!fused_quad_inline) {
+        SmBinPC bpc = { is_indirect ? 0xFFFFFFFFu : total_tris, pipe->vert_stride_vec4, W, H, tx, ty, SM_MAX_TRIS_PER_TILE, rflags,
+                        vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc_x0, sc_y0, sc_x1, sc_y1,
+                        tris_per_inst, verts_per_inst, extra_v_base, extra_t_base,
+                        eff_dbias_const, eff_dbias_slope, eff_dbias_clamp, eff_line_width, 0u, 0u };
 
-    dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, (topo_code >= 3u) ? dev->rast.prim_bin_pipe : dev->rast.bin_pipe);
-    dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pl, 0, 1, &cur_bin_ds, 0, nullptr);
-    dev->fn.CmdPushConstants(scb->real_cb, dev->rast.bin_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bpc), &bpc);
-    {
-        SmXrayGpuScope _xg_bin((direct_2d || is_indirect) ? scb : nullptr, 7, "  -> Bin(tris=%u ind=%d d2d=%d)", total_tris, (int)is_indirect, (int)direct_2d);
-        if (is_indirect) dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 16);
-        else             dev->fn.CmdDispatch(scb->real_cb, (fused_quad || small_tri_coop) ? 1u : ((total_tris + 63) / 64), 1, 1);
+        dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, (topo_code >= 3u) ? dev->rast.prim_bin_pipe : dev->rast.bin_pipe);
+        dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pl, 0, 1, &cur_bin_ds, 0, nullptr);
+        dev->fn.CmdPushConstants(scb->real_cb, dev->rast.bin_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bpc), &bpc);
+        {
+            SmXrayGpuScope _xg_bin((direct_2d || is_indirect) ? scb : nullptr, 7, "  -> Bin(tris=%u ind=%d d2d=%d)", total_tris, (int)is_indirect, (int)direct_2d);
+            if (is_indirect) dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 16);
+            else             dev->fn.CmdDispatch(scb->real_cb, (fused_quad || small_tri_coop) ? 1u : ((total_tris + 63) / 64), 1, 1);
+        }
+        if (direct_2d || fused_quad) emit_pure_compute_barrier(scb);
+        else                         emit_bin_to_indirect_barrier(scb);
     }
-    if (direct_2d || fused_quad) emit_pure_compute_barrier(scb);
-    else                         emit_bin_to_indirect_barrier(scb);
 
     // --- PASS 3: Hybrid Active-Tile / Coherent-2D 16x16 Fine Rasterizer (SKIPPED completely on fused_quad!) ---
     if (!fused_quad) {
@@ -4080,7 +4149,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             if (direct_2d || fused_quad) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
             else                         dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
         }
-        emit_pure_compute_barrier(scb);
+        if (eff_dwrite && can_use_hiz) emit_pure_compute_barrier(scb);
     } else if (eff_dwrite && dep_img != nullptr) {
         struct { uint32_t w, h, dwrite, tx; } dpc = { W, H, 1u, tx | (direct_2d ? 0x80000000u : 0u) };
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.depth_only_pipe);
@@ -4088,7 +4157,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         dev->fn.CmdPushConstants(scb->real_cb, dev->rast.depth_only_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dpc), &dpc);
         if (direct_2d) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
         else           dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
-        emit_pure_compute_barrier(scb);
+        if (can_use_hiz) emit_pure_compute_barrier(scb);
     }
 
     // --- PASS 5: Incremental Coarse Hi-Z Refresh (ONLY on depth-writing draws!) ---
@@ -4101,6 +4170,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         else           dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
         dep_img->hiz_has_occluders = true;
     }
+    // Single unified end-of-draw barrier (v0.9: eliminates redundant double-barrier on 80+ dw=0 draws/frame!)
     if (fused_quad || small_tri_coop) emit_pure_compute_barrier(scb);
     else                              emit_draw_end_barrier(scb);
     scb->comp_state_dirty = true;
@@ -4504,6 +4574,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdCopyImage(VkCommandBuffer cb, VkImage s,
         }
     }
     if (!copy_depth_or_color) return;
+    di->real_uniform_cleared = false;
     uint32_t si_st = si->linear_aliased ? si->row_stride_px : si->extent.width;
     uint32_t di_st = di->linear_aliased ? di->row_stride_px : di->extent.width;
     if (si->attach_dirty && si->attach_buf && di->attach_buf && si->format == di->format &&
@@ -4555,6 +4626,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdCopyBufferToImage(VkCommandBuffer cb, Vk
     }
     scb->dev->fn.CmdCopyBufferToImage(scb->real_cb, from_h<SmBuffer>(s)->real_buf,
                                       di->real_img, sanitize_layout(dl), n, r);
+    di->real_uniform_cleared = false;
     if (di->linear_aliased) { di->attach_dirty = true; di->real_layout_inited = true; emit_compute_barrier(scb); }
     else di->attach_dirty = false;
 }
@@ -4590,6 +4662,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearColorImage(VkCommandBuffer cb, VkIm
     sm_flush_draw_batch(scb);
     sm_flush_pending_syncs(scb, from_h<SmImage>(i));
     auto* img = from_h<SmImage>(i);
+    img->real_uniform_cleared = false;
     if (img->attach_buf) {
         uint32_t cw[SM_MAX_MRT][4] = {{0}};
         pack_clear_words(*c, img->format, cw[0]);
@@ -4603,6 +4676,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearDepthStencilImage(VkCommandBuffer c
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
     sm_flush_draw_batch(scb);
     auto* img = from_h<SmImage>(i);
+    img->real_uniform_cleared = false;
     img->attach_pending_sync = false; img->stencil_pending_sync = false;
     sm_ensure_image_attach_buf(scb->dev, img);
     uint32_t dbits = 0; memcpy(&dbits, &ds->depth, 4);
@@ -5202,17 +5276,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_AcquireNextImageKHR(
 }
 static VKAPI_ATTR VkResult VKAPI_CALL sm_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pi) {
     auto* q = reinterpret_cast<SmQueue*>(queue);
-    // Wait for waitSemaphores on compute queue before reading back frame
-    if (pi->waitSemaphoreCount > 0) {
-        std::vector<VkPipelineStageFlags> st(pi->waitSemaphoreCount, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, pi->waitSemaphoreCount, pi->pWaitSemaphores, st.data()};
-        std::lock_guard<std::mutex> qlk(q->mtx);
-        q->dev->fn.QueueSubmit(q->real_q, 1, &si, VK_NULL_HANDLE);
-    }
+    // v0.9: Fuse waitSemaphores directly into the first swapchain's DMA QueueSubmit (eliminates 1 empty QueueSubmit/frame!)
+    bool sem_fused = false;
     for (uint32_t i = 0; i < pi->swapchainCount; ++i) {
         auto* sc = from_h<SmSwapchain>(pi->pSwapchains[i]);
         uint32_t idx = pi->pImageIndices[i];
-        if (idx < sc->images.size()) sm_wsi_blit_to_surface(sc, sc->images[idx]);
+        if (idx < sc->images.size()) {
+            uint32_t wc = (!sem_fused && pi->waitSemaphoreCount > 0 && pi->waitSemaphoreCount <= 8u) ? pi->waitSemaphoreCount : 0u;
+            if (wc > 0) sem_fused = true;
+            sm_wsi_blit_to_surface(sc, sc->images[idx], wc, wc ? pi->pWaitSemaphores : nullptr);
+        }
         if (g_sm_xray_env) {
             if (g_sm_xray_frames.load(std::memory_order_relaxed) > 0) {
                 int rem = g_sm_xray_frames.fetch_sub(1, std::memory_order_relaxed) - 1;
@@ -5224,6 +5297,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_QueuePresentKHR(VkQueue queue, const Vk
                 g_sm_xray_frames.store(2, std::memory_order_relaxed);
             }
         }
+    }
+    if (!sem_fused && pi->waitSemaphoreCount > 0) {
+        std::vector<VkPipelineStageFlags> st(pi->waitSemaphoreCount, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, pi->waitSemaphoreCount, pi->pWaitSemaphores, st.data()};
+        std::lock_guard<std::mutex> qlk(q->mtx);
+        q->dev->fn.QueueSubmit(q->real_q, 1, &si, VK_NULL_HANDLE);
     }
     return VK_SUCCESS;
 }
