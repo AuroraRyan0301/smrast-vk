@@ -1,13 +1,69 @@
-// smrast_wsi.cpp — Headless XCB & Xlib WSI Presentation Bridge for SmRast-VK
+// smrast_wsi.cpp — Zero-Copy MIT-SHM XCB & Xlib WSI Presentation Bridge for SmRast-VK v0.3
 // Copies H20 HBM3 swapchain framebuffer -> host staging buffer via pure Compute Queue (qf[2])
-// and blits directly into Xvfb / X11 windows via xcb_put_image or XPutImage!
+// and blits to Xvfb / X11 via xcb_shm_put_image (MIT-SHM zero-copy!) with automatic fallback.
 
 #include "smrast_internal.h"
 #include <xcb/xcb.h>
+#include <xcb/shm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <cstdio>
 #include <cstring>
+
+static void init_xcb_shm(SmSwapchain* sc, size_t bytes) {
+    sc->shm_checked = true;
+    SmSurface* surf = sc->surface;
+    if (!surf || !surf->is_xcb || !surf->xcb_conn) return;
+
+    sc->xcb_gc = xcb_generate_id(surf->xcb_conn);
+    xcb_create_gc(surf->xcb_conn, sc->xcb_gc, surf->xcb_win, 0, nullptr);
+
+    auto q_cookie = xcb_shm_query_version(surf->xcb_conn);
+    auto* q_rep = xcb_shm_query_version_reply(surf->xcb_conn, q_cookie, nullptr);
+    if (!q_rep) return;
+    free(q_rep);
+
+    int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
+    if (shmid < 0) return;
+    void* ptr = shmat(shmid, nullptr, 0);
+    if (ptr == (void*)-1) { shmctl(shmid, IPC_RMID, nullptr); return; }
+
+    xcb_shm_seg_t seg = xcb_generate_id(surf->xcb_conn);
+    auto att_c = xcb_shm_attach_checked(surf->xcb_conn, seg, (uint32_t)shmid, 0);
+    xcb_generic_error_t* err = xcb_request_check(surf->xcb_conn, att_c);
+    // Mark for auto-removal as soon as both client & X server detach
+    shmctl(shmid, IPC_RMID, nullptr);
+    if (err) {
+        free(err);
+        shmdt(ptr);
+        return;
+    }
+    sc->use_shm = true;
+    sc->shm_id = shmid;
+    sc->shm_seg = seg;
+    sc->shm_ptr = (uint8_t*)ptr;
+    sc->shm_bytes = bytes;
+}
+
+void sm_wsi_cleanup_swapchain(SmSwapchain* sc) {
+    if (!sc || !sc->surface) return;
+    SmSurface* surf = sc->surface;
+    if (surf->is_xcb && surf->xcb_conn) {
+        if (sc->use_shm) {
+            xcb_shm_detach(surf->xcb_conn, sc->shm_seg);
+            if (sc->shm_ptr) shmdt(sc->shm_ptr);
+            sc->shm_ptr = nullptr;
+            sc->use_shm = false;
+        }
+        if (sc->xcb_gc) {
+            xcb_free_gc(surf->xcb_conn, sc->xcb_gc);
+            sc->xcb_gc = 0;
+        }
+        xcb_flush(surf->xcb_conn);
+    }
+}
 
 void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     if (!sc || !sc->surface || !img || !img->host_ptr) return;
@@ -16,7 +72,7 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     uint32_t h = sc->extent.height;
     size_t bytes = (size_t)w * h * 4;
 
-    // 1. Copy GPU attachment buffer (or VkImage) -> host-coherent staging buffer via pure Compute Queue!
+    // 1. Copy GPU attachment buffer -> host-coherent staging buffer via pure Compute Queue (qf[2])
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     dev->fn.ResetCommandPool(dev->real_dev, sc->present_pool, 0);
     dev->fn.BeginCommandBuffer(sc->present_cmd, &bi);
@@ -35,40 +91,56 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img) {
     dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, VK_NULL_HANDLE);
     dev->fn.QueueWaitIdle(dev->main_queue->real_q);
 
-    // 2. Blit BGRA/RGBA32 pixels to XCB or Xlib window!
-    // X11 24-bit ZPixmap on x86_64 little-endian expects BGRX (same byte layout as VK_FORMAT_B8G8R8A8_UNORM!)
     const uint8_t* src = (const uint8_t*)img->host_ptr;
-    std::vector<uint8_t> tmp;
-    if (sc->format == VK_FORMAT_R8G8B8A8_UNORM || sc->format == VK_FORMAT_R8G8B8A8_SRGB) {
-        tmp.resize(bytes);
-        for (size_t i = 0; i < bytes; i += 4) {
-            tmp[i+0] = src[i+2];
-            tmp[i+1] = src[i+1];
-            tmp[i+2] = src[i+0];
-            tmp[i+3] = 255;
-        }
-        src = tmp.data();
-    }
+    bool need_swap = (sc->format == VK_FORMAT_R8G8B8A8_UNORM || sc->format == VK_FORMAT_R8G8B8A8_SRGB);
 
     SmSurface* surf = sc->surface;
     if (surf->is_xcb && surf->xcb_conn) {
-        xcb_gcontext_t gc = xcb_generate_id(surf->xcb_conn);
-        xcb_create_gc(surf->xcb_conn, gc, surf->xcb_win, 0, nullptr);
-        // Chunk by strips so we never exceed XCB max request size (~16MB)
-        const uint32_t strip_h = 64;
-        for (uint32_t y = 0; y < h; y += strip_h) {
-            uint32_t ch = (y + strip_h <= h) ? strip_h : (h - y);
-            xcb_put_image(surf->xcb_conn, XCB_IMAGE_FORMAT_Z_PIXMAP, surf->xcb_win, gc,
-                          (uint16_t)w, (uint16_t)ch, 0, (int16_t)y, 0, 24,
-                          (uint32_t)(ch * w * 4), src + (size_t)y * w * 4);
+        if (!sc->shm_checked) init_xcb_shm(sc, bytes);
+        if (sc->use_shm && sc->shm_ptr && sc->shm_bytes >= bytes) {
+            // Fast MIT-SHM Zero-Socket-Copy Blit!
+            if (!need_swap) {
+                memcpy(sc->shm_ptr, src, bytes);
+            } else {
+                uint8_t* dst = sc->shm_ptr;
+                for (size_t i = 0; i < bytes; i += 4) {
+                    dst[i+0] = src[i+2]; dst[i+1] = src[i+1]; dst[i+2] = src[i+0]; dst[i+3] = 255;
+                }
+            }
+            xcb_shm_put_image(surf->xcb_conn, surf->xcb_win, sc->xcb_gc,
+                              (uint16_t)w, (uint16_t)h, 0, 0, (uint16_t)w, (uint16_t)h,
+                              0, 0, 24, XCB_IMAGE_FORMAT_Z_PIXMAP, 0, sc->shm_seg, 0);
+            xcb_flush(surf->xcb_conn);
+        } else {
+            std::vector<uint8_t> tmp;
+            if (need_swap) {
+                tmp.resize(bytes);
+                for (size_t i = 0; i < bytes; i += 4) {
+                    tmp[i+0] = src[i+2]; tmp[i+1] = src[i+1]; tmp[i+2] = src[i+0]; tmp[i+3] = 255;
+                }
+                src = tmp.data();
+            }
+            const uint32_t strip_h = 64;
+            for (uint32_t y = 0; y < h; y += strip_h) {
+                uint32_t ch = (y + strip_h <= h) ? strip_h : (h - y);
+                xcb_put_image(surf->xcb_conn, XCB_IMAGE_FORMAT_Z_PIXMAP, surf->xcb_win, sc->xcb_gc,
+                              (uint16_t)w, (uint16_t)ch, 0, (int16_t)y, 0, 24,
+                              (uint32_t)(ch * w * 4), src + (size_t)y * w * 4);
+            }
+            xcb_flush(surf->xcb_conn);
         }
-        xcb_free_gc(surf->xcb_conn, gc);
-        xcb_flush(surf->xcb_conn);
     } else if (!surf->is_xcb && surf->xlib_dpy) {
+        std::vector<uint8_t> tmp;
+        if (need_swap) {
+            tmp.resize(bytes);
+            for (size_t i = 0; i < bytes; i += 4) {
+                tmp[i+0] = src[i+2]; tmp[i+1] = src[i+1]; tmp[i+2] = src[i+0]; tmp[i+3] = 255;
+            }
+            src = tmp.data();
+        }
         GC gc = XCreateGC(surf->xlib_dpy, surf->xlib_win, 0, nullptr);
         int screen = DefaultScreen(surf->xlib_dpy);
         Visual* vis = DefaultVisual(surf->xlib_dpy, screen);
-        // XCreateImage does not copy data; clear xi->data before XDestroyImage so it doesn't free our buffer
         XImage* xi = XCreateImage(surf->xlib_dpy, vis, 24, ZPixmap, 0, (char*)src, w, h, 32, (int)(w * 4));
         if (xi) {
             XPutImage(surf->xlib_dpy, surf->xlib_win, gc, xi, 0, 0, 0, 0, w, h);

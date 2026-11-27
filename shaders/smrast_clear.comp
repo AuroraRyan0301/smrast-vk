@@ -1,26 +1,45 @@
 #version 460
-// smrast_clear.comp — GPU Compute Attachment Clear (Color + Depth + 64-bit Visibility Buffer)
+// smrast_clear.comp — SmRast-VK v0.3: Multi-RT (up to 4 MRT Color + HDR) + Depth + 64-bit VisBuf Compute Clear
 #extension GL_ARB_gpu_shader_int64 : require
-
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, set = 0, binding = 0) buffer ColorBuf { uint color_px[]; };
-layout(std430, set = 0, binding = 1) buffer DepthBuf { float depth_px[]; };
-layout(std430, set = 0, binding = 2) buffer VisBuf   { uint64_t vis_px[]; };
+layout(std430, set = 0, binding = 0) writeonly buffer Color0Buf { uint col0[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Color1Buf { uint col1[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Color2Buf { uint col2[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Color3Buf { uint col3[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer DepthBuf  { float dep_px[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer VisBuf    { uint64_t vis_px[]; };
 
-layout(push_constant) uniform ClearParams {
+layout(std140, set = 0, binding = 6) uniform ClearUBO {
     uint width;
     uint height;
-    uint clear_mask; // bit0=color, bit1=depth, bit2=vis
-    uint clear_rgba; // packed RGBA8 / BGRA8
+    uint clear_mask; // bits 0..3 = clear RT0..3, bit 4 = clear depth, bit 5 = clear vis
     float clear_depth;
-} pc;
+    uvec4 rt_u32_stride; // u32 words per pixel for RT0..3 (1=4B, 2=8B, 4=16B)
+    uvec4 rt_clear[4];   // packed clear words for RT0..3
+} u;
 
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
-    if (p.x >= pc.width || p.y >= pc.height) return;
-    uint idx = p.y * pc.width + p.x;
-    if ((pc.clear_mask & 1u) != 0u) color_px[idx] = pc.clear_rgba;
-    if ((pc.clear_mask & 2u) != 0u) depth_px[idx] = pc.clear_depth;
-    if ((pc.clear_mask & 4u) != 0u) vis_px[idx]   = 0xFFFFFFFFFFFFFFFFul;
+    if (p.x >= u.width || p.y >= u.height) return;
+    uint idx = p.y * u.width + p.x;
+
+    if ((u.clear_mask & 1u) != 0u) {
+        uint s = u.rt_u32_stride.x;
+        for (uint k = 0u; k < s; ++k) col0[idx * s + k] = u.rt_clear[0][k];
+    }
+    if ((u.clear_mask & 2u) != 0u) {
+        uint s = u.rt_u32_stride.y;
+        for (uint k = 0u; k < s; ++k) col1[idx * s + k] = u.rt_clear[1][k];
+    }
+    if ((u.clear_mask & 4u) != 0u) {
+        uint s = u.rt_u32_stride.z;
+        for (uint k = 0u; k < s; ++k) col2[idx * s + k] = u.rt_clear[2][k];
+    }
+    if ((u.clear_mask & 8u) != 0u) {
+        uint s = u.rt_u32_stride.w;
+        for (uint k = 0u; k < s; ++k) col3[idx * s + k] = u.rt_clear[3][k];
+    }
+    if ((u.clear_mask & 16u) != 0u) dep_px[idx] = u.clear_depth;
+    if ((u.clear_mask & 32u) != 0u) vis_px[idx] = 0xFFFFFFFFFFFFFFFFul;
 }

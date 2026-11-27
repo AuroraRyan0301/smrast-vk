@@ -1,11 +1,11 @@
 CXX := g++
 CXXFLAGS := -O3 -std=c++17 -fPIC -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter -Wno-unused-function -Iinclude -I/usr/include/spirv_cross
-LDFLAGS := -shared -Wl,--no-undefined -ldl -lspirv-cross-c-shared -lxcb -lX11 -lpthread
+LDFLAGS := -shared -Wl,--no-undefined -ldl -lspirv-cross-c-shared -lshaderc -lxcb -lxcb-shm -lX11 -lpthread
 GLSLANG := glslangValidator
 
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/libvulkan_smrast.so
-SHADERS := $(BUILD_DIR)/smrast_clear.comp.spv $(BUILD_DIR)/smrast_bin.comp.spv $(BUILD_DIR)/smrast_fine.comp.spv
+SHADERS := $(BUILD_DIR)/smrast_clear.comp.spv $(BUILD_DIR)/smrast_bin.comp.spv $(BUILD_DIR)/smrast_fine.comp.spv $(BUILD_DIR)/smrast_indirect_prep.comp.spv
 SRCS := src/smrast_icd.cpp src/smrast_raster_engine.cpp src/spirv_lower.cpp src/smrast_wsi.cpp
 OBJS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 

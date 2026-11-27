@@ -177,12 +177,17 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
 }
 
 void main() {
-    uint tid = gl_GlobalInvocationID.x;
-    if (tid >= pc.tri_count) return;
+    uint meta_idx = pc.tiles_x * pc.tiles_y;
+    uint eff_tri_count = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 2u] : pc.tri_count;
+    uint eff_tpi       = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 3u] : pc.tris_per_inst;
+    uint eff_vpi       = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 4u] : pc.verts_per_inst;
 
-    uint inst_local = tid / pc.tris_per_inst;
-    uint tri_local  = tid - inst_local * pc.tris_per_inst;
-    uint vbase      = inst_local * pc.verts_per_inst;
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= eff_tri_count) return;
+
+    uint inst_local = tid / max(eff_tpi, 1u);
+    uint tri_local  = tid - inst_local * max(eff_tpi, 1u);
+    uint vbase      = inst_local * eff_vpi;
 
     uint topo = (pc.flags >> 8u) & 3u;
     uint i0, i1, i2;
@@ -226,7 +231,6 @@ void main() {
     if (!in0 && !in1 && !in2) return;
 
     // Sutherland-Hodgman clip against z = 0 (preserves exact winding!)
-    uint meta_idx = pc.tiles_x * pc.tiles_y;
     uint v_in[4];
     vec4 p_in[4];
     uint in_ids[3] = uint[3](i0, i1, i2);

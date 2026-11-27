@@ -1,11 +1,15 @@
 #pragma once
-// smrast_internal.h — SmRast-VK: Vulkan 1.3 Graphics-on-Compute Wrapper ICD for H20 / H100 / MI300X
+// smrast_internal.h — SmRast-VK v0.3: Vulkan 1.3 Graphics-on-Compute Wrapper ICD for H20 / H100 / MI300X
 // Runs 100% on backend VK_QUEUE_COMPUTE_BIT (zero hardware rasterizer, ROP, or RT Core touched!)
+// Features: CUDARaster 16x16 binning + CuRast 64-bit atomic VisBuf + cuRE/RetroWarp shared-mem fine rasterizer,
+//           MRT (up to 4 Color Attachments + HDR RGBA16F/R11G11B10F/R32F/RGBA32F), GPU-Driven DrawIndirect,
+//           Sutherland-Hodgman Near-Plane Clipper, In-Process libshaderc Lowering, Zero-Copy MIT-SHM WSI!
 
 #define VK_USE_PLATFORM_XCB_KHR
 #define VK_USE_PLATFORM_XLIB_KHR
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
+#include <xcb/shm.h>
 
 #include <cstdint>
 #include <cstring>
@@ -19,15 +23,44 @@
 #define ICD_LOADER_MAGIC 0x01CDC0DE
 #endif
 
-// Max varyings per vertex (slot 0 = gl_Position, slots 1..15 = Location 0..14)
+static constexpr uint32_t SM_MAX_MRT            = 4;
 static constexpr uint32_t SM_MAX_VARYINGS       = 15;
 static constexpr uint32_t SM_VERT_STRIDE_VEC4   = 1 + SM_MAX_VARYINGS; // 16 vec4 = 256 bytes
 static constexpr uint32_t SM_MAX_DRAW_VERTS     = 6 * 1024 * 1024;     // 6.29M regular verts/draw (>2M tris!)
-static constexpr uint32_t SM_MAX_VERTS_PER_DRAW = 7 * 1024 * 1024;     // +1M near-clipped verts (~1.75 GB HBM3)
+static constexpr uint32_t SM_MAX_VERTS_PER_DRAW = 7 * 1024 * 1024;     // +1M near-clipped verts
 static constexpr uint32_t SM_MAX_DRAW_TRIS      = 2100000;             // 2.1M regular tris/draw
 static constexpr uint32_t SM_MAX_TRIS_PER_DRAW  = 2500000;             // +400K near-clipped tris
 static constexpr uint32_t SM_MAX_TRIS_PER_TILE  = 2048;                // 2048 macro tris/tile
 static constexpr uint32_t SM_MAX_VTX_BINDINGS   = 8;
+
+// Render-Target Format Encoding shared between Host & Compute Shaders:
+// 0=RGBA8_UNORM, 1=BGRA8_UNORM, 2=RGBA8_SRGB, 3=BGRA8_SRGB,
+// 4=RGBA16_SFLOAT (8B), 5=B10G11R11_UFLOAT (4B), 6=R32_SFLOAT (4B),
+// 7=RG16_SFLOAT (4B), 8=RGBA32_SFLOAT (16B), 9=A2B10G10R10_UNORM (4B), 10=RG32_SFLOAT (8B)
+static inline uint32_t sm_format_code(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_B8G8R8A8_UNORM:          return 1u;
+        case VK_FORMAT_R8G8B8A8_SRGB:           return 2u;
+        case VK_FORMAT_B8G8R8A8_SRGB:           return 3u;
+        case VK_FORMAT_R16G16B16A16_SFLOAT:     return 4u;
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 5u;
+        case VK_FORMAT_R32_SFLOAT:              return 6u;
+        case VK_FORMAT_R16G16_SFLOAT:           return 7u;
+        case VK_FORMAT_R32G32B32A32_SFLOAT:     return 8u;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:return 9u;
+        case VK_FORMAT_R32G32_SFLOAT:           return 10u;
+        default:                                return 0u;
+    }
+}
+static inline uint32_t sm_format_u32_stride(VkFormat f) {
+    uint32_t c = sm_format_code(f);
+    if (c == 4u || c == 10u) return 2u; // 8 bytes/px
+    if (c == 8u)             return 4u; // 16 bytes/px
+    return 1u;                          // 4 bytes/px
+}
+static inline uint32_t sm_format_bpp(VkFormat f) {
+    return sm_format_u32_stride(f) * 4u;
+}
 
 struct SmInstance;
 struct SmPhysicalDevice;
@@ -35,9 +68,6 @@ struct SmDevice;
 struct SmQueue;
 struct SmCommandBuffer;
 
-// -----------------------------------------------------------------------------
-// Backend ICD function pointer tables (loaded directly from libGLX_nvidia.so.0 / backend ICD)
-// -----------------------------------------------------------------------------
 struct BackendInstFns {
     PFN_vkGetInstanceProcAddr gipa = nullptr;
     PFN_vkCreateInstance CreateInstance = nullptr;
@@ -140,9 +170,6 @@ struct BackendDevFns {
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
 };
 
-// -----------------------------------------------------------------------------
-// Wrapper structs (ALL dispatchable handles begin with VK_LOADER_DATA!)
-// -----------------------------------------------------------------------------
 struct SmInstance {
     VK_LOADER_DATA loader_data;
     void* backend_dl = nullptr;
@@ -155,15 +182,18 @@ struct SmPhysicalDevice {
     VK_LOADER_DATA loader_data;
     SmInstance* inst = nullptr;
     VkPhysicalDevice real_pd = VK_NULL_HANDLE;
-    uint32_t backend_compute_qf = 2; // Pure VK_QUEUE_COMPUTE_BIT queue family on H20!
+    uint32_t backend_compute_qf = 2;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceMemoryProperties mem_props{};
 };
 
-// Tracked non-dispatchable objects (cast directly to/from Vulkan handle uint64_t)
 struct SmShaderModule {
     VkShaderModule real_mod = VK_NULL_HANDLE;
     std::vector<uint32_t> spirv;
+};
+
+struct SmDescriptorUpdateTemplate {
+    std::vector<VkDescriptorUpdateTemplateEntry> entries;
 };
 
 struct SmBuffer {
@@ -179,10 +209,8 @@ struct SmImage {
     VkImageUsageFlags usage = 0;
     bool is_swapchain = false;
     bool is_depth = false;
-    // Linear HBM3 attachment mirror buffer (used when rendered into by Compute Fragment Shader)
     VkBuffer attach_buf = VK_NULL_HANDLE;
     VkDeviceMemory attach_mem = VK_NULL_HANDLE;
-    // Host-coherent readback staging buffer (only allocated for swapchain images!)
     VkBuffer host_buf = VK_NULL_HANDLE;
     VkDeviceMemory host_mem = VK_NULL_HANDLE;
     void* host_ptr = nullptr;
@@ -196,7 +224,8 @@ struct SmImageView {
 
 struct SmRenderPass {
     std::vector<VkAttachmentDescription> attachments;
-    int color_attach_idx = -1;
+    int color_attach_idxs[SM_MAX_MRT] = {-1, -1, -1, -1};
+    uint32_t color_attach_count = 0;
     int depth_attach_idx = -1;
 };
 
@@ -208,10 +237,9 @@ struct SmFramebuffer {
 };
 
 struct SmPipelineLayout {
-    VkPipelineLayout real_layout = VK_NULL_HANDLE; // App's original layout (for native vkCmdDispatch)
+    VkPipelineLayout real_layout = VK_NULL_HANDLE;
     std::vector<VkDescriptorSetLayout> app_dsls;
     std::vector<VkPushConstantRange> push_ranges;
-    // Extended layout with SmRast internal descriptor set appended at set = app_dsls.size()
     VkPipelineLayout sm_vs_layout = VK_NULL_HANDLE;
     VkPipelineLayout sm_fs_layout = VK_NULL_HANDLE;
     uint32_t sm_set_index = 0;
@@ -226,36 +254,33 @@ struct SmPipeline {
     bool is_compute = false;
     VkPipeline real_compute_pipe = VK_NULL_HANDLE;
 
-    // Lowered graphics -> compute pipelines
     SmPipelineLayout* layout = nullptr;
     VkPipeline vs_comp_pipe = VK_NULL_HANDLE;
     VkPipeline fs_comp_pipe = VK_NULL_HANDLE;
     SmVertexInputState vtx_input;
 
-    // Fixed-function rasterization & depth/blend state
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool depth_test = false;
     bool depth_write = false;
     VkCompareOp depth_op = VK_COMPARE_OP_LESS;
-    bool blend_enable = false;
-    VkBlendFactor src_color_blend = VK_BLEND_FACTOR_SRC_ALPHA;
-    VkBlendFactor dst_color_blend = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    VkBlendOp color_blend_op = VK_BLEND_OP_ADD;
+
+    // Per-MRT blending state (up to 4 independent RTs!)
+    bool blend_enable[SM_MAX_MRT] = {false, false, false, false};
+    VkBlendFactor src_color_blend[SM_MAX_MRT] = {VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_SRC_ALPHA};
+    VkBlendFactor dst_color_blend[SM_MAX_MRT] = {VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA};
+    VkBlendOp color_blend_op[SM_MAX_MRT] = {VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD};
     bool has_static_vp = false;
     VkViewport static_vp{};
     bool has_static_scissor = false;
     VkRect2D static_scissor{};
 };
 
-// WSI Surface & Swapchain
 struct SmSurface {
     bool is_xcb = false;
-    // XCB
     xcb_connection_t* xcb_conn = nullptr;
     xcb_window_t xcb_win = 0;
-    // Xlib
     Display* xlib_dpy = nullptr;
     Window xlib_win = 0;
 };
@@ -267,13 +292,59 @@ struct SmSwapchain {
     VkExtent2D extent{800, 600};
     std::vector<SmImage*> images;
     uint32_t next_image = 0;
-    // Dedicated present command pool & buffer for fast GPU->Host readback
     VkCommandPool present_pool = VK_NULL_HANDLE;
     VkCommandBuffer present_cmd = VK_NULL_HANDLE;
     uint64_t present_frames = 0;
+    // Zero-Copy MIT-SHM XCB presentation state
+    bool shm_checked = false;
+    bool use_shm = false;
+    int shm_id = -1;
+    xcb_shm_seg_t shm_seg = 0;
+    uint8_t* shm_ptr = nullptr;
+    size_t shm_bytes = 0;
+    xcb_gcontext_t xcb_gc = 0;
 };
 
-// Internal GPU Compute Rasterizer Resources per Device
+struct alignas(256) SmVsParamsUBO {
+    uint32_t vertex_count;
+    uint32_t first_vertex;
+    uint32_t instance_idx;
+    uint32_t indexed;            // 0=non-indexed, 1=uint16, 2=uint32
+    uint32_t first_index;
+    int32_t  vertex_offset;
+    uint32_t vert_stride_vec4;
+    uint32_t idx_buf_offset;
+    uint32_t vtx_offsets[4];
+    uint32_t vtx_strides[4];
+    uint32_t verts_per_instance;
+    uint32_t vtx_inst_rate_mask;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+struct alignas(256) SmFsParamsUBO {
+    uint32_t width;
+    uint32_t height;
+    uint32_t vert_stride_vec4;
+    uint32_t depth_write;
+    uint32_t rt_active_mask;     // bits 0..3 = RT0..3 attached
+    uint32_t pad0, pad1, pad2;
+    uint32_t rt_fmt[4];          // sm_format_code() for RT0..3
+    uint32_t rt_blend_en[4];
+    uint32_t rt_src_blend[4];
+    uint32_t rt_dst_blend[4];
+    uint32_t rt_blend_op[4];
+};
+
+struct alignas(256) SmClearUBO {
+    uint32_t width;
+    uint32_t height;
+    uint32_t clear_mask;         // bits 0..3=RT0..3, bit4=depth, bit5=vis
+    float    clear_depth;
+    uint32_t rt_u32_stride[4];
+    uint32_t rt_clear[4][4];
+};
+
 struct SmRasterEngine {
     VkDescriptorSetLayout clear_dsl = VK_NULL_HANDLE;
     VkPipelineLayout clear_pl = VK_NULL_HANDLE;
@@ -287,65 +358,40 @@ struct SmRasterEngine {
     VkPipelineLayout fine_pl = VK_NULL_HANDLE;
     VkPipeline fine_pipe = VK_NULL_HANDLE;
 
-    // App-appended internal descriptor set layouts (bound at set = app_set_count)
-    // VS internal set: binding 0=ClipVertBuf, 1=IndexBuf, 2=VtxBuf0, 3=VtxBuf1, 4=VtxBuf2, 5=VtxBuf3, 6=VsParamsUBO
+    VkDescriptorSetLayout ind_prep_dsl = VK_NULL_HANDLE;
+    VkPipelineLayout ind_prep_pl = VK_NULL_HANDLE;
+    VkPipeline ind_prep_pipe = VK_NULL_HANDLE;
+
     VkDescriptorSetLayout vs_int_dsl = VK_NULL_HANDLE;
-    // FS internal set: binding 0=ClipVertBuf, 1=TriSetupBuf, 2=VisBuf, 3=ColorBuf, 4=DepthBuf, 5=FsParamsUBO
     VkDescriptorSetLayout fs_int_dsl = VK_NULL_HANDLE;
 
-    // Persistent H20 HBM3 rasterization buffers
     VkBuffer clip_vert_buf = VK_NULL_HANDLE;   VkDeviceMemory clip_vert_mem = VK_NULL_HANDLE;
     VkBuffer tri_setup_buf = VK_NULL_HANDLE;   VkDeviceMemory tri_setup_mem = VK_NULL_HANDLE;
+    uint32_t cap_verts = 0;
+    uint32_t cap_tris  = 0;
+
     VkBuffer tile_count_buf = VK_NULL_HANDLE;  VkDeviceMemory tile_count_mem = VK_NULL_HANDLE;
     VkBuffer tile_bins_buf = VK_NULL_HANDLE;   VkDeviceMemory tile_bins_mem = VK_NULL_HANDLE;
     VkBuffer vis_buf = VK_NULL_HANDLE;         VkDeviceMemory vis_mem = VK_NULL_HANDLE;
+    VkBuffer ind_disp_buf = VK_NULL_HANDLE;    VkDeviceMemory ind_disp_mem = VK_NULL_HANDLE;
     VkBuffer dummy_buf = VK_NULL_HANDLE;       VkDeviceMemory dummy_mem = VK_NULL_HANDLE;
 
-    // Ring buffer of host-visible Draw UBOs + per-slot Descriptor Sets (zero cross-pass hazards!)
     static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 1024;
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
     VkBuffer fs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory fs_ubo_mem = VK_NULL_HANDLE; void* fs_ubo_ptr = nullptr;
+    VkBuffer clr_ubo_buf = VK_NULL_HANDLE;     VkDeviceMemory clr_ubo_mem = VK_NULL_HANDLE; void* clr_ubo_ptr = nullptr;
 
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
-    std::vector<VkDescriptorSet> clear_ds;  // ring [MAX_DRAWS_IN_FLIGHT]
-    std::vector<VkDescriptorSet> bin_ds;    // ring [MAX_DRAWS_IN_FLIGHT]
-    std::vector<VkDescriptorSet> fine_ds;   // ring [MAX_DRAWS_IN_FLIGHT]
-    std::vector<VkDescriptorSet> vs_int_ds; // ring [MAX_DRAWS_IN_FLIGHT]
-    std::vector<VkDescriptorSet> fs_int_ds; // ring [MAX_DRAWS_IN_FLIGHT]
+    std::vector<VkDescriptorSet> clear_ds;
+    std::vector<VkDescriptorSet> bin_ds;
+    std::vector<VkDescriptorSet> fine_ds;
+    std::vector<VkDescriptorSet> ind_prep_ds;
+    std::vector<VkDescriptorSet> vs_int_ds;
+    std::vector<VkDescriptorSet> fs_int_ds;
     uint32_t draw_cursor = 0;
 
     uint32_t cur_w = 0, cur_h = 0;
     uint32_t tiles_x = 0, tiles_y = 0;
-};
-
-struct alignas(256) SmVsParamsUBO {
-    uint32_t vertex_count;     // total = verts_per_instance * instance_count
-    uint32_t first_vertex;
-    uint32_t instance_idx;     // first_instance
-    uint32_t indexed;          // 0=non-indexed, 1=uint16, 2=uint32
-    uint32_t first_index;
-    int32_t  vertex_offset;
-    uint32_t vert_stride_vec4;
-    uint32_t idx_buf_offset;
-    uint32_t vtx_offsets[4];
-    uint32_t vtx_strides[4];
-    uint32_t verts_per_instance;
-    uint32_t vtx_inst_rate_mask; // bit b = 1 if binding b is VK_VERTEX_INPUT_RATE_INSTANCE
-    uint32_t pad0;
-    uint32_t pad1;
-};
-
-struct alignas(256) SmFsParamsUBO {
-    uint32_t width;
-    uint32_t height;
-    uint32_t vert_stride_vec4;
-    uint32_t format_flags;   // bit0=bgra, bit1=srgb
-    uint32_t depth_write;
-    uint32_t blend_enable;
-    uint32_t src_blend;
-    uint32_t dst_blend;
-    uint32_t blend_op;
-    uint32_t pad[3];
 };
 
 struct SmQueue {
@@ -369,12 +415,12 @@ struct SmCommandBuffer {
     SmDevice* dev = nullptr;
     VkCommandBuffer real_cb = VK_NULL_HANDLE;
 
-    // Active recorded graphics state
     bool in_render_pass = false;
     bool in_dyn_rendering = false;
     SmRenderPass* cur_rp = nullptr;
     SmFramebuffer* cur_fb = nullptr;
-    SmImage* dyn_col_img = nullptr;
+    SmImage* dyn_col_imgs[SM_MAX_MRT] = {nullptr, nullptr, nullptr, nullptr};
+    uint32_t dyn_col_count = 0;
     SmImage* dyn_dep_img = nullptr;
     uint32_t dyn_w = 0, dyn_h = 0;
     SmPipeline* cur_gfx_pipe = nullptr;
@@ -385,7 +431,6 @@ struct SmCommandBuffer {
     bool has_vp = false;
     bool has_scissor = false;
 
-    // Extended Dynamic State overrides (VK_EXT_extended_dynamic_state / Vulkan 1.3)
     bool has_dyn_cull = false;        VkCullModeFlags dyn_cull = VK_CULL_MODE_NONE;
     bool has_dyn_front_face = false;  VkFrontFace dyn_front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool has_dyn_topo = false;        VkPrimitiveTopology dyn_topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -393,16 +438,13 @@ struct SmCommandBuffer {
     bool has_dyn_depth_write = false; bool dyn_depth_write = false;
     bool has_dyn_depth_op = false;    VkCompareOp dyn_depth_op = VK_COMPARE_OP_LESS;
 
-    // Bound app descriptor sets for GRAPHICS point (+ dynamic buffer offsets!)
     VkDescriptorSet gfx_sets[16] = {VK_NULL_HANDLE};
     uint32_t gfx_set_mask = 0;
     uint32_t gfx_dyn_counts[16] = {0};
     uint32_t gfx_dyn_offs[16][8] = {{0}};
-    // Bound push constants
     uint8_t push_data[256] = {0};
     uint32_t push_size = 0;
 
-    // Bound vertex & index buffers
     SmBuffer* vtx_bufs[SM_MAX_VTX_BINDINGS] = {nullptr};
     VkDeviceSize vtx_offsets[SM_MAX_VTX_BINDINGS] = {0};
     uint32_t dyn_vtx_strides[SM_MAX_VTX_BINDINGS] = {0};
@@ -412,26 +454,25 @@ struct SmCommandBuffer {
     VkIndexType idx_type = VK_INDEX_TYPE_UINT32;
 };
 
-// -----------------------------------------------------------------------------
-// Helper functions implemented across translation units
-// -----------------------------------------------------------------------------
 uint32_t sm_find_mem_type(SmPhysicalDevice* pd, uint32_t bits, VkMemoryPropertyFlags req);
 bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img);
+bool sm_ensure_geom_capacity(SmDevice* dev, uint32_t need_verts, uint32_t need_tris);
 bool sm_init_raster_engine(SmDevice* dev);
 void sm_destroy_raster_engine(SmDevice* dev);
 bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h);
 
-// spirv_lower.cpp
 bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            const SmVertexInputState& vtx_in,
+                           const VkSpecializationInfo* spec,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
                            std::string& err);
 
 bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
+                             const VkSpecializationInfo* spec,
                              uint32_t sm_set_idx,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err);
 
-// smrast_wsi.cpp
 void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img);
+void sm_wsi_cleanup_swapchain(SmSwapchain* sc);
