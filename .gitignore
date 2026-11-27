@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.spv
+*.exe
+*.ppm
+*.log
+*.b64
+
+# Editor & OS files
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

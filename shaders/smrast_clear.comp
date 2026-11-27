@@ -1,0 +1,26 @@
+#version 460
+// smrast_clear.comp — GPU Compute Attachment Clear (Color + Depth + 64-bit Visibility Buffer)
+#extension GL_ARB_gpu_shader_int64 : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) buffer ColorBuf { uint color_px[]; };
+layout(std430, set = 0, binding = 1) buffer DepthBuf { float depth_px[]; };
+layout(std430, set = 0, binding = 2) buffer VisBuf   { uint64_t vis_px[]; };
+
+layout(push_constant) uniform ClearParams {
+    uint width;
+    uint height;
+    uint clear_mask; // bit0=color, bit1=depth, bit2=vis
+    uint clear_rgba; // packed RGBA8 / BGRA8
+    float clear_depth;
+} pc;
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    uint idx = p.y * pc.width + p.x;
+    if ((pc.clear_mask & 1u) != 0u) color_px[idx] = pc.clear_rgba;
+    if ((pc.clear_mask & 2u) != 0u) depth_px[idx] = pc.clear_depth;
+    if ((pc.clear_mask & 4u) != 0u) vis_px[idx]   = 0xFFFFFFFFFFFFFFFFul;
+}

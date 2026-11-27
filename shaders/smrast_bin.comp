@@ -1,0 +1,272 @@
+#version 460
+// smrast_bin.comp — SmRast-VK v0.2:
+//   - Hybrid CUDARaster (16x16 Coarse Tile Binning) + CuRast (<=64 px Micro-Triangle 64-bit Atomic Fast-Path)
+//   - Exact Sutherland-Hodgman Near-Plane (z >= 0) Triangle Clipping (1->1 or 1->2 clipped triangles)
+//   - TRIANGLE_LIST / TRIANGLE_STRIP / TRIANGLE_FAN + Single-Dispatch GPU Instancing
+// Runs 100% on VK_QUEUE_COMPUTE_BIT (H20 78 SMs / H100 / MI300X — zero hardware rasterizer or ROP!)
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+layout(local_size_x = 64) in;
+
+struct TriSetup {
+    vec4 v0;     // sx, sy, ndc_z, inv_w
+    vec4 v1;     // sx, sy, ndc_z, inv_w
+    vec4 v2;     // sx, sy, ndc_z, inv_w
+    vec4 area;   // inv_area, minx, miny, maxx
+    uvec4 idx;   // i0, i1, i2, maxy
+};
+
+layout(std430, set = 0, binding = 0) buffer ClipVertBuf       { vec4 clip_verts[]; };
+layout(std430, set = 0, binding = 1) buffer TriSetupBuf       { TriSetup tris[]; };
+layout(std430, set = 0, binding = 2) buffer TileCountBuf      { uint tile_counts[]; };
+layout(std430, set = 0, binding = 3) buffer TileBinsBuf       { uint tile_bins[]; };
+layout(std430, set = 0, binding = 4) buffer VisBuf            { uint64_t vis_px[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DepthBuf { float depth_px[]; };
+
+layout(push_constant) uniform BinParams {
+    uint tri_count;         // total tris = tris_per_inst * instance_count
+    uint vert_stride_vec4;  // 1 + max_varyings
+    uint width;
+    uint height;
+    uint tiles_x;
+    uint tiles_y;
+    uint max_tris_per_tile;
+    uint flags;             // bit0=cull_back, bit1=cull_front, bit2=front_cw, bit3=depth_test, bits4..6=depth_op, bits8..9=topo
+    float vp_x;
+    float vp_y;
+    float vp_w;
+    float vp_h;
+    float vp_min_d;
+    float vp_max_d;
+    int sc_x0;
+    int sc_y0;
+    int sc_x1;
+    int sc_y1;
+    uint tris_per_inst;
+    uint verts_per_inst;
+    uint extra_vert_base;
+    uint extra_tri_base;
+} pc;
+
+bool depth_pass(float d, float ref_d, uint op) {
+    if (op == 0u) return false;       // NEVER
+    if (op == 1u) return d < ref_d;   // LESS
+    if (op == 2u) return d == ref_d;  // EQUAL
+    if (op == 3u) return d <= ref_d;  // LESS_OR_EQUAL
+    if (op == 4u) return d > ref_d;   // GREATER
+    if (op == 5u) return d != ref_d;  // NOT_EQUAL
+    if (op == 6u) return d >= ref_d;  // GREATER_OR_EQUAL
+    return true;                      // ALWAYS
+}
+
+// Interpolate all clip-space vertex attributes between vertex ia and ib at factor t, write to dst_idx
+void emit_interp_vert(uint dst_idx, uint ia, uint ib, float t) {
+    uint base_d = dst_idx * pc.vert_stride_vec4;
+    uint base_a = ia * pc.vert_stride_vec4;
+    uint base_b = ib * pc.vert_stride_vec4;
+    for (uint k = 0u; k < pc.vert_stride_vec4; ++k) {
+        clip_verts[base_d + k] = mix(clip_verts[base_a + k], clip_verts[base_b + k], t);
+    }
+}
+
+void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2) {
+    if (c0.w <= 1e-6 || c1.w <= 1e-6 || c2.w <= 1e-6) return;
+
+    // Frustum guard rejection
+    if ((c0.x < -c0.w && c1.x < -c1.w && c2.x < -c2.w) ||
+        (c0.x >  c0.w && c1.x >  c1.w && c2.x >  c2.w) ||
+        (c0.y < -c0.w && c1.y < -c1.w && c2.y < -c2.w) ||
+        (c0.y >  c0.w && c1.y >  c1.w && c2.y >  c2.w) ||
+        (c0.z >  c0.w && c1.z >  c1.w && c2.z >  c2.w)) return;
+
+    float invw0 = 1.0 / c0.w;
+    float invw1 = 1.0 / c1.w;
+    float invw2 = 1.0 / c2.w;
+
+    vec2 s0 = vec2(pc.vp_x + (c0.x * invw0 * 0.5 + 0.5) * pc.vp_w,
+                   pc.vp_y + (c0.y * invw0 * 0.5 + 0.5) * pc.vp_h);
+    vec2 s1 = vec2(pc.vp_x + (c1.x * invw1 * 0.5 + 0.5) * pc.vp_w,
+                   pc.vp_y + (c1.y * invw1 * 0.5 + 0.5) * pc.vp_h);
+    vec2 s2 = vec2(pc.vp_x + (c2.x * invw2 * 0.5 + 0.5) * pc.vp_w,
+                   pc.vp_y + (c2.y * invw2 * 0.5 + 0.5) * pc.vp_h);
+
+    float z0 = pc.vp_min_d + (c0.z * invw0) * (pc.vp_max_d - pc.vp_min_d);
+    float z1 = pc.vp_min_d + (c1.z * invw1) * (pc.vp_max_d - pc.vp_min_d);
+    float z2 = pc.vp_min_d + (c2.z * invw2) * (pc.vp_max_d - pc.vp_min_d);
+
+    float area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x);
+    if (abs(area) < 1e-5) return;
+
+    bool front_cw = (pc.flags & 4u) != 0u;
+    bool is_front = front_cw ? (area > 0.0) : (area < 0.0);
+    bool cull_back  = (pc.flags & 1u) != 0u;
+    bool cull_front = (pc.flags & 2u) != 0u;
+    if ((cull_back && !is_front) || (cull_front && is_front)) return;
+
+    // Normalize winding so edge functions are positive inside (area > 0)
+    if (area < 0.0) {
+        vec2 ts = s1; s1 = s2; s2 = ts;
+        float tz = z1; z1 = z2; z2 = tz;
+        float tw = invw1; invw1 = invw2; invw2 = tw;
+        uint ti = i1; i1 = i2; i2 = ti;
+        area = -area;
+    }
+
+    int minx = max(pc.sc_x0, int(floor(min(s0.x, min(s1.x, s2.x)))));
+    int miny = max(pc.sc_y0, int(floor(min(s0.y, min(s1.y, s2.y)))));
+    int maxx = min(pc.sc_x1 - 1, int(ceil(max(s0.x, max(s1.x, s2.x)))));
+    int maxy = min(pc.sc_y1 - 1, int(ceil(max(s0.y, max(s1.y, s2.y)))));
+    if (minx > maxx || miny > maxy) return;
+
+    float inv_area = 1.0 / area;
+
+    TriSetup ts;
+    ts.v0   = vec4(s0, z0, invw0);
+    ts.v1   = vec4(s1, z1, invw1);
+    ts.v2   = vec4(s2, z2, invw2);
+    ts.area = vec4(inv_area, float(minx), float(miny), float(maxx));
+    ts.idx  = uvec4(i0, i1, i2, uint(maxy));
+    tris[tid] = ts;
+
+    int bw = maxx - minx + 1;
+    int bh = maxy - miny + 1;
+
+    // CuRast / Nanite Micro-Triangle Fast-Path (bbox <= 64 pixels -> direct lock-free 64-bit atomicMin!)
+    if (bw * bh <= 64) {
+        bool dtest = (pc.flags & 8u) != 0u;
+        uint dop = (pc.flags >> 4u) & 7u;
+        bool greater_wins = (dop == 4u || dop == 6u);
+        for (int py = miny; py <= maxy; ++py) {
+            float fy = float(py) + 0.5;
+            for (int px = minx; px <= maxx; ++px) {
+                float fx = float(px) + 0.5;
+                float e0 = (s2.x - s1.x) * (fy - s1.y) - (s2.y - s1.y) * (fx - s1.x);
+                float e1 = (s0.x - s2.x) * (fy - s2.y) - (s0.y - s2.y) * (fx - s2.x);
+                float e2 = (s1.x - s0.x) * (fy - s0.y) - (s1.y - s0.y) * (fx - s0.x);
+                if (e0 < 0.0 || e1 < 0.0 || e2 < 0.0) continue;
+                float l0 = e0 * inv_area;
+                float l1 = e1 * inv_area;
+                float l2 = 1.0 - l0 - l1;
+                float d = clamp(l0 * z0 + l1 * z1 + l2 * z2, 0.0, 1.0);
+                uint pidx = uint(py) * pc.width + uint(px);
+                if (dtest && !depth_pass(d, depth_px[pidx], dop)) continue;
+                uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
+                uint64_t packed = (uint64_t(d_u32) << 32) | uint64_t(tid);
+                atomicMin(vis_px[pidx], packed);
+            }
+        }
+        return;
+    }
+
+    // CUDARaster / RetroWarp Coarse 16x16 Tile Binning for Large Triangles
+    uint tx0 = uint(minx) >> 4u;
+    uint ty0 = uint(miny) >> 4u;
+    uint tx1 = min(pc.tiles_x - 1u, uint(maxx) >> 4u);
+    uint ty1 = min(pc.tiles_y - 1u, uint(maxy) >> 4u);
+
+    for (uint ty = ty0; ty <= ty1; ++ty) {
+        for (uint tx = tx0; tx <= tx1; ++tx) {
+            uint tile_id = ty * pc.tiles_x + tx;
+            uint slot = atomicAdd(tile_counts[tile_id], 1u);
+            if (slot < pc.max_tris_per_tile) {
+                tile_bins[tile_id * pc.max_tris_per_tile + slot] = tid;
+            }
+        }
+    }
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= pc.tri_count) return;
+
+    uint inst_local = tid / pc.tris_per_inst;
+    uint tri_local  = tid - inst_local * pc.tris_per_inst;
+    uint vbase      = inst_local * pc.verts_per_inst;
+
+    uint topo = (pc.flags >> 8u) & 3u;
+    uint i0, i1, i2;
+    if (topo == 0u) {
+        // TRIANGLE_LIST
+        i0 = vbase + tri_local * 3u + 0u;
+        i1 = vbase + tri_local * 3u + 1u;
+        i2 = vbase + tri_local * 3u + 2u;
+    } else if (topo == 1u) {
+        // TRIANGLE_STRIP (flip winding on odd triangles)
+        if ((tri_local & 1u) == 0u) {
+            i0 = vbase + tri_local;
+            i1 = vbase + tri_local + 1u;
+            i2 = vbase + tri_local + 2u;
+        } else {
+            i0 = vbase + tri_local + 1u;
+            i1 = vbase + tri_local;
+            i2 = vbase + tri_local + 2u;
+        }
+    } else {
+        // TRIANGLE_FAN
+        i0 = vbase;
+        i1 = vbase + tri_local + 1u;
+        i2 = vbase + tri_local + 2u;
+    }
+
+    vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
+    vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
+    vec4 c2 = clip_verts[i2 * pc.vert_stride_vec4];
+
+    // Near-plane clipping against z >= 0 (Vulkan NDC [0, 1]) & w > 1e-5
+    // Signed distance from near plane: d = c.z (inside iff c.z >= 0 && c.w > 1e-5)
+    bool in0 = (c0.z >= 0.0 && c0.w > 1e-5);
+    bool in1 = (c1.z >= 0.0 && c1.w > 1e-5);
+    bool in2 = (c2.z >= 0.0 && c2.w > 1e-5);
+
+    if (in0 && in1 && in2) {
+        process_tri(tid, i0, i1, i2, c0, c1, c2);
+        return;
+    }
+    if (!in0 && !in1 && !in2) return;
+
+    // Sutherland-Hodgman clip against z = 0 (preserves exact winding!)
+    uint meta_idx = pc.tiles_x * pc.tiles_y;
+    uint v_in[4];
+    vec4 p_in[4];
+    uint in_ids[3] = uint[3](i0, i1, i2);
+    vec4 in_pos[3] = vec4[3](c0, c1, c2);
+    bool inside[3] = bool[3](in0, in1, in2);
+
+    uint n_out = 0u;
+    for (uint e = 0u; e < 3u; ++e) {
+        uint ne = (e + 1u) % 3u;
+        bool a_in = inside[e];
+        bool b_in = inside[ne];
+        if (a_in) {
+            v_in[n_out] = in_ids[e];
+            p_in[n_out] = in_pos[e];
+            n_out++;
+        }
+        if (a_in != b_in) {
+            float da = in_pos[e].z;
+            float db = in_pos[ne].z;
+            float t = clamp(da / (da - db), 0.0, 1.0);
+            uint vslot = atomicAdd(tile_counts[meta_idx], 1u);
+            if (vslot >= 900000u) return;
+            uint nv = pc.extra_vert_base + vslot;
+            emit_interp_vert(nv, in_ids[e], in_ids[ne], t);
+            vec4 np = mix(in_pos[e], in_pos[ne], t);
+            np.z = max(np.z, 0.0);
+            clip_verts[nv * pc.vert_stride_vec4] = np;
+            v_in[n_out] = nv;
+            p_in[n_out] = np;
+            n_out++;
+        }
+    }
+
+    if (n_out >= 3u) {
+        process_tri(tid, v_in[0], v_in[1], v_in[2], p_in[0], p_in[1], p_in[2]);
+    }
+    if (n_out == 4u) {
+        uint tslot = atomicAdd(tile_counts[meta_idx + 1u], 1u);
+        if (tslot < 390000u) {
+            process_tri(pc.extra_tri_base + tslot, v_in[0], v_in[2], v_in[3], p_in[0], p_in[2], p_in[3]);
+        }
+    }
+}
