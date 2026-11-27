@@ -917,10 +917,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateBuffer(VkDevice d, const VkBuffer
     *out = to_h<VkBuffer>(sb);
     return VK_SUCCESS;
 }
+static inline void sm_invalidate_ds_caches(SmDevice* dev) {
+    std::lock_guard<std::mutex> lk(dev->mtx);
+    dev->rast.vs_ds_cache.clear();
+    dev->rast.fs_ds_cache.clear();
+    dev->rast.bin_ds_cache.clear();
+    dev->rast.fine_ds_cache.clear();
+    dev->rast.dep_ds_cache.clear();
+    dev->rast.hiz_ds_cache.clear();
+}
+static inline uint64_t sm_hash_bufs(const VkBuffer* b, uint32_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t v = (uint64_t)(uintptr_t)b[i];
+        h ^= v; h *= 1099511628211ULL;
+        h ^= (v >> 32); h *= 1099511628211ULL;
+    }
+    return h;
+}
 static VKAPI_ATTR void VKAPI_CALL sm_DestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks*) {
     if (!b) return;
+    auto* dev = reinterpret_cast<SmDevice*>(d);
     auto* sb = from_h<SmBuffer>(b);
-    reinterpret_cast<SmDevice*>(d)->fn.DestroyBuffer(reinterpret_cast<SmDevice*>(d)->real_dev, sb->real_buf, nullptr);
+    sm_invalidate_ds_caches(dev);
+    dev->fn.DestroyBuffer(dev->real_dev, sb->real_buf, nullptr);
     delete sb;
 }
 static VKAPI_ATTR void VKAPI_CALL sm_GetBufferMemoryRequirements(VkDevice d, VkBuffer b, VkMemoryRequirements* mr) {
@@ -995,7 +1015,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_DestroyImage(VkDevice d, VkImage i, const V
         auto& v = dev->storage_images;
         v.erase(std::remove(v.begin(), v.end(), si), v.end());
     }
+    if (si->attach_buf || si->hiz_buf || si->stencil_buf) sm_invalidate_ds_caches(dev);
     if (si->attach_buf)       { dev->fn.DestroyBuffer(dev->real_dev, si->attach_buf, nullptr);  dev->fn.FreeMemory(dev->real_dev, si->attach_mem, nullptr); }
+    if (si->hiz_buf)          { dev->fn.DestroyBuffer(dev->real_dev, si->hiz_buf, nullptr);     dev->fn.FreeMemory(dev->real_dev, si->hiz_mem, nullptr); }
     if (si->stencil_buf)      { dev->fn.DestroyBuffer(dev->real_dev, si->stencil_buf, nullptr); dev->fn.FreeMemory(dev->real_dev, si->stencil_mem, nullptr); }
     if (si->real_stencil_img) { dev->fn.DestroyImage(dev->real_dev, si->real_stencil_img, nullptr); dev->fn.FreeMemory(dev->real_dev, si->real_stencil_mem, nullptr); }
     if (si->host_buf)         { dev->fn.DestroyBuffer(dev->real_dev, si->host_buf, nullptr);    dev->fn.FreeMemory(dev->real_dev, si->host_mem, nullptr); }
@@ -1306,10 +1328,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
                 }
             }
         }
-        if (gci.pInputAssemblyState) sp->topology = gci.pInputAssemblyState->topology;
+        if (gci.pInputAssemblyState) {
+            sp->topology     = gci.pInputAssemblyState->topology;
+            sp->prim_restart = (gci.pInputAssemblyState->primitiveRestartEnable == VK_TRUE);
+        }
         if (gci.pRasterizationState) {
             sp->cull_mode          = gci.pRasterizationState->cullMode;
             sp->front_face         = gci.pRasterizationState->frontFace;
+            sp->line_width         = std::max(1.0f, gci.pRasterizationState->lineWidth);
             sp->depth_clamp        = (gci.pRasterizationState->depthClampEnable == VK_TRUE);
             sp->rasterizer_discard = (gci.pRasterizationState->rasterizerDiscardEnable == VK_TRUE);
             sp->depth_bias_enable  = (gci.pRasterizationState->depthBiasEnable == VK_TRUE);
@@ -1392,7 +1418,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateGraphicsPipelines(
         if (vs_spv_ptr) {
             std::vector<uint32_t> vs_comp_spv;
             std::string err;
-            if (!sm_lower_vertex_spirv(*vs_spv_ptr, sp->vtx_input, vs_spec, sp->layout->sm_set_index, vs_comp_spv, err)) {
+            if (!sm_lower_vertex_spirv(*vs_spv_ptr, sp->vtx_input, vs_spec, sp->layout->sm_set_index, vs_comp_spv, err, &sp->vs_writes_point_size)) {
                 fprintf(stderr, "[SmRast] VS lowering failed: %s\n", err.c_str());
                 ok = false;
             } else {
@@ -1554,6 +1580,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BeginCommandBuffer(VkCommandBuffer cb, 
     scb->has_dyn_depth_bias = false;
     scb->has_dyn_depth_bias_en = false;
     scb->has_dyn_rast_discard = false;
+    scb->has_dyn_prim_restart = false;
+    scb->has_dyn_line_width = false;
     scb->has_dyn_blend_const = false;
     scb->has_dyn_stencil_test = false;
     for (int f = 0; f < 2; ++f) {
@@ -2047,6 +2075,32 @@ static void emit_compute_barrier(SmCommandBuffer* scb) {
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 1, &mb, 0, nullptr, 0, nullptr);
 }
+static void emit_pure_compute_barrier(SmCommandBuffer* scb) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                       VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    scb->dev->fn.CmdPipelineBarrier(scb->real_cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+static void emit_bin_to_indirect_barrier(SmCommandBuffer* scb) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                       VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+    scb->dev->fn.CmdPipelineBarrier(scb->real_cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+static void emit_draw_end_barrier(SmCommandBuffer* scb) {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                       VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    scb->dev->fn.CmdPipelineBarrier(scb->real_cb,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+}
 
 static uint16_t f32_to_f16(float f) {
     uint32_t x; memcpy(&x, &f, 4);
@@ -2148,10 +2202,20 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
             if (clear_mask & (1u << i)) col_imgs[i]->attach_dirty = true;
         }
     }
+    uint32_t clr_tx = (W + 15u) / 16u;
+    uint32_t clr_ty = (H + 15u) / 16u;
     if (dep_img) {
         sm_ensure_image_attach_buf(dev, dep_img);
         if (dep_img->has_stencil) sm_ensure_image_stencil_buf(dev, dep_img);
-        if (clear_mask & 256u)  dep_img->attach_dirty = true;
+        if (clear_mask & 256u) {
+            dep_img->attach_dirty = true;
+            if (dep_img->hiz_buf) {
+                dep_img->hiz_valid = true;
+                dep_img->hiz_has_occluders = false;
+                dep_img->hiz_tx = clr_tx;
+                dep_img->hiz_ty = clr_ty;
+            }
+        }
         if (clear_mask & 1024u) dep_img->stencil_dirty = true;
     }
 
@@ -2167,13 +2231,15 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
         cubo->clear_mask = clear_mask;
         cubo->clear_depth = clear_depth;
         cubo->clear_stencil = clear_stencil & 0xFFu;
-        cubo->pad0 = cubo->pad1 = cubo->pad2 = 0u;
+        cubo->tiles_x = clr_tx;
+        cubo->tiles_y = clr_ty;
+        cubo->hiz_en  = (dep_img && dep_img->hiz_buf) ? 1u : 0u;
         for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
             cubo->rt_bpp_code[i] = col_imgs[i] ? sm_format_bpp_code(col_imgs[i]->format) : 0u;
             for (uint32_t k = 0; k < 4; ++k) cubo->rt_clear[i][k] = clear_words[i][k];
         }
 
-        VkDescriptorBufferInfo bi[12];
+        VkDescriptorBufferInfo bi[14];
         for (uint32_t i = 0; i < SM_MAX_MRT; ++i) {
             bi[i] = {col_imgs[i] ? col_imgs[i]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
         }
@@ -2181,12 +2247,14 @@ static void sm_begin_pass_clear_mrt(SmCommandBuffer* scb, SmImage* col_imgs[SM_M
         bi[9]  = {dev->rast.vis_buf, 0, VK_WHOLE_SIZE};
         bi[10] = {(dep_img && dep_img->stencil_buf) ? dep_img->stencil_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
         bi[11] = {dev->rast.clr_ubo_buf, cslot * sizeof(SmClearUBO), sizeof(SmClearUBO)};
-        VkWriteDescriptorSet ws[12];
-        for (uint32_t i = 0; i < 12; ++i) {
+        bi[12] = {(dep_img && dep_img->hiz_buf) ? dep_img->hiz_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
+        bi[13] = {dev->rast.tile_count_buf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet ws[14];
+        for (uint32_t i = 0; i < 14; ++i) {
             ws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.clear_ds[cslot], i, 0, 1,
                      (i == 11) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[i]};
         }
-        dev->fn.UpdateDescriptorSets(dev->real_dev, 12, ws, 0, nullptr);
+        dev->fn.UpdateDescriptorSets(dev->real_dev, 14, ws, 0, nullptr);
     }
 
     dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.clear_pipe);
@@ -2221,6 +2289,7 @@ static void sm_sync_image_to_attach(SmCommandBuffer* scb, SmImage* img, VkImageL
     img->attach_dirty = true;
     img->attach_mip = (int32_t)mip;
     img->attach_layer = (int32_t)layer;
+    if (img->is_depth) img->hiz_valid = false;
 }
 
 static void sm_sync_attach_to_image(SmCommandBuffer* scb, SmImage* img, VkImageLayout target_layout, uint32_t mip, uint32_t layer) {
@@ -2610,7 +2679,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     if (!pipe || !pipe->vs_comp_pipe) return;
     bool eff_rast_discard = scb->has_dyn_rast_discard ? scb->dyn_rast_discard : pipe->rasterizer_discard;
     if (eff_rast_discard) return;
-    if (!is_indirect && (vert_or_idx_count < 3 || instance_count == 0)) return;
+    if (!is_indirect && (vert_or_idx_count == 0 || instance_count == 0)) return;
 
     SmImage* col_imgs[SM_MAX_MRT] = {nullptr};
     SmImage* dep_img = nullptr;
@@ -2635,14 +2704,32 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
 
     VkPrimitiveTopology eff_topo = scb->has_dyn_topo ? scb->dyn_topo : pipe->topology;
     uint32_t topo_code = 0;
-    uint32_t tris_per_inst = 1, verts_per_inst = 3, total_verts = 0, total_tris = 0;
+    uint32_t tris_per_inst = 0, verts_per_inst = 0, total_verts = 0, total_tris = 0;
+    if (eff_topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) topo_code = 1;
+    else if (eff_topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) topo_code = 2;
+    else if (eff_topo == VK_PRIMITIVE_TOPOLOGY_LINE_LIST) topo_code = 3;
+    else if (eff_topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) topo_code = 4;
+    else if (eff_topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST) topo_code = 5;
     if (!is_indirect) {
-        tris_per_inst = vert_or_idx_count / 3;
-        verts_per_inst = tris_per_inst * 3;
-        if (eff_topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
-            topo_code = 1; tris_per_inst = vert_or_idx_count - 2; verts_per_inst = vert_or_idx_count;
-        } else if (eff_topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
-            topo_code = 2; tris_per_inst = vert_or_idx_count - 2; verts_per_inst = vert_or_idx_count;
+        if (topo_code == 0) {
+            if (vert_or_idx_count < 3) return;
+            tris_per_inst = vert_or_idx_count / 3;
+            verts_per_inst = tris_per_inst * 3;
+        } else if (topo_code == 1 || topo_code == 2) {
+            if (vert_or_idx_count < 3) return;
+            tris_per_inst = vert_or_idx_count - 2;
+            verts_per_inst = vert_or_idx_count;
+        } else if (topo_code == 3) {
+            if (vert_or_idx_count < 2) return;
+            tris_per_inst = vert_or_idx_count / 2;
+            verts_per_inst = tris_per_inst * 2;
+        } else if (topo_code == 4) {
+            if (vert_or_idx_count < 2) return;
+            tris_per_inst = vert_or_idx_count - 1;
+            verts_per_inst = vert_or_idx_count;
+        } else { // POINT_LIST
+            tris_per_inst = vert_or_idx_count;
+            verts_per_inst = vert_or_idx_count;
         }
         if (tris_per_inst == 0) return;
         uint32_t max_inst_v = SM_MAX_DRAW_VERTS / verts_per_inst;
@@ -2650,9 +2737,6 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         uint32_t eff_inst = std::min(instance_count, std::max(1u, std::min(max_inst_v, max_inst_t)));
         total_verts = std::min(verts_per_inst * eff_inst, SM_MAX_DRAW_VERTS);
         total_tris  = std::min(tris_per_inst  * eff_inst, SM_MAX_DRAW_TRIS);
-    } else {
-        if (eff_topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) topo_code = 1;
-        else if (eff_topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) topo_code = 2;
     }
 
     uint32_t tx = (W + 15) / 16, ty = (H + 15) / 16;
@@ -2686,8 +2770,18 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     float eff_dbias_const    = scb->has_dyn_depth_bias ? scb->dyn_depth_bias_const : pipe->depth_bias_const;
     float eff_dbias_clamp    = scb->has_dyn_depth_bias ? scb->dyn_depth_bias_clamp : pipe->depth_bias_clamp;
     float eff_dbias_slope    = scb->has_dyn_depth_bias ? scb->dyn_depth_bias_slope : pipe->depth_bias_slope;
+    bool eff_prim_restart    = scb->has_dyn_prim_restart ? scb->dyn_prim_restart : pipe->prim_restart;
+    float eff_line_width     = scb->has_dyn_line_width ? scb->dyn_line_width : pipe->line_width;
+    if (!pipe->fs_comp_pipe && (!eff_dwrite || dep_img == nullptr)) return; // No-op draw keeps VisBuf untouched!
     if (eff_stest && dep_img && dep_img->has_stencil) dep_img->stencil_dirty = true;
     if (eff_dwrite && dep_img) dep_img->attach_dirty = true;
+    bool can_use_hiz = (dep_img != nullptr && dep_img->hiz_valid && dep_img->hiz_buf != VK_NULL_HANDLE &&
+                        dep_img->hiz_tx == tx && dep_img->hiz_ty == ty);
+    bool use_prebin_hiz = can_use_hiz && dep_img->hiz_has_occluders && eff_dtest &&
+                          (eff_dop == VK_COMPARE_OP_LESS || eff_dop == VK_COMPARE_OP_LESS_OR_EQUAL ||
+                           eff_dop == VK_COMPARE_OP_GREATER || eff_dop == VK_COMPARE_OP_GREATER_OR_EQUAL);
+    bool direct_2d = (!is_indirect && total_tris >= 65536u);
+    VkBuffer hiz_buf = can_use_hiz ? dep_img->hiz_buf : dev->rast.dummy_buf;
     VkStencilOpState eff_sf  = pipe->stencil_front;
     VkStencilOpState eff_sb  = pipe->stencil_back;
     if (scb->has_dyn_stencil_op[0])    { eff_sf.failOp = scb->dyn_stencil_fail[0]; eff_sf.passOp = scb->dyn_stencil_pass[0]; eff_sf.depthFailOp = scb->dyn_stencil_dfail[0]; eff_sf.compareOp = scb->dyn_stencil_cmp[0]; }
@@ -2706,6 +2800,9 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
 
     uint32_t slot = 0, islot = 0;
     uint32_t extra_v_base = 0, extra_t_base = 0;
+    VkDescriptorSet cur_vs_ds = VK_NULL_HANDLE, cur_fs_ds = VK_NULL_HANDLE;
+    VkDescriptorSet cur_bin_ds = VK_NULL_HANDLE, cur_fine_ds = VK_NULL_HANDLE;
+    VkDescriptorSet cur_dep_ds = VK_NULL_HANDLE, cur_hiz_ds = VK_NULL_HANDLE;
     {
         std::lock_guard<std::mutex> lk(dev->mtx);
         // On-demand geometry buffer growth (keeps startup <15ms while supporting 2M+ tris!)
@@ -2733,6 +2830,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         vs_ubo->idx_buf_offset = (uint32_t)scb->idx_offset;
         vs_ubo->verts_per_instance = verts_per_inst;
         vs_ubo->vtx_inst_rate_mask = 0;
+        vs_ubo->prim_restart_en    = (indexed && eff_prim_restart) ? 1u : 0u;
+        vs_ubo->pad1               = 0u;
         for (uint32_t b = 0; b < SM_MAX_VTX_BINDINGS; ++b) {
             uint32_t off = (uint32_t)scb->vtx_offsets[b];
             uint32_t st  = 16;
@@ -2758,7 +2857,9 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         fs_ubo->stencil_front_cfg = sm_pack_stencil_cfg(eff_sf);
         fs_ubo->stencil_back_cfg  = sm_pack_stencil_cfg(eff_sb);
         fs_ubo->stencil_refs = (eff_sf.reference & 0xFFu) | ((eff_sb.reference & 0xFFu) << 8u);
-        fs_ubo->pad0 = fs_ubo->pad1 = fs_ubo->pad2 = 0u;
+        fs_ubo->tiles_x = tx;
+        fs_ubo->direct_2d = direct_2d ? 1u : 0u;
+        fs_ubo->pad2 = 0u;
         for (int k = 0; k < 4; ++k)
             fs_ubo->blend_const[k] = scb->has_dyn_blend_const ? scb->dyn_blend_const[k] : pipe->blend_constants[k];
         for (uint32_t r = 0; r < SM_MAX_MRT; ++r) {
@@ -2781,76 +2882,75 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             fs_ubo->rt_write_mask[r] = pipe->color_write_mask[r] & 0xFu;
         }
 
+        // Zero-Update Cached Descriptor Set Resolver (99.9% cache hit rate -> 0 vkUpdateDescriptorSets/draw!)
+        auto get_cached_ds = [&](std::unordered_map<uint64_t, VkDescriptorSet>& cache,
+                                 const std::vector<VkDescriptorSet>& pool, uint32_t& cursor,
+                                 const VkBuffer* bufs, uint32_t n, int dyn_binding, VkDeviceSize dyn_range) -> VkDescriptorSet {
+            uint64_t key = sm_hash_bufs(bufs, n);
+            auto it = cache.find(key);
+            if (it != cache.end()) return it->second;
+            if (cache.size() >= SmRasterEngine::MAX_DS_RING / 2) cache.clear();
+            VkDescriptorSet ds = pool[cursor % SmRasterEngine::MAX_DS_RING];
+            cursor++;
+            VkDescriptorBufferInfo bi[15];
+            VkWriteDescriptorSet ws[15];
+            for (uint32_t i = 0; i < n; ++i) {
+                bool is_dyn = ((int)i == dyn_binding);
+                bi[i] = {bufs[i], 0, is_dyn ? dyn_range : VK_WHOLE_SIZE};
+                ws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, i, 0, 1,
+                         is_dyn ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                         nullptr, &bi[i]};
+            }
+            dev->fn.UpdateDescriptorSets(dev->real_dev, n, ws, 0, nullptr);
+            cache[key] = ds;
+            return ds;
+        };
+
         uint32_t used_vb_mask = 0;
         for (const auto& bd : pipe->vtx_input.bindings)
             if (bd.binding < SM_MAX_VTX_BINDINGS) used_vb_mask |= (1u << bd.binding);
         auto get_vb = [&](uint32_t b) -> VkBuffer {
             return ((used_vb_mask & (1u << b)) && scb->vtx_bufs[b]) ? scb->vtx_bufs[b]->real_buf : dev->rast.dummy_buf;
         };
-        VkDescriptorBufferInfo vbi[11] = {
-            {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE},
-            {(indexed && scb->idx_buf) ? scb->idx_buf->real_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE},
-            {get_vb(0), 0, VK_WHOLE_SIZE},
-            {get_vb(1), 0, VK_WHOLE_SIZE},
-            {get_vb(2), 0, VK_WHOLE_SIZE},
-            {get_vb(3), 0, VK_WHOLE_SIZE},
-            {get_vb(4), 0, VK_WHOLE_SIZE},
-            {get_vb(5), 0, VK_WHOLE_SIZE},
-            {get_vb(6), 0, VK_WHOLE_SIZE},
-            {get_vb(7), 0, VK_WHOLE_SIZE},
-            {dev->rast.vs_ubo_buf, slot * sizeof(SmVsParamsUBO), sizeof(SmVsParamsUBO)},
+        VkBuffer vbufs[11] = {
+            dev->rast.clip_vert_buf,
+            (indexed && scb->idx_buf) ? scb->idx_buf->real_buf : dev->rast.dummy_buf,
+            get_vb(0), get_vb(1), get_vb(2), get_vb(3), get_vb(4), get_vb(5), get_vb(6), get_vb(7),
+            dev->rast.vs_ubo_buf
         };
-        VkWriteDescriptorSet vws[11];
-        for (uint32_t i = 0; i < 11; ++i)
-            vws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.vs_int_ds[slot], i, 0, 1,
-                      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &vbi[i]};
+        cur_vs_ds = get_cached_ds(dev->rast.vs_ds_cache, dev->rast.vs_int_ds, dev->rast.vs_ds_cursor, vbufs, 11, 10, sizeof(SmVsParamsUBO));
 
-        VkDescriptorBufferInfo fbi[14];
-        fbi[0] = {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE};
-        fbi[1] = {dev->rast.tri_setup_buf, 0, VK_WHOLE_SIZE};
-        fbi[2] = {dev->rast.vis_buf, 0, VK_WHOLE_SIZE};
-        for (uint32_t r = 0; r < SM_MAX_MRT; ++r)
-            fbi[3 + r] = {col_imgs[r] ? col_imgs[r]->attach_buf : dev->rast.dummy_buf, 0, VK_WHOLE_SIZE};
-        fbi[11] = {dep_buf, 0, VK_WHOLE_SIZE};
-        fbi[12] = {stn_buf, 0, VK_WHOLE_SIZE};
-        fbi[13] = {dev->rast.fs_ubo_buf, slot * sizeof(SmFsParamsUBO), sizeof(SmFsParamsUBO)};
-        VkWriteDescriptorSet fws[14];
-        for (uint32_t i = 0; i < 14; ++i)
-            fws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.fs_int_ds[slot], i, 0, 1,
-                      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fbi[i]};
+        if (pipe->fs_comp_pipe) {
+            VkBuffer fbufs[15];
+            fbufs[0] = dev->rast.clip_vert_buf;
+            fbufs[1] = dev->rast.tri_setup_buf;
+            fbufs[2] = dev->rast.vis_buf;
+            for (uint32_t r = 0; r < SM_MAX_MRT; ++r)
+                fbufs[3 + r] = col_imgs[r] ? col_imgs[r]->attach_buf : dev->rast.dummy_buf;
+            fbufs[11] = dep_buf;
+            fbufs[12] = stn_buf;
+            fbufs[13] = dev->rast.fs_ubo_buf;
+            fbufs[14] = dev->rast.active_tiles_buf;
+            cur_fs_ds = get_cached_ds(dev->rast.fs_ds_cache, dev->rast.fs_int_ds, dev->rast.fs_ds_cursor, fbufs, 15, 13, sizeof(SmFsParamsUBO));
+        }
 
-        VkDescriptorBufferInfo bbi[6] = {
-            {dev->rast.clip_vert_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.tri_setup_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.tile_count_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.tile_bins_buf, 0, VK_WHOLE_SIZE},
-            {dev->rast.vis_buf, 0, VK_WHOLE_SIZE},
-            {dep_buf, 0, VK_WHOLE_SIZE},
+        VkBuffer bbufs[9] = {
+            dev->rast.clip_vert_buf, dev->rast.tri_setup_buf, dev->rast.tile_count_buf, dev->rast.tile_bins_buf,
+            dev->rast.vis_buf, dep_buf, dev->rast.active_tiles_buf, dev->rast.ind_disp_buf, hiz_buf
         };
-        VkWriteDescriptorSet bws[6];
-        for (uint32_t i = 0; i < 6; ++i)
-            bws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.bin_ds[slot], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bbi[i]};
+        cur_bin_ds = get_cached_ds(dev->rast.bin_ds_cache, dev->rast.bin_ds, dev->rast.bin_ds_cursor, bbufs, 9, -1, 0);
 
-        VkDescriptorBufferInfo fn_bi[5] = {bbi[1], bbi[2], bbi[3], bbi[4], bbi[5]};
-        VkWriteDescriptorSet fn_ws[5];
-        for (uint32_t i = 0; i < 5; ++i)
-            fn_ws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.fine_ds[slot], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &fn_bi[i]};
-
-        dev->fn.UpdateDescriptorSets(dev->real_dev, 11, vws, 0, nullptr);
-        if (pipe->fs_comp_pipe) dev->fn.UpdateDescriptorSets(dev->real_dev, 14, fws, 0, nullptr);
-        dev->fn.UpdateDescriptorSets(dev->real_dev, 6, bws, 0, nullptr);
-        dev->fn.UpdateDescriptorSets(dev->real_dev, 5, fn_ws, 0, nullptr);
+        VkBuffer fnbufs[7] = {bbufs[1], bbufs[2], bbufs[3], bbufs[4], bbufs[5], bbufs[6], bbufs[8]};
+        cur_fine_ds = get_cached_ds(dev->rast.fine_ds_cache, dev->rast.fine_ds, dev->rast.fine_ds_cursor, fnbufs, 7, -1, 0);
 
         if (!pipe->fs_comp_pipe && eff_dwrite && dep_img != nullptr) {
-            VkDescriptorBufferInfo dbi[3] = {
-                {dev->rast.tri_setup_buf, 0, VK_WHOLE_SIZE},
-                {dev->rast.vis_buf, 0, VK_WHOLE_SIZE},
-                {dep_buf, 0, VK_WHOLE_SIZE},
-            };
-            VkWriteDescriptorSet dws[3];
-            for (uint32_t i = 0; i < 3; ++i)
-                dws[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dev->rast.depth_only_ds[slot], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &dbi[i]};
-            dev->fn.UpdateDescriptorSets(dev->real_dev, 3, dws, 0, nullptr);
+            VkBuffer dbufs[4] = {dev->rast.tri_setup_buf, dev->rast.vis_buf, dep_buf, dev->rast.active_tiles_buf};
+            cur_dep_ds = get_cached_ds(dev->rast.dep_ds_cache, dev->rast.depth_only_ds, dev->rast.dep_ds_cursor, dbufs, 4, -1, 0);
+        }
+
+        if (eff_dwrite && can_use_hiz) {
+            VkBuffer hbufs[3] = {dev->rast.active_tiles_buf, dep_buf, hiz_buf};
+            cur_hiz_ds = get_cached_ds(dev->rast.hiz_ds_cache, dev->rast.hiz_update_ds, dev->rast.hiz_ds_cursor, hbufs, 3, -1, 0);
         }
 
         if (is_indirect) {
@@ -2868,9 +2968,13 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         }
     }
 
-    // --- PASS 0: Reset tile_counts (+ clipper & indirect metadata) & VisBuf ---
-    dev->fn.CmdFillBuffer(scb->real_cb, dev->rast.tile_count_buf, 0, (VkDeviceSize)(tx * ty + 8) * 4, 0u);
-    dev->fn.CmdFillBuffer(scb->real_cb, dev->rast.vis_buf, 0, (VkDeviceSize)W * H * 8, 0xFFFFFFFFu);
+    // --- PASS 0: Reset ONLY 8-byte clip counters + 16-byte Active-Tile Indirect Cmd (ZERO CmdFillBuffer!) ---
+    static const uint32_t kZeroMeta[2] = {0u, 0u};
+    dev->fn.CmdUpdateBuffer(scb->real_cb, dev->rast.tile_count_buf, (VkDeviceSize)(tx * ty) * 4, 8, kZeroMeta);
+    if (!direct_2d) {
+        static const uint32_t kZeroActiveDisp[4] = {0u, 1u, 1u, 0u};
+        dev->fn.CmdUpdateBuffer(scb->real_cb, dev->rast.ind_disp_buf, 32, 16, kZeroActiveDisp);
+    }
 
     if (is_indirect) {
         emit_compute_barrier(scb);
@@ -2891,6 +2995,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     }
 
     // --- PASS 1: Lowered Vertex Compute Shader on H20 78 SMs! ---
+    uint32_t vs_dyn_off = slot * (uint32_t)sizeof(SmVsParamsUBO);
+    uint32_t fs_dyn_off = slot * (uint32_t)sizeof(SmFsParamsUBO);
     dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->vs_comp_pipe);
     for (uint32_t s = 0; s < pipe->layout->sm_set_index && s < 16; ++s) {
         if (scb->gfx_set_mask & (1u << s)) {
@@ -2902,7 +3008,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         }
     }
     dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout->sm_vs_layout,
-                                  pipe->layout->sm_set_index, 1, &dev->rast.vs_int_ds[slot], 0, nullptr);
+                                  pipe->layout->sm_set_index, 1, &cur_vs_ds, 1, &vs_dyn_off);
     if (scb->push_size > 0 && !pipe->layout->push_ranges.empty()) {
         for (const auto& pr : pipe->layout->push_ranges) {
             if (pr.offset < scb->push_size) {
@@ -2916,45 +3022,49 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     else             dev->fn.CmdDispatch(scb->real_cb, (total_verts + 63) / 64, 1, 1);
     emit_compute_barrier(scb);
 
-    // --- PASS 2: CUDARaster Binning + CuRast Micro-Triangle Fast-Path + Near-Plane Clipper ---
+    // --- PASS 2: CUDARaster Binning + Pre-Bin Hi-Z + Active-Tile Compaction + CuRast Fast-Path + Clip + Lines/Points ---
     uint32_t rflags = 0;
     if (eff_cull & VK_CULL_MODE_BACK_BIT)  rflags |= 1u;
     if (eff_cull & VK_CULL_MODE_FRONT_BIT) rflags |= 2u;
     if (eff_ff == VK_FRONT_FACE_CLOCKWISE) rflags |= 4u;
     if (eff_dtest && dep_img != nullptr)   rflags |= 8u;
     rflags |= (((uint32_t)eff_dop & 7u) << 4u);
-    rflags |= ((topo_code & 3u) << 8u);
-    if (pipe->depth_clamp)                 rflags |= 1024u;
-    if (eff_dbias_en)                      rflags |= 2048u;
+    rflags |= ((topo_code & 7u) << 8u);
+    if (pipe->depth_clamp)                 rflags |= 2048u;
+    if (eff_dbias_en)                      rflags |= 4096u;
+    if (use_prebin_hiz)                    rflags |= 8192u;
+    if (pipe->vs_writes_point_size)        rflags |= 16384u;
+    if (direct_2d)                         rflags |= 32768u;
 
     struct {
         uint32_t tri_count, vstride, w, h, tx, ty, max_tpt, flags;
         float vp_x, vp_y, vp_w, vp_h, vp_min_d, vp_max_d;
         int32_t sx0, sy0, sx1, sy1;
         uint32_t tris_per_inst, verts_per_inst, extra_vert_base, extra_tri_base;
-        float depth_bias_const, depth_bias_slope, depth_bias_clamp;
-        uint32_t pad0;
+        float depth_bias_const, depth_bias_slope, depth_bias_clamp, line_width;
     } bpc = { is_indirect ? 0xFFFFFFFFu : total_tris, SM_VERT_STRIDE_VEC4, W, H, tx, ty, SM_MAX_TRIS_PER_TILE, rflags,
               vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc_x0, sc_y0, sc_x1, sc_y1,
               tris_per_inst, verts_per_inst, extra_v_base, extra_t_base,
-              eff_dbias_const, eff_dbias_slope, eff_dbias_clamp, 0u };
+              eff_dbias_const, eff_dbias_slope, eff_dbias_clamp, eff_line_width };
 
-    dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pipe);
-    dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pl, 0, 1, &dev->rast.bin_ds[slot], 0, nullptr);
+    dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, (topo_code >= 3u) ? dev->rast.prim_bin_pipe : dev->rast.bin_pipe);
+    dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.bin_pl, 0, 1, &cur_bin_ds, 0, nullptr);
     dev->fn.CmdPushConstants(scb->real_cb, dev->rast.bin_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bpc), &bpc);
     if (is_indirect) dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 16);
     else             dev->fn.CmdDispatch(scb->real_cb, (total_tris + 63) / 64, 1, 1);
-    emit_compute_barrier(scb);
+    if (direct_2d) emit_pure_compute_barrier(scb);
+    else           emit_bin_to_indirect_barrier(scb);
 
-    // --- PASS 3: RetroWarp / cuRE 16x16 Tiled Shared-Memory Fine Rasterizer ---
-    struct { uint32_t w, h, tx, max_tpt, flags; } fpc = { W, H, tx, SM_MAX_TRIS_PER_TILE, rflags };
+    // --- PASS 3: Hybrid Active-Tile / Coherent-2D 16x16 Fine Rasterizer (Self-Clears tile_counts!) ---
+    struct { uint32_t w, h, tx, max_tpt, flags, ty; } fpc = { W, H, tx, SM_MAX_TRIS_PER_TILE, rflags, ty };
     dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.fine_pipe);
-    dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.fine_pl, 0, 1, &dev->rast.fine_ds[slot], 0, nullptr);
+    dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.fine_pl, 0, 1, &cur_fine_ds, 0, nullptr);
     dev->fn.CmdPushConstants(scb->real_cb, dev->rast.fine_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(fpc), &fpc);
-    dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
-    emit_compute_barrier(scb);
+    if (direct_2d) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
+    else           dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
+    emit_pure_compute_barrier(scb);
 
-    // --- PASS 4: Lowered Quad-Subgroup 8-MRT + Stencil Fragment Compute Shader (Zero Overdraw + H20 TMUs!) ---
+    // --- PASS 4: Hybrid Active-Tile / Coherent-2D Quad-Subgroup 8-MRT + Stencil FS (Self-Clears VisBuf!) ---
     if (pipe->fs_comp_pipe) {
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->fs_comp_pipe);
         for (uint32_t s = 0; s < pipe->layout->sm_set_index && s < 16; ++s) {
@@ -2967,7 +3077,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             }
         }
         dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout->sm_fs_layout,
-                                      pipe->layout->sm_set_index, 1, &dev->rast.fs_int_ds[slot], 0, nullptr);
+                                      pipe->layout->sm_set_index, 1, &cur_fs_ds, 1, &fs_dyn_off);
         if (scb->push_size > 0 && !pipe->layout->push_ranges.empty()) {
             for (const auto& pr : pipe->layout->push_ranges) {
                 if (pr.offset < scb->push_size) {
@@ -2977,17 +3087,30 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
                 }
             }
         }
-        dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
-        emit_compute_barrier(scb);
+        if (direct_2d) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
+        else           dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
+        emit_pure_compute_barrier(scb);
     } else if (eff_dwrite && dep_img != nullptr) {
-        // Depth-Only Pass (Shadow Maps / Z-Prepass with fs_mod == nullptr)
-        struct { uint32_t w, h, dwrite, pad; } dpc = { W, H, 1u, 0u };
+        struct { uint32_t w, h, dwrite, tx; } dpc = { W, H, 1u, tx | (direct_2d ? 0x80000000u : 0u) };
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.depth_only_pipe);
-        dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.depth_only_pl, 0, 1, &dev->rast.depth_only_ds[slot], 0, nullptr);
+        dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.depth_only_pl, 0, 1, &cur_dep_ds, 0, nullptr);
         dev->fn.CmdPushConstants(scb->real_cb, dev->rast.depth_only_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dpc), &dpc);
-        dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
-        emit_compute_barrier(scb);
+        if (direct_2d) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
+        else           dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
+        emit_pure_compute_barrier(scb);
     }
+
+    // --- PASS 5: Incremental Coarse Hi-Z Refresh (ONLY on depth-writing draws!) ---
+    if (eff_dwrite && can_use_hiz) {
+        struct { uint32_t w, h, tx, d2d; } hpc = { W, H, tx, direct_2d ? 1u : 0u };
+        dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.hiz_update_pipe);
+        dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.hiz_update_pl, 0, 1, &cur_hiz_ds, 0, nullptr);
+        dev->fn.CmdPushConstants(scb->real_cb, dev->rast.hiz_update_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hpc), &hpc);
+        if (direct_2d) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
+        else           dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
+        dep_img->hiz_has_occluders = true;
+    }
+    emit_draw_end_barrier(scb);
     scb->comp_state_dirty = true;
 }
 
@@ -3352,6 +3475,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdCopyImage(VkCommandBuffer cb, VkImage s,
         VkBufferCopy bc{0, 0, (VkDeviceSize)si->extent.width * si->extent.height * bpp};
         scb->dev->fn.CmdCopyBuffer(scb->real_cb, si->attach_buf, di->attach_buf, 1, &bc);
         di->attach_dirty = true;
+        if (di->is_depth) di->hiz_valid = false;
         sm_sync_attach_to_image(scb, di, dl);
         return;
     }
@@ -3422,6 +3546,7 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdClearDepthStencilImage(VkCommandBuffer c
     uint32_t dbits = 0; memcpy(&dbits, &ds->depth, 4);
     scb->dev->fn.CmdFillBuffer(scb->real_cb, img->attach_buf, 0, (VkDeviceSize)img->extent.width * img->extent.height * 4, dbits);
     img->attach_dirty = true; img->attach_mip = 0; img->attach_layer = 0;
+    img->hiz_valid = false;
     sm_sync_attach_to_image(scb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 0);
     if (img->has_stencil) {
         sm_ensure_image_stencil_buf(scb->dev, img);
@@ -3564,7 +3689,9 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdSetRasterizerDiscardEnable(VkCommandBuff
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBiasEnable(VkCommandBuffer cb, VkBool32 e) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_depth_bias_en = true; scb->dyn_depth_bias_en = (e != 0);
 }
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetPrimitiveRestartEnable(VkCommandBuffer, VkBool32) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetPrimitiveRestartEnable(VkCommandBuffer cb, VkBool32 e) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_prim_restart = true; scb->dyn_prim_restart = (e != 0);
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginConditionalRenderingEXT(VkCommandBuffer, const VkConditionalRenderingBeginInfoEXT*) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdEndConditionalRenderingEXT(VkCommandBuffer) {}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdBeginTransformFeedbackEXT(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*) {}
@@ -3976,7 +4103,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_BindImageMemory2(VkDevice d, uint32_t c
     }
     return VK_SUCCESS;
 }
-static VKAPI_ATTR void VKAPI_CALL sm_CmdSetLineWidth(VkCommandBuffer, float) {}
+static VKAPI_ATTR void VKAPI_CALL sm_CmdSetLineWidth(VkCommandBuffer cb, float w) {
+    auto* scb = reinterpret_cast<SmCommandBuffer*>(cb); scb->has_dyn_line_width = true; scb->dyn_line_width = std::max(1.0f, w);
+}
 static VKAPI_ATTR void VKAPI_CALL sm_CmdSetDepthBias(VkCommandBuffer cb, float c, float cl, float sl) {
     auto* scb = reinterpret_cast<SmCommandBuffer*>(cb);
     scb->has_dyn_depth_bias = true;

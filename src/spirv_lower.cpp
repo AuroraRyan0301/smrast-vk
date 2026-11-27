@@ -75,7 +75,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v5_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v6_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -612,10 +612,14 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            const VkSpecializationInfo*,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
-                           std::string& err) {
+                           std::string& err,
+                           bool* out_writes_point_size) {
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
+
+    bool writes_ps = (glsl.find("gl_PointSize") != std::string::npos);
+    if (out_writes_point_size) *out_writes_point_size = writes_ps;
 
     std::string user_exts;
     std::string body = strip_version_and_stage_io(glsl, user_exts);
@@ -654,7 +658,7 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
        << "    uvec4 vtx_strides;\n"
        << "    uint verts_per_instance;\n"
        << "    uint vtx_inst_rate_mask;\n"
-       << "    uint pad0;\n"
+       << "    uint prim_restart_en;\n"
        << "    uint pad1;\n"
        << "    uvec4 vtx_offsets_hi;\n"
        << "    uvec4 vtx_strides_hi;\n"
@@ -681,21 +685,26 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    sm_base_instance = int(sm_vs.instance_idx);\n";
     ss << "    sm_base_vertex   = (sm_vs.indexed != 0u) ? sm_vs.vertex_offset : int(sm_vs.first_vertex);\n";
     ss << "    sm_iidx = int(sm_vs.instance_idx + inst_local);\n";
+    ss << "    uint base_slot = gid * sm_vs.vert_stride_vec4;\n";
     ss << "    if (sm_vs.indexed == 0u) {\n";
     ss << "        sm_vidx = int(sm_vs.first_vertex + vert_local);\n";
     ss << "    } else if (sm_vs.indexed == 1u) {\n";
     ss << "        uint ii = (sm_vs.idx_buf_offset >> 1u) + sm_vs.first_index + vert_local;\n";
     ss << "        uint w = sm_idx_raw[ii >> 1u];\n";
     ss << "        uint idx16 = ((ii & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);\n";
+    ss << "        if (sm_vs.prim_restart_en != 0u && idx16 == 0xFFFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, -2.0); return; }\n";
     ss << "        sm_vidx = int(idx16) + sm_vs.vertex_offset;\n";
     ss << "    } else if (sm_vs.indexed == 3u) {\n";
     ss << "        uint ii = sm_vs.idx_buf_offset + sm_vs.first_index + vert_local;\n";
     ss << "        uint w = sm_idx_raw[ii >> 2u];\n";
     ss << "        uint idx8 = (w >> ((ii & 3u) << 3u)) & 0xFFu;\n";
+    ss << "        if (sm_vs.prim_restart_en != 0u && idx8 == 0xFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, -2.0); return; }\n";
     ss << "        sm_vidx = int(idx8) + sm_vs.vertex_offset;\n";
     ss << "    } else {\n";
     ss << "        uint ii = (sm_vs.idx_buf_offset >> 2u) + sm_vs.first_index + vert_local;\n";
-    ss << "        sm_vidx = int(sm_idx_raw[ii]) + sm_vs.vertex_offset;\n";
+    ss << "        uint idx32 = sm_idx_raw[ii];\n";
+    ss << "        if (sm_vs.prim_restart_en != 0u && idx32 == 0xFFFFFFFFu) { sm_clip_verts[base_slot] = vec4(0.0, 0.0, 0.0, -2.0); return; }\n";
+    ss << "        sm_vidx = int(idx32) + sm_vs.vertex_offset;\n";
     ss << "    }\n";
 
     for (const auto& io : inputs) {
@@ -711,7 +720,6 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
     }
 
     ss << "    sm_user_vs_main();\n";
-    ss << "    uint base_slot = gid * sm_vs.vert_stride_vec4;\n";
     ss << "    sm_clip_verts[base_slot] = sm_gl_Position;\n";
     for (const auto& io : outputs) {
         uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
@@ -733,6 +741,9 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                 }
             }
         }
+    }
+    if (writes_ps) {
+        ss << "    sm_clip_verts[base_slot + 15u].w = clamp(sm_gl_PointSize, 1.0, 64.0);\n";
     }
     ss << "}\n";
 
@@ -792,15 +803,15 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx;\n"
        << "};\n";
 
-    // SmRast v0.4 Full 8-MRT + Depth + 8-bit Stencil FS Internal Descriptor Set!
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 0)  readonly buffer SmClipVertBuf { vec4 sm_clip_verts[]; };\n";
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 1)  readonly buffer SmTriSetupBuf { SmTriSetup sm_tris[]; };\n";
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 2)  readonly buffer SmVisBuf      { uint64_t sm_vis_px[]; };\n";
+    // SmRast v0.6 Full 8-MRT + Depth + 8-bit Stencil + Active-Tile + Self-Clearing VisBuf FS Internal Set!
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 0)  readonly buffer SmClipVertBuf    { vec4 sm_clip_verts[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 1)  readonly buffer SmTriSetupBuf    { SmTriSetup sm_tris[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 2)  buffer SmVisBuf                  { uint64_t sm_vis_px[]; };\n";
     for (uint32_t m = 0; m < SM_MAX_MRT; ++m) {
         ss << "layout(std430, set = " << sm_set_idx << ", binding = " << (3u + m) << ") buffer SmColor" << m << "Buf { uint sm_col" << m << "[]; };\n";
     }
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 11) buffer SmDepthBuf             { float sm_depth_px[]; };\n";
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 12) buffer SmStencilBuf           { uint sm_stencil_px[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 11) buffer SmDepthBuf                { float sm_depth_px[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 12) buffer SmStencilBuf              { uint sm_stencil_px[]; };\n";
     ss << "layout(std430, set = " << sm_set_idx << ", binding = 13) readonly buffer SmFsParams {\n"
        << "    uint width;\n"
        << "    uint height;\n"
@@ -811,7 +822,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    uint stencil_front_cfg;\n"
        << "    uint stencil_back_cfg;\n"
        << "    uint stencil_refs;\n"
-       << "    uint pad0; uint pad1; uint pad2;\n"
+       << "    uint tiles_x; uint direct_2d; uint pad2;\n"
        << "    vec4 blend_const;\n"
        << "    uvec4 rt_fmt[2];\n"
        << "    uvec4 rt_blend_en[2];\n"
@@ -822,7 +833,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    uvec4 rt_dst_alpha[2];\n"
        << "    uvec4 rt_alpha_op[2];\n"
        << "    uvec4 rt_write_mask[2];\n"
-       << "} sm_fs;\n\n";
+       << "} sm_fs;\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n\n";
 
     ss << "uint sm_u4(uvec4 a[2], uint i) { return a[i >> 2u][i & 3u]; }\n";
     ss << "uint sm_quad_lane;\n";
@@ -1109,11 +1121,18 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    sm_quad_lane = tid & 3u;\n";
     ss << "    uint lx = ((quad_id & 7u) << 1u) | (sm_quad_lane & 1u);\n";
     ss << "    uint ly = ((quad_id >> 3u) << 1u) | ((sm_quad_lane >> 1u) & 1u);\n";
-    ss << "    uvec2 p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
+    ss << "    uvec2 p;\n";
+    ss << "    if (sm_fs.direct_2d != 0u) {\n";
+    ss << "        p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
+    ss << "    } else {\n";
+    ss << "        uint sm_tile_id = sm_active_tiles[gl_WorkGroupID.x];\n";
+    ss << "        p = uvec2((sm_tile_id % sm_fs.tiles_x) * 16u + lx, (sm_tile_id / sm_fs.tiles_x) * 16u + ly);\n";
+    ss << "    }\n";
     ss << "    bool in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
     ss << "    uint pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
     ss << "    uint64_t vis = in_bounds ? sm_vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;\n";
     ss << "    bool active_px = in_bounds && (vis != 0xFFFFFFFFFFFFFFFFul);\n";
+    ss << "    if (active_px) sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n";
     ss << "    sm_gl_HelperInvocation = !active_px;\n";
     ss << "    uint my_tri = active_px ? uint(vis & 0xFFFFFFFFul) : 0xFFFFFFFFu;\n";
     ss << "    uint t0 = subgroupQuadBroadcast(my_tri, 0u);\n";
@@ -1208,13 +1227,14 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "layout(local_size_x = 16, local_size_y = 16) in;\n"
        << "struct SmTriSetup { vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 1)  readonly buffer SmTriSetupBuf { SmTriSetup sm_tris[]; };\n"
-       << "layout(std430, set = " << sm_set_idx << ", binding = 2)  readonly buffer SmVisBuf      { uint64_t sm_vis_px[]; };\n"
+       << "layout(std430, set = " << sm_set_idx << ", binding = 2)  buffer SmVisBuf               { uint64_t sm_vis_px[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 11) writeonly buffer SmDepthBuf   { float sm_depth_px[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 12) buffer SmStencilBuf           { uint sm_stencil_px[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 13) readonly buffer SmFsParams {\n"
        << "    uint width; uint height; uint vert_stride_vec4; uint depth_write;\n"
-       << "    uint rt_active_mask; uint stencil_enable; uint stencil_front_cfg; uint stencil_back_cfg; uint stencil_refs;\n"
+       << "    uint rt_active_mask; uint stencil_enable; uint stencil_front_cfg; uint stencil_back_cfg; uint stencil_refs; uint tiles_x; uint direct_2d;\n"
        << "} sm_fs;\n"
+       << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n"
        << "bool sm_stencil_cmp(uint op, uint ref_m, uint val_m) {\n"
        << "    if (op == 0u) return false; if (op == 1u) return ref_m < val_m; if (op == 2u) return ref_m == val_m;\n"
        << "    if (op == 3u) return ref_m <= val_m; if (op == 4u) return ref_m > val_m; if (op == 5u) return ref_m != val_m;\n"
@@ -1226,11 +1246,18 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "    if (op == 6u) return (cur + 1u) & 0xFFu; if (op == 7u) return (cur - 1u) & 0xFFu; return cur;\n"
        << "}\n"
        << "void main() {\n"
-       << "    uvec2 p = gl_GlobalInvocationID.xy;\n"
+       << "    uvec2 p;\n"
+       << "    if (sm_fs.direct_2d != 0u) {\n"
+       << "        p = gl_GlobalInvocationID.xy;\n"
+       << "    } else {\n"
+       << "        uint tile_id = sm_active_tiles[gl_WorkGroupID.x];\n"
+       << "        p = uvec2((tile_id % sm_fs.tiles_x) * 16u + gl_LocalInvocationID.x, (tile_id / sm_fs.tiles_x) * 16u + gl_LocalInvocationID.y);\n"
+       << "    }\n"
        << "    if (p.x >= sm_fs.width || p.y >= sm_fs.height) return;\n"
        << "    uint pidx = p.y * sm_fs.width + p.x;\n"
        << "    uint64_t vis = sm_vis_px[pidx];\n"
        << "    if (vis == 0xFFFFFFFFFFFFFFFFul) return;\n"
+       << "    sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n"
        << "    uint tid = uint(vis & 0xFFFFFFFFul);\n"
        << "    SmTriSetup ts = sm_tris[tid];\n"
        << "    bool ff = (ts.idx.w & 0x80000000u) != 0u;\n"

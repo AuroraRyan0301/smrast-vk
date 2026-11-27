@@ -269,6 +269,11 @@ struct SmImage {
     int32_t stencil_layer = -1;
     VkBuffer attach_buf = VK_NULL_HANDLE;
     VkDeviceMemory attach_mem = VK_NULL_HANDLE;
+    VkBuffer hiz_buf = VK_NULL_HANDLE;
+    VkDeviceMemory hiz_mem = VK_NULL_HANDLE;
+    bool hiz_valid = false;
+    bool hiz_has_occluders = false;
+    uint32_t hiz_tx = 0, hiz_ty = 0;
     VkBuffer stencil_buf = VK_NULL_HANDLE;
     VkDeviceMemory stencil_mem = VK_NULL_HANDLE;
     VkImage real_stencil_img = VK_NULL_HANDLE;
@@ -328,6 +333,9 @@ struct SmPipeline {
     SmVertexInputState vtx_input;
 
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    bool prim_restart = false;
+    bool vs_writes_point_size = false;
+    float line_width = 1.0f;
     VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
     VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     bool depth_clamp = false;
@@ -413,7 +421,7 @@ struct alignas(256) SmVsParamsUBO {
     uint32_t vtx_strides[4];     // VB 0..3
     uint32_t verts_per_instance; // word 16 (patched by smrast_indirect_prep.comp!)
     uint32_t vtx_inst_rate_mask; // bits 0..7 = instanced VB 0..7
-    uint32_t pad0;
+    uint32_t prim_restart_en;    // 1 = emit restart sentinel (w = -2.0) for 0xFF/0xFFFF/0xFFFFFFFF
     uint32_t pad1;
     uint32_t vtx_offsets_hi[4];  // VB 4..7
     uint32_t vtx_strides_hi[4];  // VB 4..7
@@ -429,7 +437,9 @@ struct alignas(512) SmFsParamsUBO {
     uint32_t stencil_front_cfg;  // [0..2]=cmpOp, [3..5]=failOp, [6..8]=passOp, [9..11]=depthFailOp, [16..23]=cmpMask, [24..31]=writeMask
     uint32_t stencil_back_cfg;   // same layout for back faces
     uint32_t stencil_refs;       // [0..7]=frontRef, [8..15]=backRef
-    uint32_t pad0, pad1, pad2;
+    uint32_t tiles_x;            // screen tile columns for Active-Tile Indirect Dispatch!
+    uint32_t direct_2d;          // 1 = coherent 2D grid (gl_WorkGroupID.xy), 0 = active_tiles[gl_WorkGroupID.x]
+    uint32_t pad2;
     float    blend_const[4];     // vec4 blend_const
     uint32_t rt_fmt[8];          // uvec4 rt_fmt[2]
     uint32_t rt_blend_en[8];     // uvec4 rt_blend_en[2]
@@ -448,7 +458,9 @@ struct alignas(256) SmClearUBO {
     uint32_t clear_mask;         // bits 0..7=RT0..7, bit8=depth, bit9=vis, bit10=stencil
     float    clear_depth;
     uint32_t clear_stencil;
-    uint32_t pad0, pad1, pad2;
+    uint32_t tiles_x;
+    uint32_t tiles_y;
+    uint32_t hiz_en;
     uint32_t rt_bpp_code[8];     // uvec4[2]: 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
     uint32_t rt_clear[8][4];     // uvec4[8]
 };
@@ -461,6 +473,7 @@ struct SmRasterEngine {
     VkDescriptorSetLayout bin_dsl = VK_NULL_HANDLE;
     VkPipelineLayout bin_pl = VK_NULL_HANDLE;
     VkPipeline bin_pipe = VK_NULL_HANDLE;
+    VkPipeline prim_bin_pipe = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout fine_dsl = VK_NULL_HANDLE;
     VkPipelineLayout fine_pl = VK_NULL_HANDLE;
@@ -478,6 +491,10 @@ struct SmRasterEngine {
     VkPipelineLayout blit_pl = VK_NULL_HANDLE;
     VkPipeline blit_pipe = VK_NULL_HANDLE;
 
+    VkDescriptorSetLayout hiz_update_dsl = VK_NULL_HANDLE;
+    VkPipelineLayout hiz_update_pl = VK_NULL_HANDLE;
+    VkPipeline hiz_update_pipe = VK_NULL_HANDLE;
+
     VkDescriptorSetLayout vs_int_dsl = VK_NULL_HANDLE;
     VkDescriptorSetLayout fs_int_dsl = VK_NULL_HANDLE;
 
@@ -488,11 +505,13 @@ struct SmRasterEngine {
 
     VkBuffer tile_count_buf = VK_NULL_HANDLE;  VkDeviceMemory tile_count_mem = VK_NULL_HANDLE;
     VkBuffer tile_bins_buf = VK_NULL_HANDLE;   VkDeviceMemory tile_bins_mem = VK_NULL_HANDLE;
+    VkBuffer active_tiles_buf = VK_NULL_HANDLE; VkDeviceMemory active_tiles_mem = VK_NULL_HANDLE;
     VkBuffer vis_buf = VK_NULL_HANDLE;         VkDeviceMemory vis_mem = VK_NULL_HANDLE;
     VkBuffer ind_disp_buf = VK_NULL_HANDLE;    VkDeviceMemory ind_disp_mem = VK_NULL_HANDLE;
     VkBuffer dummy_buf = VK_NULL_HANDLE;       VkDeviceMemory dummy_mem = VK_NULL_HANDLE;
 
     static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 49152;
+    static constexpr uint32_t MAX_DS_RING         = 16384;
     static constexpr uint32_t MAX_IND_SLOTS       = 16384;
     static constexpr uint32_t MAX_AUX_SLOTS       = 4096;
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
@@ -506,12 +525,20 @@ struct SmRasterEngine {
     std::vector<VkDescriptorSet> ind_prep_ds;
     std::vector<VkDescriptorSet> depth_only_ds;
     std::vector<VkDescriptorSet> blit_ds;
+    std::vector<VkDescriptorSet> hiz_update_ds;
     std::vector<VkDescriptorSet> vs_int_ds;
     std::vector<VkDescriptorSet> fs_int_ds;
     uint32_t draw_cursor = 0;
     uint32_t ind_cursor = 0;
     uint32_t clear_cursor = 0;
     uint32_t blit_cursor = 0;
+    uint32_t vs_ds_cursor = 0, fs_ds_cursor = 0, bin_ds_cursor = 0, fine_ds_cursor = 0, dep_ds_cursor = 0, hiz_ds_cursor = 0;
+    std::unordered_map<uint64_t, VkDescriptorSet> vs_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> fs_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> bin_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> fine_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> dep_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> hiz_ds_cache;
 
     uint32_t cur_w = 0, cur_h = 0;
     uint32_t tiles_x = 0, tiles_y = 0;
@@ -580,6 +607,8 @@ struct SmCommandBuffer {
     bool has_dyn_depth_bias = false;  float dyn_depth_bias_const = 0.f, dyn_depth_bias_clamp = 0.f, dyn_depth_bias_slope = 0.f;
     bool has_dyn_depth_bias_en = false; bool dyn_depth_bias_en = false;
     bool has_dyn_rast_discard = false;  bool dyn_rast_discard = false;
+    bool has_dyn_prim_restart = false;  bool dyn_prim_restart = false;
+    bool has_dyn_line_width = false;    float dyn_line_width = 1.0f;
     bool has_dyn_blend_const = false; float dyn_blend_const[4] = {0.f, 0.f, 0.f, 0.f};
 
     bool has_dyn_stencil_test = false;       bool dyn_stencil_test = false;
@@ -633,7 +662,8 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            const VkSpecializationInfo* spec,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
-                           std::string& err);
+                           std::string& err,
+                           bool* out_writes_point_size = nullptr);
 
 struct SmFsCompileHints {
     int      rt_fmt[SM_MAX_MRT]     = {-1,-1,-1,-1,-1,-1,-1,-1};

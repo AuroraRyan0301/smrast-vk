@@ -5,7 +5,7 @@ GLSLANG := glslangValidator
 
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/libvulkan_smrast.so
-SHADERS := $(BUILD_DIR)/smrast_clear.comp.spv $(BUILD_DIR)/smrast_bin.comp.spv $(BUILD_DIR)/smrast_fine.comp.spv $(BUILD_DIR)/smrast_indirect_prep.comp.spv $(BUILD_DIR)/smrast_depth_only.comp.spv $(BUILD_DIR)/smrast_blit.comp.spv
+SHADERS := $(BUILD_DIR)/smrast_clear.comp.spv $(BUILD_DIR)/smrast_bin.comp.spv $(BUILD_DIR)/smrast_prim_bin.comp.spv $(BUILD_DIR)/smrast_fine.comp.spv $(BUILD_DIR)/smrast_indirect_prep.comp.spv $(BUILD_DIR)/smrast_depth_only.comp.spv $(BUILD_DIR)/smrast_blit.comp.spv $(BUILD_DIR)/smrast_hiz_update.comp.spv
 SRCS := src/smrast_icd.cpp src/smrast_raster_engine.cpp src/spirv_lower.cpp src/smrast_wsi.cpp
 OBJS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 
@@ -23,13 +23,16 @@ $(TARGET): $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/%.comp.spv: shaders/%.comp | $(BUILD_DIR)
 	$(GLSLANG) --target-env vulkan1.3 -V $< -o $@
 
-bench: $(BUILD_DIR)/smrast_stress_bench $(BUILD_DIR)/test_vk13_game_features $(BUILD_DIR)/test_v04_features $(BUILD_DIR)/test_v05_features
+bench: $(BUILD_DIR)/smrast_stress_bench $(BUILD_DIR)/test_vk13_game_features $(BUILD_DIR)/test_v04_features $(BUILD_DIR)/test_v05_features $(BUILD_DIR)/test_v06_features
 
 $(BUILD_DIR)/test_v04_features: bench/test_v04_features.cpp | $(BUILD_DIR)
 	$(CXX) -O3 -std=c++17 bench/test_v04_features.cpp -o $@ -lvulkan -lm
 
 $(BUILD_DIR)/test_v05_features: bench/test_v05_features.cpp | $(BUILD_DIR)
 	$(CXX) -O3 -std=c++17 bench/test_v05_features.cpp -o $@ -lvulkan -lm
+
+$(BUILD_DIR)/test_v06_features: bench/test_v06_features.cpp | $(BUILD_DIR)
+	$(CXX) -O3 -std=c++17 bench/test_v06_features.cpp -o $@ -lvulkan -lm
 
 $(BUILD_DIR)/smrast_stress_bench: bench/smrast_stress_bench.cpp bench/pbr.vert bench/pbr.frag | $(BUILD_DIR)
 	$(GLSLANG) -V bench/pbr.vert -o bench/pbr.vert.spv

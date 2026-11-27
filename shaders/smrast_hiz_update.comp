@@ -1,0 +1,52 @@
+#version 460
+// smrast_hiz_update.comp — SmRast-VK v0.6:
+//   Hybrid Active-Tile / Coherent-2D Coarse Hi-Z Updater
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ActiveTilesBuf { uint active_tiles[]; };
+layout(std430, set = 0, binding = 1) readonly buffer DepthBuf       { float depth_px[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer TileHizBuf    { vec2 tile_hiz[]; };
+
+layout(push_constant) uniform HizUpdatePC {
+    uint width;
+    uint height;
+    uint tiles_x;
+    uint direct_2d;
+} pc;
+
+shared float s_wmin[32];
+shared float s_wmax[32];
+
+void main() {
+    uint tx, ty, tile_id;
+    if (pc.direct_2d != 0u) {
+        tx = gl_WorkGroupID.x;
+        ty = gl_WorkGroupID.y;
+        tile_id = ty * pc.tiles_x + tx;
+    } else {
+        tile_id = active_tiles[gl_WorkGroupID.x];
+        tx = tile_id % pc.tiles_x;
+        ty = tile_id / pc.tiles_x;
+    }
+    uvec2 p = uvec2(tx * 16u + gl_LocalInvocationID.x, ty * 16u + gl_LocalInvocationID.y);
+    bool in_b = (p.x < pc.width && p.y < pc.height);
+    float d = in_b ? depth_px[p.y * pc.width + p.x] : 0.0;
+
+    float wmin = subgroupMin(in_b ? d : 1e30);
+    float wmax = subgroupMax(in_b ? d : -1e30);
+    if (subgroupElect()) {
+        s_wmin[gl_SubgroupID] = wmin;
+        s_wmax[gl_SubgroupID] = wmax;
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        float mn = 1e30, mx = -1e30;
+        for (uint w = 0u; w < gl_NumSubgroups; ++w) {
+            mn = min(mn, s_wmin[w]);
+            mx = max(mx, s_wmax[w]);
+        }
+        tile_hiz[tile_id] = vec2(mn, mx);
+    }
+}

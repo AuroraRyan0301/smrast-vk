@@ -1,11 +1,10 @@
 #version 460
-// smrast_bin.comp — SmRast-VK v0.5:
-//   - Hybrid CUDARaster (16x16 Coarse Tile Binning) + CuRast (<=64 px Micro-Triangle 64-bit Atomic Fast-Path)
-//   - Hardware-Exact Top-Left Fill-Rule Tie-Breaking + 4-bit Subpixel Snapping (zero shared-edge seams!)
-//   - Hardware-Accurate Depth Bias (constant + slope-scaled + clamp) & Depth Clamp (shadow pancake mode)
-//   - Exact Sutherland-Hodgman Near-Plane (z >= 0) Triangle Clipping (1->1 or 1->2 clipped triangles)
-//   - TRIANGLE_LIST / TRIANGLE_STRIP / TRIANGLE_FAN + Single-Dispatch GPU Instancing
-// Runs 100% on VK_QUEUE_COMPUTE_BIT (H20 78 SMs / H100 / MI300X — zero hardware rasterizer or ROP!)
+// smrast_bin.comp — SmRast-VK v0.6 (Pure-Triangle Hopper-Optimized Hot Kernel):
+//   - Lean register footprint (lines/points split into smrast_prim_bin.comp for peak Hopper SM occupancy!)
+//   - Hybrid Coherent-2D (giant 1M+ meshes) + GPU Active-Tile Compaction (small/medium draws)
+//   - Coarse Pre-Binning Hi-Z Early-Reject (Standard-Z & Reverse-Z)
+//   - CuRast (<=64 px) 64-bit Atomic Fast-Path + CUDARaster 16x16 Binning + Sutherland-Hodgman Clipping
+//   - Watertight Top-Left Fill-Rule + 4-bit (1/16 px) Subpixel Snapping + DepthBias + DepthClamp + PrimRestart
 #extension GL_ARB_gpu_shader_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 
@@ -19,23 +18,27 @@ struct TriSetup {
     uvec4 idx;   // i0, i1, i2, maxy | (is_front << 31)
 };
 
-layout(std430, set = 0, binding = 0) buffer ClipVertBuf       { vec4 clip_verts[]; };
-layout(std430, set = 0, binding = 1) buffer TriSetupBuf       { TriSetup tris[]; };
-layout(std430, set = 0, binding = 2) buffer TileCountBuf      { uint tile_counts[]; };
-layout(std430, set = 0, binding = 3) buffer TileBinsBuf       { uint tile_bins[]; };
-layout(std430, set = 0, binding = 4) buffer VisBuf            { uint64_t vis_px[]; };
-layout(std430, set = 0, binding = 5) readonly buffer DepthBuf { float depth_px[]; };
+layout(std430, set = 0, binding = 0) buffer ClipVertBuf         { vec4 clip_verts[]; };
+layout(std430, set = 0, binding = 1) buffer TriSetupBuf         { TriSetup tris[]; };
+layout(std430, set = 0, binding = 2) buffer TileCountBuf        { uint tile_counts[]; };
+layout(std430, set = 0, binding = 3) buffer TileBinsBuf         { uint tile_bins[]; };
+layout(std430, set = 0, binding = 4) buffer VisBuf              { uint64_t vis_px[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DepthBuf   { float depth_px[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer ActBuf    { uint active_tiles[]; };
+layout(std430, set = 0, binding = 7) buffer DispCmdBuf          { uint disp_cmds[]; };
+layout(std430, set = 0, binding = 8) readonly buffer TileHizBuf { vec2 tile_hiz[]; };
 
 layout(push_constant) uniform BinParams {
-    uint tri_count;         // total tris = tris_per_inst * instance_count (0xFFFFFFFF = indirect)
-    uint vert_stride_vec4;  // 1 + max_varyings
+    uint tri_count;
+    uint vert_stride_vec4;
     uint width;
     uint height;
     uint tiles_x;
     uint tiles_y;
     uint max_tris_per_tile;
-    uint flags;             // bit0=cull_back, bit1=cull_front, bit2=front_cw, bit3=depth_test,
-                            // bits4..6=depth_op, bits8..9=topo, bit10=depth_clamp, bit11=depth_bias
+    uint flags; // bit0=cull_back, bit1=cull_front, bit2=front_cw, bit3=depth_test,
+                // bits4..6=depth_op, bits8..10=topo, bit11=depth_clamp, bit12=depth_bias,
+                // bit13=use_prebin_hiz, bit14=has_point_size, bit15=direct_2d
     float vp_x;
     float vp_y;
     float vp_w;
@@ -53,26 +56,32 @@ layout(push_constant) uniform BinParams {
     float depth_bias_const;
     float depth_bias_slope;
     float depth_bias_clamp;
-    uint pad0;
+    float line_width;
 } pc;
 
 bool depth_pass(float d, float ref_d, uint op) {
-    if (op == 0u) return false;       // NEVER
-    if (op == 1u) return d < ref_d;   // LESS
-    if (op == 2u) return d == ref_d;  // EQUAL
-    if (op == 3u) return d <= ref_d;  // LESS_OR_EQUAL
-    if (op == 4u) return d > ref_d;   // GREATER
-    if (op == 5u) return d != ref_d;  // NOT_EQUAL
-    if (op == 6u) return d >= ref_d;  // GREATER_OR_EQUAL
-    return true;                      // ALWAYS
+    if (op == 0u) return false;
+    if (op == 1u) return d < ref_d;
+    if (op == 2u) return d == ref_d;
+    if (op == 3u) return d <= ref_d;
+    if (op == 4u) return d > ref_d;
+    if (op == 5u) return d != ref_d;
+    if (op == 6u) return d >= ref_d;
+    return true;
 }
 
-// Top-left edge rule in Y-down screen space (with normalized area > 0 winding)
+bool hiz_tile_pass(float tri_min_z, float tri_max_z, vec2 hz, uint dop) {
+    if (dop == 1u) return tri_min_z <  hz.y;
+    if (dop == 3u) return tri_min_z <= hz.y;
+    if (dop == 4u) return tri_max_z >  hz.x;
+    if (dop == 6u) return tri_max_z >= hz.x;
+    return true;
+}
+
 bool is_top_left(vec2 d) {
     return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0);
 }
 
-// Bit-exact shared-edge evaluation: canonical endpoint ordering guarantees edge_eval(a,b) == -edge_eval(b,a)
 float edge_eval(vec2 a, vec2 b, float fx, float fy) {
     if (a.y < b.y || (a.y == b.y && a.x < b.x)) {
         vec2 d = b - a;
@@ -83,7 +92,16 @@ float edge_eval(vec2 a, vec2 b, float fx, float fy) {
     }
 }
 
-// Interpolate all clip-space vertex attributes between vertex ia and ib at factor t, write to dst_idx
+void mark_tile_active(uint tile_id) {
+    uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
+    if (tile_counts[flag_idx] == 0u) {
+        if (atomicExchange(tile_counts[flag_idx], 1u) == 0u) {
+            uint slot = atomicAdd(disp_cmds[8u], 1u);
+            active_tiles[slot] = tile_id;
+        }
+    }
+}
+
 void emit_interp_vert(uint dst_idx, uint ia, uint ib, float t) {
     uint base_d = dst_idx * pc.vert_stride_vec4;
     uint base_a = ia * pc.vert_stride_vec4;
@@ -96,9 +114,7 @@ void emit_interp_vert(uint dst_idx, uint ia, uint ib, float t) {
 void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2) {
     if (c0.w <= 1e-6 || c1.w <= 1e-6 || c2.w <= 1e-6) return;
 
-    bool depth_clamp = (pc.flags & 1024u) != 0u;
-
-    // Frustum guard rejection (skip far-plane reject when depthClampEnable is active!)
+    bool depth_clamp = (pc.flags & 2048u) != 0u;
     if ((c0.x < -c0.w && c1.x < -c1.w && c2.x < -c2.w) ||
         (c0.x >  c0.w && c1.x >  c1.w && c2.x >  c2.w) ||
         (c0.y < -c0.w && c1.y < -c1.w && c2.y < -c2.w) ||
@@ -109,7 +125,6 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     float invw1 = 1.0 / c1.w;
     float invw2 = 1.0 / c2.w;
 
-    // 4-bit (1/16 px) subpixel vertex snapping guarantees watertight shared-edge agreement!
     vec2 s0 = round(vec2(pc.vp_x + (c0.x * invw0 * 0.5 + 0.5) * pc.vp_w,
                          pc.vp_y + (c0.y * invw0 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
     vec2 s1 = round(vec2(pc.vp_x + (c1.x * invw1 * 0.5 + 0.5) * pc.vp_w,
@@ -130,7 +145,6 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     bool cull_front = (pc.flags & 2u) != 0u;
     if ((cull_back && !is_front) || (cull_front && is_front)) return;
 
-    // Normalize winding so edge functions are positive inside (area > 0)
     if (area < 0.0) {
         vec2 ts = s1; s1 = s2; s2 = ts;
         float tz = z1; z1 = z2; z2 = tz;
@@ -147,19 +161,27 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
 
     float inv_area = 1.0 / area;
 
-    // Hardware-accurate Depth Bias (polygon offset) for shadow maps & decals!
-    if ((pc.flags & 2048u) != 0u) {
+    if ((pc.flags & 4096u) != 0u) {
         float dzdx = (-(s2.y - s1.y) * z0 - (s0.y - s2.y) * z1 - (s1.y - s0.y) * z2) * inv_area;
         float dzdy = ( (s2.x - s1.x) * z0 + (s0.x - s2.x) * z1 + (s1.x - s0.x) * z2) * inv_area;
         float max_slope = max(abs(dzdx), abs(dzdy));
-        // r = 2^-24 (standard minimum resolvable D24/D32F unit)
         float bias = pc.depth_bias_const * 5.9604645e-8 + pc.depth_bias_slope * max_slope;
         if (pc.depth_bias_clamp > 0.0) bias = min(bias, pc.depth_bias_clamp);
         else if (pc.depth_bias_clamp < 0.0) bias = max(bias, pc.depth_bias_clamp);
-        z0 += bias;
-        z1 += bias;
-        z2 += bias;
+        z0 += bias; z1 += bias; z2 += bias;
     }
+
+    uint tx0 = uint(minx) >> 4u;
+    uint ty0 = uint(miny) >> 4u;
+    uint tx1 = min(pc.tiles_x - 1u, uint(maxx) >> 4u);
+    uint ty1 = min(pc.tiles_y - 1u, uint(maxy) >> 4u);
+
+    bool dtest     = (pc.flags & 8u) != 0u;
+    uint dop       = (pc.flags >> 4u) & 7u;
+    bool use_hiz   = (pc.flags & 8192u) != 0u;
+    bool direct_2d = (pc.flags & 32768u) != 0u;
+    float tri_min_z = clamp(min(z0, min(z1, z2)), 0.0, 1.0);
+    float tri_max_z = clamp(max(z0, max(z1, z2)), 0.0, 1.0);
 
     TriSetup ts;
     ts.v0   = vec4(s0, z0, invw0);
@@ -167,17 +189,27 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     ts.v2   = vec4(s2, z2, invw2);
     ts.area = vec4(inv_area, float(minx), float(miny), float(maxx));
     ts.idx  = uvec4(i0, i1, i2, (uint(maxy) & 0x7FFFFFFFu) | (is_front ? 0x80000000u : 0u));
-    tris[tid] = ts;
 
     int bw = maxx - minx + 1;
     int bh = maxy - miny + 1;
 
-    // CuRast / Nanite Micro-Triangle Fast-Path (bbox <= 64 pixels -> direct lock-free 64-bit atomicMin!)
     if (bw * bh <= 64) {
-        bool dtest = (pc.flags & 8u) != 0u;
-        uint dop = (pc.flags >> 4u) & 7u;
+        if (use_hiz) {
+            bool any_pass = false;
+            for (uint ty = ty0; ty <= ty1 && !any_pass; ++ty) {
+                for (uint tx = tx0; tx <= tx1; ++tx) {
+                    if (hiz_tile_pass(tri_min_z, tri_max_z, tile_hiz[ty * pc.tiles_x + tx], dop)) {
+                        any_pass = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_pass) return;
+        }
+        tris[tid] = ts;
         bool greater_wins = (dop == 4u || dop == 6u);
         bool tl0 = is_top_left(s2 - s1), tl1 = is_top_left(s0 - s2), tl2 = is_top_left(s1 - s0);
+        bool wrote_any = false;
         for (int py = miny; py <= maxy; ++py) {
             float fy = float(py) + 0.5;
             for (int px = minx; px <= maxx; ++px) {
@@ -197,23 +229,29 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
                 uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
                 uint64_t packed = (uint64_t(d_u32) << 32) | uint64_t(tid);
                 atomicMin(vis_px[pidx], packed);
+                wrote_any = true;
+            }
+        }
+        if (wrote_any && !direct_2d) {
+            for (uint ty = ty0; ty <= ty1; ++ty) {
+                for (uint tx = tx0; tx <= tx1; ++tx) {
+                    mark_tile_active(ty * pc.tiles_x + tx);
+                }
             }
         }
         return;
     }
 
-    // CUDARaster / RetroWarp Coarse 16x16 Tile Binning for Large Triangles
-    uint tx0 = uint(minx) >> 4u;
-    uint ty0 = uint(miny) >> 4u;
-    uint tx1 = min(pc.tiles_x - 1u, uint(maxx) >> 4u);
-    uint ty1 = min(pc.tiles_y - 1u, uint(maxy) >> 4u);
-
+    bool wrote_ts = false;
     for (uint ty = ty0; ty <= ty1; ++ty) {
         for (uint tx = tx0; tx <= tx1; ++tx) {
             uint tile_id = ty * pc.tiles_x + tx;
+            if (use_hiz && !hiz_tile_pass(tri_min_z, tri_max_z, tile_hiz[tile_id], dop)) continue;
+            if (!wrote_ts) { tris[tid] = ts; wrote_ts = true; }
             uint slot = atomicAdd(tile_counts[tile_id], 1u);
             if (slot < pc.max_tris_per_tile) {
                 tile_bins[tile_id * pc.max_tris_per_tile + slot] = tid;
+                if (slot == 0u && !direct_2d) mark_tile_active(tile_id);
             }
         }
     }
@@ -232,15 +270,13 @@ void main() {
     uint tri_local  = tid - inst_local * max(eff_tpi, 1u);
     uint vbase      = inst_local * eff_vpi;
 
-    uint topo = (pc.flags >> 8u) & 3u;
+    uint topo = (pc.flags >> 8u) & 7u;
     uint i0, i1, i2;
     if (topo == 0u) {
-        // TRIANGLE_LIST
         i0 = vbase + tri_local * 3u + 0u;
         i1 = vbase + tri_local * 3u + 1u;
         i2 = vbase + tri_local * 3u + 2u;
     } else if (topo == 1u) {
-        // TRIANGLE_STRIP (flip winding on odd triangles)
         if ((tri_local & 1u) == 0u) {
             i0 = vbase + tri_local;
             i1 = vbase + tri_local + 1u;
@@ -251,7 +287,6 @@ void main() {
             i2 = vbase + tri_local + 2u;
         }
     } else {
-        // TRIANGLE_FAN
         i0 = vbase;
         i1 = vbase + tri_local + 1u;
         i2 = vbase + tri_local + 2u;
@@ -260,9 +295,9 @@ void main() {
     vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
     vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
     vec4 c2 = clip_verts[i2 * pc.vert_stride_vec4];
+    if (c0.w < -1.5 || c1.w < -1.5 || c2.w < -1.5) return;
 
-    bool depth_clamp = (pc.flags & 1024u) != 0u;
-    // Near-plane clipping: if depthClampEnable=true, clip only against w > 1e-5 so shadow casters behind near plane clamp cleanly!
+    bool depth_clamp = (pc.flags & 2048u) != 0u;
     bool in0 = depth_clamp ? (c0.w > 1e-5) : (c0.z >= 0.0 && c0.w > 1e-5);
     bool in1 = depth_clamp ? (c1.w > 1e-5) : (c1.z >= 0.0 && c1.w > 1e-5);
     bool in2 = depth_clamp ? (c2.w > 1e-5) : (c2.z >= 0.0 && c2.w > 1e-5);
@@ -273,7 +308,6 @@ void main() {
     }
     if (!in0 && !in1 && !in2) return;
 
-    // Sutherland-Hodgman clip against z = 0 (or w = 1e-4 under depthClampEnable)
     uint v_in[4];
     vec4 p_in[4];
     uint in_ids[3] = uint[3](i0, i1, i2);
@@ -308,13 +342,9 @@ void main() {
         }
     }
 
-    if (n_out >= 3u) {
-        process_tri(tid, v_in[0], v_in[1], v_in[2], p_in[0], p_in[1], p_in[2]);
-    }
+    if (n_out >= 3u) process_tri(tid, v_in[0], v_in[1], v_in[2], p_in[0], p_in[1], p_in[2]);
     if (n_out == 4u) {
         uint tslot = atomicAdd(tile_counts[meta_idx + 1u], 1u);
-        if (tslot < 390000u) {
-            process_tri(pc.extra_tri_base + tslot, v_in[0], v_in[2], v_in[3], p_in[0], p_in[2], p_in[3]);
-        }
+        if (tslot < 390000u) process_tri(pc.extra_tri_base + tslot, v_in[0], v_in[2], v_in[3], p_in[0], p_in[2], p_in[3]);
     }
 }

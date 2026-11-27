@@ -1,6 +1,6 @@
 #version 460
-// smrast_depth_only.comp — SmRast-VK v0.3: Zero-Compile-Cost Depth-Only Pass (Shadow Maps / Z-Prepass)
-// Writes winning depth from 64-bit Visibility Buffer -> Depth attachment when a pipeline has VS-only (no FS).
+// smrast_depth_only.comp — SmRast-VK v0.6:
+//   Hybrid Active-Tile / Coherent-2D Depth-Only Pass + Self-Clearing 64-bit VisBuf
 #extension GL_ARB_gpu_shader_int64 : require
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -8,23 +8,36 @@ struct SmTriSetup {
     vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx;
 };
 
-layout(std430, set = 0, binding = 0) readonly buffer TriSetupBuf { SmTriSetup sm_tris[]; };
-layout(std430, set = 0, binding = 1) readonly buffer VisBuf      { uint64_t sm_vis_px[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer DepthBuf   { float sm_depth_px[]; };
+layout(std430, set = 0, binding = 0) readonly buffer TriSetupBuf    { SmTriSetup sm_tris[]; };
+layout(std430, set = 0, binding = 1) buffer VisBuf                  { uint64_t sm_vis_px[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer DepthBuf      { float sm_depth_px[]; };
+layout(std430, set = 0, binding = 3) readonly buffer ActiveTilesBuf { uint sm_active_tiles[]; };
 
 layout(push_constant) uniform DepthOnlyPC {
     uint width;
     uint height;
     uint depth_write;
-    uint pad;
+    uint tiles_x; // bit31 = direct_2d mode
 } pc;
 
 void main() {
-    uvec2 p = gl_GlobalInvocationID.xy;
-    if (p.x >= pc.width || p.y >= pc.height || pc.depth_write == 0u) return;
+    uint tx, ty;
+    if ((pc.tiles_x & 0x80000000u) != 0u) {
+        tx = gl_WorkGroupID.x;
+        ty = gl_WorkGroupID.y;
+    } else {
+        uint tile_id = sm_active_tiles[gl_WorkGroupID.x];
+        uint tw = pc.tiles_x & 0x7FFFFFFFu;
+        tx = tile_id % tw;
+        ty = tile_id / tw;
+    }
+    uvec2 p = uvec2(tx * 16u + gl_LocalInvocationID.x, ty * 16u + gl_LocalInvocationID.y);
+    if (p.x >= pc.width || p.y >= pc.height) return;
     uint pidx = p.y * pc.width + p.x;
     uint64_t vis = sm_vis_px[pidx];
     if (vis == 0xFFFFFFFFFFFFFFFFul) return;
+    sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;
+    if (pc.depth_write == 0u) return;
     uint tid = uint(vis & 0xFFFFFFFFul);
     SmTriSetup ts = sm_tris[tid];
     float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;

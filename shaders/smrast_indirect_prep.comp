@@ -44,12 +44,21 @@ void main() {
     }
 
     uint tpi = 0u, vpi = 0u;
-    if (count_v_or_i >= 3u && inst_count > 0u) {
-        if (pc.topo_code == 0u) {
+    if (inst_count > 0u) {
+        if (pc.topo_code == 0u && count_v_or_i >= 3u) {
             tpi = count_v_or_i / 3u;
             vpi = tpi * 3u;
-        } else {
+        } else if ((pc.topo_code == 1u || pc.topo_code == 2u) && count_v_or_i >= 3u) {
             tpi = count_v_or_i - 2u;
+            vpi = count_v_or_i;
+        } else if (pc.topo_code == 3u && count_v_or_i >= 2u) {
+            tpi = count_v_or_i / 2u;
+            vpi = tpi * 2u;
+        } else if (pc.topo_code == 4u && count_v_or_i >= 2u) {
+            tpi = count_v_or_i - 1u;
+            vpi = count_v_or_i;
+        } else if (pc.topo_code == 5u && count_v_or_i >= 1u) {
+            tpi = count_v_or_i;
             vpi = count_v_or_i;
         }
     }

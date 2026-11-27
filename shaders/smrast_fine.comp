@@ -1,9 +1,8 @@
 #version 460
-// smrast_fine.comp — SmRast-VK v0.5:
-//   - RetroWarp / cuRE 16x16 Tiled Shared-Memory Fine Compute Rasterizer
-//   - 2-Level Tile Hi-Z Early-Reject (Subgroup + Shared reduction supporting both Standard-Z and Reverse-Z!)
-//   - Hardware-Exact Top-Left Fill-Rule Tie-Breaking (watertight shared edges, zero double-shading!)
-// 1 workgroup (16x16 = 256 threads = 8 warps = 64 2x2 quads) per screen tile.
+// smrast_fine.comp — SmRast-VK v0.6:
+//   - Hybrid Active-Tile Indirect Dispatch (small/medium draws) + Coherent 2D Grid Mode (giant 1M+ meshes)
+//   - Self-Clearing tile_counts & tile_active_flags (ZERO per-draw CmdFillBuffer!)
+//   - 1-Read Persistent Tile Hi-Z with Automatic Live Subgroup Fallback + Watertight Top-Left Fill-Rule
 #extension GL_ARB_gpu_shader_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -18,21 +17,23 @@ struct TriSetup {
     uvec4 idx;   // i0, i1, i2, maxy | (is_front << 31)
 };
 
-layout(std430, set = 0, binding = 0) readonly buffer TriSetupBuf  { TriSetup tris[]; };
-layout(std430, set = 0, binding = 1) readonly buffer TileCountBuf { uint tile_counts[]; };
-layout(std430, set = 0, binding = 2) readonly buffer TileBinsBuf  { uint tile_bins[]; };
-layout(std430, set = 0, binding = 3) buffer VisBuf                { uint64_t vis_px[]; };
-layout(std430, set = 0, binding = 4) readonly buffer DepthBuf     { float depth_px[]; };
+layout(std430, set = 0, binding = 0) readonly buffer TriSetupBuf    { TriSetup tris[]; };
+layout(std430, set = 0, binding = 1) buffer TileCountBuf            { uint tile_counts[]; };
+layout(std430, set = 0, binding = 2) readonly buffer TileBinsBuf    { uint tile_bins[]; };
+layout(std430, set = 0, binding = 3) buffer VisBuf                  { uint64_t vis_px[]; };
+layout(std430, set = 0, binding = 4) readonly buffer DepthBuf       { float depth_px[]; };
+layout(std430, set = 0, binding = 5) readonly buffer ActiveTilesBuf { uint active_tiles[]; };
+layout(std430, set = 0, binding = 6) readonly buffer TileHizBuf     { vec2 tile_hiz[]; };
 
 layout(push_constant) uniform FineParams {
     uint width;
     uint height;
     uint tiles_x;
     uint max_tris_per_tile;
-    uint flags; // bit3=depth_test, bits4..6=depth_op
+    uint flags;   // bit3=depth_test, bits4..6=depth_op, bit13=use_prebin_hiz, bit15=direct_2d
+    uint tiles_y;
 } pc;
 
-// Cooperative shared-memory batch cache + Tile Hi-Z bounds (Hopper 228KB SRAM/SM!)
 const uint BATCH = 64u;
 shared TriSetup s_tris[BATCH];
 shared uint s_tids[BATCH];
@@ -56,7 +57,6 @@ bool is_top_left(vec2 d) {
     return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0);
 }
 
-// Bit-exact shared-edge evaluation matching smrast_bin.comp
 float edge_eval(vec2 a, vec2 b, float fx, float fy) {
     if (a.y < b.y || (a.y == b.y && a.x < b.x)) {
         vec2 d = b - a;
@@ -68,15 +68,29 @@ float edge_eval(vec2 a, vec2 b, float fx, float fy) {
 }
 
 void main() {
-    uint tile_x = gl_WorkGroupID.x;
-    uint tile_y = gl_WorkGroupID.y;
-    uint tile_id = tile_y * pc.tiles_x + tile_x;
-    uint total = min(tile_counts[tile_id], pc.max_tris_per_tile);
-    if (total == 0u) return;
+    bool direct_2d = (pc.flags & 32768u) != 0u;
+    uint tile_x, tile_y, tile_id;
+    if (direct_2d) {
+        tile_x = gl_WorkGroupID.x;
+        tile_y = gl_WorkGroupID.y;
+        tile_id = tile_y * pc.tiles_x + tile_x;
+    } else {
+        tile_id = active_tiles[gl_WorkGroupID.x];
+        tile_x = tile_id % pc.tiles_x;
+        tile_y = tile_id / pc.tiles_x;
+    }
 
-    uvec2 p = gl_GlobalInvocationID.xy;
+    uint local_tid = gl_LocalInvocationIndex; // 0..255
+    uint total = min(tile_counts[tile_id], pc.max_tris_per_tile);
+    uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
+    if (total == 0u) {
+        if (!direct_2d && local_tid == 0u) tile_counts[flag_idx] = 0u;
+        return;
+    }
+
+    uvec2 p = uvec2(tile_x * 16u + gl_LocalInvocationID.x, tile_y * 16u + gl_LocalInvocationID.y);
     bool in_bounds = (p.x < pc.width && p.y < pc.height);
-    uint pidx = p.y * pc.width + p.x;
+    uint pidx = in_bounds ? (p.y * pc.width + p.x) : 0u;
     float fx = float(p.x) + 0.5;
     float fy = float(p.y) + 0.5;
 
@@ -85,34 +99,40 @@ void main() {
     bool greater_wins = (dop == 4u || dop == 6u);
     bool hiz_less    = dtest && (dop == 1u || dop == 3u);
     bool hiz_greater = dtest && (dop == 4u || dop == 6u);
+    bool use_prebin_hiz = (pc.flags & 8192u) != 0u;
 
     float ref_d = in_bounds ? depth_px[pidx] : (greater_wins ? 1.0 : 0.0);
     uint64_t best = in_bounds ? vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;
-    uint local_tid = gl_LocalInvocationIndex; // 0..255
     uint bin_base = tile_id * pc.max_tris_per_tile;
 
-    // 2-Level Tile Hi-Z reduction across 16x16 tile (<10 cycles on Hopper SMs!)
+    // 1-read persistent Tile Hi-Z (fast path) or 2-level live subgroup+shared reduction fallback!
     float tile_zmin = 0.0, tile_zmax = 1.0;
     if (hiz_less || hiz_greater) {
-        float wmin = subgroupMin(in_bounds ? ref_d : 1e30);
-        float wmax = subgroupMax(in_bounds ? ref_d : -1e30);
-        if (subgroupElect()) {
-            s_warp_zmin[gl_SubgroupID] = wmin;
-            s_warp_zmax[gl_SubgroupID] = wmax;
-        }
-        barrier();
-        if (local_tid == 0u) {
-            float mn = 1e30, mx = -1e30;
-            for (uint w = 0u; w < gl_NumSubgroups; ++w) {
-                mn = min(mn, s_warp_zmin[w]);
-                mx = max(mx, s_warp_zmax[w]);
+        if (use_prebin_hiz) {
+            vec2 hz = tile_hiz[tile_id];
+            tile_zmin = hz.x;
+            tile_zmax = hz.y;
+        } else {
+            float wmin = subgroupMin(in_bounds ? ref_d : 1e30);
+            float wmax = subgroupMax(in_bounds ? ref_d : -1e30);
+            if (subgroupElect()) {
+                s_warp_zmin[gl_SubgroupID] = wmin;
+                s_warp_zmax[gl_SubgroupID] = wmax;
             }
-            s_tile_zmin = mn;
-            s_tile_zmax = mx;
+            barrier();
+            if (local_tid == 0u) {
+                float mn = 1e30, mx = -1e30;
+                for (uint w = 0u; w < gl_NumSubgroups; ++w) {
+                    mn = min(mn, s_warp_zmin[w]);
+                    mx = max(mx, s_warp_zmax[w]);
+                }
+                s_tile_zmin = mn;
+                s_tile_zmax = mx;
+            }
+            barrier();
+            tile_zmin = s_tile_zmin;
+            tile_zmax = s_tile_zmax;
         }
-        barrier();
-        tile_zmin = s_tile_zmin;
-        tile_zmax = s_tile_zmax;
     }
 
     for (uint base = 0u; base < total; base += BATCH) {
@@ -127,7 +147,6 @@ void main() {
         if (in_bounds) {
             for (uint k = 0u; k < count; ++k) {
                 TriSetup t = s_tris[k];
-                // Uniform 1-instruction Tile Hi-Z early reject (standard-Z & reverse-Z!)
                 if (hiz_less) {
                     float tri_min_z = clamp(min(t.v0.z, min(t.v1.z, t.v2.z)), 0.0, 1.0);
                     if (dop == 1u ? (tri_min_z >= tile_zmax) : (tri_min_z > tile_zmax)) continue;
@@ -157,6 +176,12 @@ void main() {
             }
         }
         barrier();
+    }
+
+    // Self-clear tile_counts & active flag for this tile (ZERO per-draw CmdFillBuffer!)
+    if (local_tid == 0u) {
+        tile_counts[tile_id] = 0u;
+        if (!direct_2d) tile_counts[flag_idx] = 0u;
     }
 
     if (in_bounds && best != 0xFFFFFFFFFFFFFFFFul) {

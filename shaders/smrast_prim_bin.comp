@@ -1,0 +1,162 @@
+#version 460
+// smrast_prim_bin.comp — SmRast-VK v0.6:
+//   Dedicated LINE_LIST (3), LINE_STRIP (4) (w/ lineWidth) & POINT_LIST (5) (w/ gl_PointSize) Binning Kernel.
+//   Kept separate from smrast_bin.comp so triangle binning maintains peak Hopper SM register occupancy!
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+layout(local_size_x = 64) in;
+
+struct TriSetup {
+    vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx;
+};
+
+layout(std430, set = 0, binding = 0) buffer ClipVertBuf         { vec4 clip_verts[]; };
+layout(std430, set = 0, binding = 1) buffer TriSetupBuf         { TriSetup tris[]; };
+layout(std430, set = 0, binding = 2) buffer TileCountBuf        { uint tile_counts[]; };
+layout(std430, set = 0, binding = 3) buffer TileBinsBuf         { uint tile_bins[]; };
+layout(std430, set = 0, binding = 4) buffer VisBuf              { uint64_t vis_px[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DepthBuf   { float depth_px[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer ActBuf    { uint active_tiles[]; };
+layout(std430, set = 0, binding = 7) buffer DispCmdBuf          { uint disp_cmds[]; };
+layout(std430, set = 0, binding = 8) readonly buffer TileHizBuf { vec2 tile_hiz[]; };
+
+layout(push_constant) uniform BinParams {
+    uint tri_count; uint vert_stride_vec4; uint width; uint height;
+    uint tiles_x; uint tiles_y; uint max_tris_per_tile; uint flags;
+    float vp_x; float vp_y; float vp_w; float vp_h; float vp_min_d; float vp_max_d;
+    int sc_x0; int sc_y0; int sc_x1; int sc_y1;
+    uint tris_per_inst; uint verts_per_inst; uint extra_vert_base; uint extra_tri_base;
+    float depth_bias_const; float depth_bias_slope; float depth_bias_clamp; float line_width;
+} pc;
+
+void mark_tile_active(uint tile_id) {
+    uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
+    if (tile_counts[flag_idx] == 0u) {
+        if (atomicExchange(tile_counts[flag_idx], 1u) == 0u) {
+            uint slot = atomicAdd(disp_cmds[8u], 1u);
+            active_tiles[slot] = tile_id;
+        }
+    }
+}
+
+void copy_vert_varyings(uint dst_idx, uint src_idx, vec4 pos) {
+    uint base_d = dst_idx * pc.vert_stride_vec4;
+    uint base_s = src_idx * pc.vert_stride_vec4;
+    clip_verts[base_d] = pos;
+    for (uint k = 1u; k < pc.vert_stride_vec4; ++k) clip_verts[base_d + k] = clip_verts[base_s + k];
+}
+
+void emit_nocull_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2) {
+    if (c0.w <= 1e-6 || c1.w <= 1e-6 || c2.w <= 1e-6) return;
+    float invw0 = 1.0 / c0.w, invw1 = 1.0 / c1.w, invw2 = 1.0 / c2.w;
+    vec2 s0 = round(vec2(pc.vp_x + (c0.x * invw0 * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y * invw0 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
+    vec2 s1 = round(vec2(pc.vp_x + (c1.x * invw1 * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y * invw1 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
+    vec2 s2 = round(vec2(pc.vp_x + (c2.x * invw2 * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c2.y * invw2 * 0.5 + 0.5) * pc.vp_h) * 16.0) * 0.0625;
+    float z0 = pc.vp_min_d + (c0.z * invw0) * (pc.vp_max_d - pc.vp_min_d);
+    float z1 = pc.vp_min_d + (c1.z * invw1) * (pc.vp_max_d - pc.vp_min_d);
+    float z2 = pc.vp_min_d + (c2.z * invw2) * (pc.vp_max_d - pc.vp_min_d);
+    float area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x);
+    if (abs(area) < 1e-6) return;
+    if (area < 0.0) {
+        vec2 ts = s1; s1 = s2; s2 = ts;
+        float tz = z1; z1 = z2; z2 = tz;
+        float tw = invw1; invw1 = invw2; invw2 = tw;
+        uint ti = i1; i1 = i2; i2 = ti;
+        area = -area;
+    }
+    int minx = max(pc.sc_x0, int(floor(min(s0.x, min(s1.x, s2.x)))));
+    int miny = max(pc.sc_y0, int(floor(min(s0.y, min(s1.y, s2.y)))));
+    int maxx = min(pc.sc_x1 - 1, int(ceil(max(s0.x, max(s1.x, s2.x)))));
+    int maxy = min(pc.sc_y1 - 1, int(ceil(max(s0.y, max(s1.y, s2.y)))));
+    if (minx > maxx || miny > maxy) return;
+
+    TriSetup ts;
+    ts.v0 = vec4(s0, z0, invw0); ts.v1 = vec4(s1, z1, invw1); ts.v2 = vec4(s2, z2, invw2);
+    ts.area = vec4(1.0 / area, float(minx), float(miny), float(maxx));
+    ts.idx = uvec4(i0, i1, i2, (uint(maxy) & 0x7FFFFFFFu) | 0x80000000u);
+    tris[tid] = ts;
+
+    bool direct_2d = (pc.flags & 32768u) != 0u;
+    uint tx0 = uint(minx) >> 4u, ty0 = uint(miny) >> 4u;
+    uint tx1 = min(pc.tiles_x - 1u, uint(maxx) >> 4u);
+    uint ty1 = min(pc.tiles_y - 1u, uint(maxy) >> 4u);
+    for (uint ty = ty0; ty <= ty1; ++ty) {
+        for (uint tx = tx0; tx <= tx1; ++tx) {
+            uint tile_id = ty * pc.tiles_x + tx;
+            uint slot = atomicAdd(tile_counts[tile_id], 1u);
+            if (slot < pc.max_tris_per_tile) {
+                tile_bins[tile_id * pc.max_tris_per_tile + slot] = tid;
+                if (slot == 0u && !direct_2d) mark_tile_active(tile_id);
+            }
+        }
+    }
+}
+
+void emit_screen_quad(uint tid, uint meta_idx, uint ia, uint ib, vec4 pa, vec4 pb, vec4 pc0, vec4 pd0) {
+    uint vslot = atomicAdd(tile_counts[meta_idx], 4u);
+    if (vslot + 4u > 900000u) return;
+    uint nv = pc.extra_vert_base + vslot;
+    copy_vert_varyings(nv + 0u, ia, pa);
+    copy_vert_varyings(nv + 1u, ia, pb);
+    copy_vert_varyings(nv + 2u, ib, pc0);
+    copy_vert_varyings(nv + 3u, ib, pd0);
+    emit_nocull_tri(tid, nv + 0u, nv + 1u, nv + 2u, pa, pb, pc0);
+    uint tslot = atomicAdd(tile_counts[meta_idx + 1u], 1u);
+    if (tslot < 390000u) emit_nocull_tri(pc.extra_tri_base + tslot, nv + 0u, nv + 2u, nv + 3u, pa, pc0, pd0);
+}
+
+void main() {
+    uint meta_idx = pc.tiles_x * pc.tiles_y;
+    uint eff_count = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 2u] : pc.tri_count;
+    uint eff_tpi   = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 3u] : pc.tris_per_inst;
+    uint eff_vpi   = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 4u] : pc.verts_per_inst;
+
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= eff_count) return;
+    uint inst_local = tid / max(eff_tpi, 1u);
+    uint prim_local = tid - inst_local * max(eff_tpi, 1u);
+    uint vbase      = inst_local * eff_vpi;
+
+    uint topo = (pc.flags >> 8u) & 7u;
+    bool depth_clamp = (pc.flags & 2048u) != 0u;
+
+    if (topo == 3u || topo == 4u) {
+        uint i0 = (topo == 3u) ? (vbase + prim_local * 2u) : (vbase + prim_local);
+        uint i1 = i0 + 1u;
+        vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
+        vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
+        if (c0.w < -1.5 || c1.w < -1.5) return;
+        bool in0 = depth_clamp ? (c0.w > 1e-5) : (c0.z >= 0.0 && c0.w > 1e-5);
+        bool in1 = depth_clamp ? (c1.w > 1e-5) : (c1.z >= 0.0 && c1.w > 1e-5);
+        if (!in0 && !in1) return;
+        if (in0 != in1) {
+            float da = depth_clamp ? (c0.w - 1e-4) : c0.z;
+            float db = depth_clamp ? (c1.w - 1e-4) : c1.z;
+            float t = clamp(da / (da - db), 0.0, 1.0);
+            vec4 np = mix(c0, c1, t);
+            if (depth_clamp) np.w = max(np.w, 1e-4); else np.z = max(np.z, 0.0);
+            if (!in0) c0 = np; else c1 = np;
+        }
+        vec2 s0 = vec2(pc.vp_x + (c0.x / c0.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y / c0.w * 0.5 + 0.5) * pc.vp_h);
+        vec2 s1 = vec2(pc.vp_x + (c1.x / c1.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y / c1.w * 0.5 + 0.5) * pc.vp_h);
+        vec2 dir = s1 - s0;
+        float len = length(dir);
+        if (len < 1e-5) return;
+        vec2 nrm = vec2(-dir.y, dir.x) * (0.5 * max(pc.line_width, 1.0) / len);
+        vec2 o0 = vec2(nrm.x * 2.0 / pc.vp_w, nrm.y * 2.0 / pc.vp_h) * c0.w;
+        vec2 o1 = vec2(nrm.x * 2.0 / pc.vp_w, nrm.y * 2.0 / pc.vp_h) * c1.w;
+        emit_screen_quad(tid, meta_idx, i0, i1,
+                         vec4(c0.xy - o0, c0.zw), vec4(c0.xy + o0, c0.zw),
+                         vec4(c1.xy + o1, c1.zw), vec4(c1.xy - o1, c1.zw));
+    } else {
+        uint i0 = vbase + prim_local;
+        vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
+        if (c0.w <= 1e-5 || (!depth_clamp && (c0.z < 0.0 || c0.z > c0.w))) return;
+        float ps = ((pc.flags & 16384u) != 0u) ? clamp(clip_verts[i0 * pc.vert_stride_vec4 + 15u].w, 1.0, 64.0) : max(pc.line_width, 1.0);
+        vec2 h = vec2(ps / abs(pc.vp_w), ps / abs(pc.vp_h)) * c0.w;
+        emit_screen_quad(tid, meta_idx, i0, i0,
+                         vec4(c0.x - h.x, c0.y - h.y, c0.zw), vec4(c0.x + h.x, c0.y - h.y, c0.zw),
+                         vec4(c0.x + h.x, c0.y + h.y, c0.zw), vec4(c0.x - h.x, c0.y + h.y, c0.zw));
+    }
+}

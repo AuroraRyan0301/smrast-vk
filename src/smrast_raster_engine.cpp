@@ -47,15 +47,27 @@ static bool create_buf(SmDevice* dev, VkDeviceSize sz, VkBufferUsageFlags usage,
 }
 
 bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img) {
-    if (!img || img->attach_buf != VK_NULL_HANDLE) return true;
-    uint32_t bpp = img->is_depth ? 4u : sm_format_bpp(img->format);
-    VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * bpp;
-    sz = (sz + 15ull) & ~15ull; // 16-byte aligned for 1B/2B u32 atomic words
-    if (sz < 256) sz = 256;
-    return create_buf(dev, sz,
-                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                      img->attach_buf, img->attach_mem);
+    if (!img) return false;
+    if (img->attach_buf == VK_NULL_HANDLE) {
+        uint32_t bpp = img->is_depth ? 4u : sm_format_bpp(img->format);
+        VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * bpp;
+        sz = (sz + 15ull) & ~15ull; // 16-byte aligned for 1B/2B u32 atomic words
+        if (sz < 256) sz = 256;
+        if (!create_buf(dev, sz,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                        img->attach_buf, img->attach_mem)) return false;
+    }
+    if (img->is_depth && img->hiz_buf == VK_NULL_HANDLE && img->extent.width > 0 && img->extent.height > 0) {
+        uint32_t tx = (img->extent.width + 15u) / 16u;
+        uint32_t ty = (img->extent.height + 15u) / 16u;
+        VkDeviceSize hsz = std::max<VkDeviceSize>(256, (VkDeviceSize)tx * ty * 8u);
+        create_buf(dev, hsz,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                   img->hiz_buf, img->hiz_mem);
+    }
+    return true;
 }
 
 bool sm_ensure_image_stencil_buf(SmDevice* dev, SmImage* img) {
@@ -144,29 +156,31 @@ bool sm_init_raster_engine(SmDevice* dev) {
     const char* shader_dir = getenv("SMRAST_SHADER_DIR");
     if (!shader_dir || !shader_dir[0]) shader_dir = "./build";
 
-    // 1. DescriptorSetLayouts for Clear (8-MRT+Depth+Vis+Stencil+UBO), Bin, Fine, IndirectPrep(+Count), VS-int, FS-int (8-MRT+Stencil)
+    // 1. DescriptorSetLayouts for Clear (8-MRT+Depth+Vis+Stencil+UBO+HiZ+TileCount), Bin, Fine, IndirectPrep, DepthOnly, Blit, HiZUpdate, VS-int, FS-int
     {
-        VkDescriptorSetLayoutBinding b[12];
+        VkDescriptorSetLayoutBinding b[14];
         for (uint32_t i = 0; i < 11; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         b[11] = {11, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 12, b};
+        b[12] = {12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[13] = {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 14, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.clear_dsl);
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.clear_dsl, 0, nullptr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.clear_pl);
     }
     {
-        VkDescriptorSetLayoutBinding b[6];
-        for (uint32_t i = 0; i < 6; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 6, b};
+        VkDescriptorSetLayoutBinding b[9];
+        for (uint32_t i = 0; i < 9; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 9, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.bin_dsl);
         VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.bin_dsl, 1, &pcr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.bin_pl);
     }
     {
-        VkDescriptorSetLayoutBinding b[5];
-        for (uint32_t i = 0; i < 5; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 5, b};
+        VkDescriptorSetLayoutBinding b[7];
+        for (uint32_t i = 0; i < 7; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 7, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.fine_dsl);
         VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.fine_dsl, 1, &pcr};
@@ -182,9 +196,9 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.ind_prep_pl);
     }
     {
-        VkDescriptorSetLayoutBinding b[3];
-        for (uint32_t i = 0; i < 3; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 3, b};
+        VkDescriptorSetLayoutBinding b[4];
+        for (uint32_t i = 0; i < 4; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 4, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.depth_only_dsl);
         VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.depth_only_dsl, 1, &pcr};
@@ -200,35 +214,49 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.blit_pl);
     }
     {
-        // VS internal set: 0=ClipVert, 1=IdxBuf, 2..9=VB0..VB7, 10=VsParams (SSBO to avoid NV535 set>=5 UBO bank aliasing!)
+        VkDescriptorSetLayoutBinding b[3];
+        for (uint32_t i = 0; i < 3; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 3, b};
+        dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.hiz_update_dsl);
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.hiz_update_dsl, 1, &pcr};
+        dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.hiz_update_pl);
+    }
+    {
+        // VS internal set: 0=ClipVert, 1=IdxBuf, 2..9=VB0..VB7, 10=VsParams (DYNAMIC SSBO for zero per-draw vkUpdateDescriptorSets!)
         VkDescriptorSetLayoutBinding b[11];
-        for (uint32_t i = 0; i < 11; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        for (uint32_t i = 0; i < 10; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[10] = {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 11, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.vs_int_dsl);
     }
     {
-        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf, 13=FsParams (SSBO!)
-        VkDescriptorSetLayoutBinding b[14];
-        for (uint32_t i = 0; i < 14; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 14, b};
+        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf, 13=FsParams (DYNAMIC!), 14=ActiveTiles
+        VkDescriptorSetLayoutBinding b[15];
+        for (uint32_t i = 0; i < 15; ++i) b[i] = {i, (i == 13u) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 15, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.fs_int_dsl);
     }
 
     // 2. Load compiled internal Compute Rasterizer SPIR-V shaders onto H20 qf[2]
-    char p_clear[512], p_bin[512], p_fine[512], p_ind[512], p_dep[512], p_blit[512];
+    char p_clear[512], p_bin[512], p_pbin[512], p_fine[512], p_ind[512], p_dep[512], p_blit[512], p_hiz[512];
     snprintf(p_clear, sizeof(p_clear), "%s/smrast_clear.comp.spv", shader_dir);
     snprintf(p_bin,   sizeof(p_bin),   "%s/smrast_bin.comp.spv",   shader_dir);
+    snprintf(p_pbin,  sizeof(p_pbin),  "%s/smrast_prim_bin.comp.spv", shader_dir);
     snprintf(p_fine,  sizeof(p_fine),  "%s/smrast_fine.comp.spv",  shader_dir);
     snprintf(p_ind,   sizeof(p_ind),   "%s/smrast_indirect_prep.comp.spv", shader_dir);
     snprintf(p_dep,   sizeof(p_dep),   "%s/smrast_depth_only.comp.spv", shader_dir);
     snprintf(p_blit,  sizeof(p_blit),  "%s/smrast_blit.comp.spv",  shader_dir);
+    snprintf(p_hiz,   sizeof(p_hiz),   "%s/smrast_hiz_update.comp.spv", shader_dir);
     R.clear_pipe      = make_internal_pipe(dev, p_clear, R.clear_pl);
     R.bin_pipe        = make_internal_pipe(dev, p_bin,   R.bin_pl);
+    R.prim_bin_pipe   = make_internal_pipe(dev, p_pbin,  R.bin_pl);
     R.fine_pipe       = make_internal_pipe(dev, p_fine,  R.fine_pl);
     R.ind_prep_pipe   = make_internal_pipe(dev, p_ind,   R.ind_prep_pl);
     R.depth_only_pipe = make_internal_pipe(dev, p_dep,   R.depth_only_pl);
     R.blit_pipe       = make_internal_pipe(dev, p_blit,  R.blit_pl);
-    if (!R.clear_pipe || !R.bin_pipe || !R.fine_pipe || !R.ind_prep_pipe || !R.depth_only_pipe || !R.blit_pipe) return false;
+    R.hiz_update_pipe = make_internal_pipe(dev, p_hiz,   R.hiz_update_pl);
+    if (!R.clear_pipe || !R.bin_pipe || !R.prim_bin_pipe || !R.fine_pipe || !R.ind_prep_pipe || !R.depth_only_pipe || !R.blit_pipe || !R.hiz_update_pipe) return false;
 
     // 3. Pre-allocate 2.2M verts + 1.1M tris on H20 HBM3 (~640 MB < 0.7% of 96 GB) so DrawIndirect never reallocs mid-CB!
     if (!sm_ensure_geom_capacity(dev, 2200000, 1100000)) return false;
@@ -246,17 +274,19 @@ bool sm_init_raster_engine(SmDevice* dev) {
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_AUX_SLOTS * sizeof(SmClearUBO),
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hv, R.clr_ubo_buf, R.clr_ubo_mem, &R.clr_ubo_ptr)) return false;
 
-    // 4. Batch-allocate descriptor pool & per-slot ring sets (49,152 draw slots = 3+ full 15K-draw 3A open-world frames zero-collision!)
-    uint32_t ND = SmRasterEngine::MAX_DRAWS_IN_FLIGHT;
+    // 4. Batch-allocate cached DS ring pools (16,384 cached sets/stage w/ dynamic SSBO offsets -> 0 vkUpdateDescriptorSets/draw!)
+    uint32_t ND = SmRasterEngine::MAX_DS_RING;
     uint32_t NI = SmRasterEngine::MAX_IND_SLOTS;
     uint32_t NA = SmRasterEngine::MAX_AUX_SLOTS;
-    uint32_t total_sets = ND * 5 + NI + NA * 2;
-    uint32_t total_ssbo = ND * (11 + 14 + 6 + 5 + 3) + NI * 5 + NA * (11 + 2);
-    VkDescriptorPoolSize ps[2] = {
+    uint32_t total_sets = ND * 6 + NI + NA * 2;
+    uint32_t total_ssbo = ND * (10 + 14 + 9 + 7 + 4 + 3) + NI * 5 + NA * (13 + 2);
+    uint32_t total_dyn_ssbo = ND * 2;
+    VkDescriptorPoolSize ps[3] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, total_ssbo},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, total_dyn_ssbo},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NA},
     };
-    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, total_sets, 2, ps};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, total_sets, 3, ps};
     if (dev->fn.CreateDescriptorPool(dev->real_dev, &dpci, nullptr, &R.desc_pool) != VK_SUCCESS) return false;
 
     auto alloc_batch = [&](VkDescriptorSetLayout dsl, uint32_t count, std::vector<VkDescriptorSet>& out) -> bool {
@@ -271,6 +301,7 @@ bool sm_init_raster_engine(SmDevice* dev) {
         !alloc_batch(R.bin_dsl,        ND, R.bin_ds)        ||
         !alloc_batch(R.fine_dsl,       ND, R.fine_ds)       ||
         !alloc_batch(R.depth_only_dsl, ND, R.depth_only_ds) ||
+        !alloc_batch(R.hiz_update_dsl, ND, R.hiz_update_ds) ||
         !alloc_batch(R.vs_int_dsl,     ND, R.vs_int_ds)     ||
         !alloc_batch(R.fs_int_dsl,     ND, R.fs_int_ds)) return false;
 
@@ -291,16 +322,19 @@ bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
         R.retired_bufs.push_back({R.vis_buf, R.vis_mem});
         R.retired_bufs.push_back({R.tile_count_buf, R.tile_count_mem});
         R.retired_bufs.push_back({R.tile_bins_buf, R.tile_bins_mem});
+        R.retired_bufs.push_back({R.active_tiles_buf, R.active_tiles_mem});
         R.vis_buf = VK_NULL_HANDLE; R.vis_mem = VK_NULL_HANDLE;
         R.tile_count_buf = VK_NULL_HANDLE; R.tile_count_mem = VK_NULL_HANDLE;
         R.tile_bins_buf = VK_NULL_HANDLE; R.tile_bins_mem = VK_NULL_HANDLE;
+        R.active_tiles_buf = VK_NULL_HANDLE; R.active_tiles_mem = VK_NULL_HANDLE;
     }
 
     VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (!create_buf(dev, (VkDeviceSize)nw * nh * 8, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.vis_buf, R.vis_mem)) return false;
-    // +8 extra uints at tail of tile_count_buf for near-plane clipper & DrawIndirect metadata!
-    if (!create_buf(dev, (VkDeviceSize)(num_tiles + 8) * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.tile_count_buf, R.tile_count_mem)) return false;
+    // [0..num_tiles-1]=macro tri counts, [num_tiles..+7]=clip/indirect meta, [num_tiles+8..2*num_tiles+7]=active tile flags
+    if (!create_buf(dev, (VkDeviceSize)(num_tiles * 2 + 16) * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.tile_count_buf, R.tile_count_mem)) return false;
     if (!create_buf(dev, (VkDeviceSize)num_tiles * SM_MAX_TRIS_PER_TILE * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.tile_bins_buf, R.tile_bins_mem)) return false;
+    if (!create_buf(dev, std::max<VkDeviceSize>(256, (VkDeviceSize)num_tiles * 4), u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.active_tiles_buf, R.active_tiles_mem)) return false;
 
     R.cur_w = nw; R.cur_h = nh;
     R.tiles_x = tx; R.tiles_y = ty;
@@ -312,7 +346,8 @@ void sm_destroy_raster_engine(SmDevice* dev) {
     if (!dev->real_dev) return;
     dev->fn.DeviceWaitIdle(dev->real_dev);
     auto dpipe = [&](VkPipeline& p) { if (p) { dev->fn.DestroyPipeline(dev->real_dev, p, nullptr); p = VK_NULL_HANDLE; } };
-    dpipe(R.clear_pipe); dpipe(R.bin_pipe); dpipe(R.fine_pipe); dpipe(R.ind_prep_pipe); dpipe(R.depth_only_pipe); dpipe(R.blit_pipe);
+    dpipe(R.clear_pipe); dpipe(R.bin_pipe); dpipe(R.prim_bin_pipe); dpipe(R.fine_pipe); dpipe(R.ind_prep_pipe);
+    dpipe(R.depth_only_pipe); dpipe(R.blit_pipe); dpipe(R.hiz_update_pipe);
     for (auto& rb : R.retired_bufs) {
         if (rb.first)  dev->fn.DestroyBuffer(dev->real_dev, rb.first, nullptr);
         if (rb.second) dev->fn.FreeMemory(dev->real_dev, rb.second, nullptr);

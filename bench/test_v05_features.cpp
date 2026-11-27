@@ -699,5 +699,9 @@ void main() { o = vec4(pc.color_z.rgb, 1.0); }
     }
 
     printf("V05_FEATURE_TEST PASS\n");
+    fflush(stdout);
+    vkDeviceWaitIdle(dev);
+    vkDestroyDevice(dev, nullptr);
+    vkDestroyInstance(inst, nullptr);
     return 0;
 }

@@ -1,19 +1,22 @@
 #version 460
-// smrast_clear.comp — SmRast-VK v0.4: 8-MRT (1B/2B/4B/8B/16B HDR) + Depth + 64-bit VisBuf + 8-bit Stencil Clear
+// smrast_clear.comp — SmRast-VK v0.6:
+//   8-MRT (1B/2B/4B/8B/16B HDR) + Depth + 64-bit VisBuf + 8-bit Stencil + Tile Hi-Z + Tile Counts Clear
 #extension GL_ARB_gpu_shader_int64 : require
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(std430, set = 0, binding = 0)  writeonly buffer Color0Buf  { uint col0[]; };
-layout(std430, set = 0, binding = 1)  writeonly buffer Color1Buf  { uint col1[]; };
-layout(std430, set = 0, binding = 2)  writeonly buffer Color2Buf  { uint col2[]; };
-layout(std430, set = 0, binding = 3)  writeonly buffer Color3Buf  { uint col3[]; };
-layout(std430, set = 0, binding = 4)  writeonly buffer Color4Buf  { uint col4[]; };
-layout(std430, set = 0, binding = 5)  writeonly buffer Color5Buf  { uint col5[]; };
-layout(std430, set = 0, binding = 6)  writeonly buffer Color6Buf  { uint col6[]; };
-layout(std430, set = 0, binding = 7)  writeonly buffer Color7Buf  { uint col7[]; };
-layout(std430, set = 0, binding = 8)  writeonly buffer DepthBuf   { float dep_px[]; };
-layout(std430, set = 0, binding = 9)  writeonly buffer VisBuf     { uint64_t vis_px[]; };
-layout(std430, set = 0, binding = 10) writeonly buffer StencilBuf { uint stn_px[]; };
+layout(std430, set = 0, binding = 0)  writeonly buffer Color0Buf    { uint col0[]; };
+layout(std430, set = 0, binding = 1)  writeonly buffer Color1Buf    { uint col1[]; };
+layout(std430, set = 0, binding = 2)  writeonly buffer Color2Buf    { uint col2[]; };
+layout(std430, set = 0, binding = 3)  writeonly buffer Color3Buf    { uint col3[]; };
+layout(std430, set = 0, binding = 4)  writeonly buffer Color4Buf    { uint col4[]; };
+layout(std430, set = 0, binding = 5)  writeonly buffer Color5Buf    { uint col5[]; };
+layout(std430, set = 0, binding = 6)  writeonly buffer Color6Buf    { uint col6[]; };
+layout(std430, set = 0, binding = 7)  writeonly buffer Color7Buf    { uint col7[]; };
+layout(std430, set = 0, binding = 8)  writeonly buffer DepthBuf     { float dep_px[]; };
+layout(std430, set = 0, binding = 9)  writeonly buffer VisBuf       { uint64_t vis_px[]; };
+layout(std430, set = 0, binding = 10) writeonly buffer StencilBuf   { uint stn_px[]; };
+layout(std430, set = 0, binding = 12) writeonly buffer TileHizBuf   { vec2 tile_hiz[]; };
+layout(std430, set = 0, binding = 13) writeonly buffer TileCountBuf { uint tile_counts[]; };
 
 layout(std140, set = 0, binding = 11) uniform ClearUBO {
     uint width;
@@ -21,7 +24,9 @@ layout(std140, set = 0, binding = 11) uniform ClearUBO {
     uint clear_mask;      // bits 0..7=RT0..7, bit8=depth, bit9=vis, bit10=stencil
     float clear_depth;
     uint clear_stencil;
-    uint pad0; uint pad1; uint pad2;
+    uint tiles_x;
+    uint tiles_y;
+    uint hiz_en;
     uvec4 rt_bpp_code[2]; // 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
     uvec4 rt_clear[8];    // packed clear words (1B/2B replicated across u32 in .x)
 } u;
@@ -39,6 +44,21 @@ uint get_bpp(uint i) { return u.rt_bpp_code[i >> 2u][i & 3u]; }
     }
 
 void main() {
+    if (gl_LocalInvocationIndex == 0u && u.tiles_x > 0u) {
+        uint tile_id = gl_WorkGroupID.y * u.tiles_x + gl_WorkGroupID.x;
+        if ((u.clear_mask & 256u) != 0u && u.hiz_en != 0u) {
+            tile_hiz[tile_id] = vec2(u.clear_depth, u.clear_depth);
+        }
+        if ((u.clear_mask & 512u) != 0u) {
+            uint num_tiles = u.tiles_x * u.tiles_y;
+            tile_counts[tile_id] = 0u;
+            tile_counts[num_tiles + 8u + tile_id] = 0u;
+            if (tile_id == 0u) {
+                for (uint m = 0u; m < 8u; ++m) tile_counts[num_tiles + m] = 0u;
+            }
+        }
+    }
+
     uvec2 p = gl_GlobalInvocationID.xy;
     if (p.x >= u.width || p.y >= u.height) return;
     uint idx = p.y * u.width + p.x;
