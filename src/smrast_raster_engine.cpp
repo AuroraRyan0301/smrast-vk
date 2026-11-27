@@ -48,6 +48,7 @@ static bool create_buf(SmDevice* dev, VkDeviceSize sz, VkBufferUsageFlags usage,
 
 bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img) {
     if (!img) return false;
+    std::lock_guard<std::recursive_mutex> rlk(dev->res_mtx);
     if (img->attach_buf == VK_NULL_HANDLE) {
         uint32_t bpp = img->is_depth ? 4u : sm_format_bpp(img->format);
         VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * bpp;
@@ -72,6 +73,7 @@ bool sm_ensure_image_attach_buf(SmDevice* dev, SmImage* img) {
 
 bool sm_ensure_image_stencil_buf(SmDevice* dev, SmImage* img) {
     if (!img) return false;
+    std::lock_guard<std::recursive_mutex> rlk(dev->res_mtx);
     if (img->stencil_buf == VK_NULL_HANDLE) {
         VkDeviceSize sz = (VkDeviceSize)img->extent.width * img->extent.height * 4u;
         if (sz < 256) sz = 256;
@@ -313,10 +315,12 @@ bool sm_init_raster_engine(SmDevice* dev) {
         !alloc_batch(R.vs_int_dsl,     ND, R.vs_int_ds)     ||
         !alloc_batch(R.fs_int_dsl,     ND, R.fs_int_ds)) return false;
 
-    return sm_ensure_vis_size(dev, 1920, 1080);
+    // Pre-size vis_buf to 2048x2048 so 1080p/2K shadow maps never reallocate mid-frame across DX12 worker threads!
+    return sm_ensure_vis_size(dev, 2048, 2048);
 }
 
 bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
+    std::lock_guard<std::recursive_mutex> rlk(dev->res_mtx);
     auto& R = dev->rast;
     if (w <= R.cur_w && h <= R.cur_h && R.vis_buf != VK_NULL_HANDLE) return true;
     uint32_t nw = std::max(w, R.cur_w);
@@ -325,28 +329,36 @@ bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
     uint32_t ty = (nh + 15) / 16;
     uint32_t num_tiles = tx * ty;
 
-    if (R.vis_buf) {
-        // Retire safely so in-flight / recorded CBs never hit freed HBM3 pages!
-        R.retired_bufs.push_back({R.vis_buf, R.vis_mem});
-        R.retired_bufs.push_back({R.tile_count_buf, R.tile_count_mem});
-        R.retired_bufs.push_back({R.tile_bins_buf, R.tile_bins_mem});
-        R.retired_bufs.push_back({R.active_tiles_buf, R.active_tiles_mem});
-        R.vis_buf = VK_NULL_HANDLE; R.vis_mem = VK_NULL_HANDLE;
-        R.tile_count_buf = VK_NULL_HANDLE; R.tile_count_mem = VK_NULL_HANDLE;
-        R.tile_bins_buf = VK_NULL_HANDLE; R.tile_bins_mem = VK_NULL_HANDLE;
-        R.active_tiles_buf = VK_NULL_HANDLE; R.active_tiles_mem = VK_NULL_HANDLE;
-    }
-
     VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    if (!create_buf(dev, (VkDeviceSize)nw * nh * 8, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.vis_buf, R.vis_mem)) return false;
-    // [0..num_tiles-1]=macro tri counts, [num_tiles..+7]=clip/indirect meta, [num_tiles+8..2*num_tiles+7]=active tile flags
-    if (!create_buf(dev, (VkDeviceSize)(num_tiles * 2 + 16) * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.tile_count_buf, R.tile_count_mem)) return false;
-    if (!create_buf(dev, (VkDeviceSize)num_tiles * SM_MAX_TRIS_PER_TILE * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.tile_bins_buf, R.tile_bins_mem)) return false;
-    if (!create_buf(dev, std::max<VkDeviceSize>(256, (VkDeviceSize)num_tiles * 4), u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.active_tiles_buf, R.active_tiles_mem)) return false;
+    VkBuffer new_vis = VK_NULL_HANDLE, new_tc = VK_NULL_HANDLE, new_tb = VK_NULL_HANDLE, new_at = VK_NULL_HANDLE;
+    VkDeviceMemory new_vis_m = VK_NULL_HANDLE, new_tc_m = VK_NULL_HANDLE, new_tb_m = VK_NULL_HANDLE, new_at_m = VK_NULL_HANDLE;
+    if (!create_buf(dev, (VkDeviceSize)nw * nh * 8, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_vis, new_vis_m)) return false;
+    if (!create_buf(dev, (VkDeviceSize)(num_tiles * 2 + 16) * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_tc, new_tc_m)) return false;
+    if (!create_buf(dev, (VkDeviceSize)num_tiles * SM_MAX_TRIS_PER_TILE * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_tb, new_tb_m)) return false;
+    if (!create_buf(dev, std::max<VkDeviceSize>(256, (VkDeviceSize)num_tiles * 4), u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_at, new_at_m)) return false;
 
-    R.cur_w = nw; R.cur_h = nh;
-    R.tiles_x = tx; R.tiles_y = ty;
-    R.vis_inited = false;
+    {
+        std::lock_guard<std::mutex> dlk(dev->mtx);
+        if (R.vis_buf) {
+            R.retired_bufs.push_back({R.vis_buf, R.vis_mem});
+            R.retired_bufs.push_back({R.tile_count_buf, R.tile_count_mem});
+            R.retired_bufs.push_back({R.tile_bins_buf, R.tile_bins_mem});
+            R.retired_bufs.push_back({R.active_tiles_buf, R.active_tiles_mem});
+        }
+        R.vis_buf = new_vis; R.vis_mem = new_vis_m;
+        R.tile_count_buf = new_tc; R.tile_count_mem = new_tc_m;
+        R.tile_bins_buf = new_tb; R.tile_bins_mem = new_tb_m;
+        R.active_tiles_buf = new_at; R.active_tiles_mem = new_at_m;
+        R.cur_w = nw; R.cur_h = nh;
+        R.tiles_x = tx; R.tiles_y = ty;
+        R.vis_inited = false;
+        R.bin_ds_cache.clear();
+        R.fine_ds_cache.clear();
+        R.fs_ds_cache.clear();
+        R.dep_ds_cache.clear();
+        R.hiz_ds_cache.clear();
+        R.ind_prep_ds_cache.clear();
+    }
     return true;
 }
 

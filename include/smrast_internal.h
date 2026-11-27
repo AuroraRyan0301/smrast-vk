@@ -141,6 +141,7 @@ struct BackendDevFns {
     PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
     PFN_vkQueueSubmit QueueSubmit = nullptr;
     PFN_vkQueueSubmit2 QueueSubmit2 = nullptr;
+    PFN_vkQueueBindSparse QueueBindSparse = nullptr;
     PFN_vkQueueWaitIdle QueueWaitIdle = nullptr;
 
     PFN_vkAllocateMemory AllocateMemory = nullptr;
@@ -231,6 +232,8 @@ struct SmPhysicalDevice {
     SmInstance* inst = nullptr;
     VkPhysicalDevice real_pd = VK_NULL_HANDLE;
     uint32_t backend_compute_qf = 2;
+    uint32_t backend_compute_qcount = 1;
+    bool backend_has_sparse = false;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceMemoryProperties mem_props{};
 };
@@ -294,6 +297,7 @@ struct SmImage {
     VkDeviceMemory stencil_mem = VK_NULL_HANDLE;
     VkImage real_stencil_img = VK_NULL_HANDLE;
     VkDeviceMemory real_stencil_mem = VK_NULL_HANDLE;
+    VkDeviceMemory real_img_mem = VK_NULL_HANDLE; // owned memory for swapchain real_img
     VkBuffer host_buf = VK_NULL_HANDLE;
     VkDeviceMemory host_mem = VK_NULL_HANDLE;
     void* host_ptr = nullptr;
@@ -598,6 +602,12 @@ struct SmQueue {
     std::mutex mtx;
 };
 
+struct SmQueryPool {
+    VkQueryPool real_qp = VK_NULL_HANDLE;
+    VkQueryType orig_type = VK_QUERY_TYPE_TIMESTAMP;
+    uint32_t query_count = 0;
+};
+
 struct SmDynUboDesc {
     uint32_t set = 0;
     uint32_t binding = 0;
@@ -615,6 +625,7 @@ struct SmDevice {
     BackendDevFns fn;
     VkDevice real_dev = VK_NULL_HANDLE;
     SmQueue* main_queue = nullptr;
+    std::vector<SmQueue*> queues;
     SmRasterEngine rast;
     std::unordered_map<VkDescriptorSetLayout, uint32_t> dsl_dyn_counts;
     std::unordered_map<VkDescriptorSetLayout, std::vector<SmDynUboDesc>> dsl_dyn_ubos;
@@ -625,6 +636,7 @@ struct SmDevice {
     uint32_t compiled_gfx_pipes = 0;
     uint32_t failed_gfx_pipes = 0;
     std::mutex mtx;
+    std::recursive_mutex res_mtx;
 };
 
 struct SmPushDescSet {
@@ -830,7 +842,7 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
                                   std::vector<uint32_t>& out_comp_spv,
                                   std::string& err);
 
-void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
+void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img, SmQueue* present_q,
                             uint32_t wait_sem_cnt = 0, const VkSemaphore* wait_sems = nullptr);
 void sm_wsi_cleanup_swapchain(SmSwapchain* sc);
 

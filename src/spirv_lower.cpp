@@ -12,6 +12,7 @@
 #include <spirv_cross/spirv_cross_c.h>
 #include <shaderc/shaderc.h>
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,8 +21,22 @@
 #include <regex>
 #include <sstream>
 #include <unordered_map>
+#include <cerrno>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
+extern char** environ;
+
+// Prevent Wine thread teardown (pthread_cancel -> __forced_unwind) from firing inside
+// libspirv-cross-c-shared / libshaderc C++ catch(...) blocks (which would trigger glibc
+// "FATAL: exception not rethrown" during multi-threaded PSO compilation!).
+struct SmCancelDisableGuard {
+    int old_state = PTHREAD_CANCEL_ENABLE;
+    SmCancelDisableGuard()  { pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state); }
+    ~SmCancelDisableGuard() { pthread_setcancelstate(old_state, nullptr); }
+};
 
 static uint64_t fnv1a_64(const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
@@ -59,6 +74,181 @@ struct ThreadLocalShaderc {
 
 static std::atomic<uint64_t> g_tmp_seq{0};
 
+// Vulkan SPIR-V spec rule (VUID-StandaloneSpirv-OpSampledImage-04651 / 06671):
+//   "All OpSampledImage instructions must be in the same basic block in which their Result <id> are consumed."
+// Complex ternary/conditional coordinate expressions inside `textureGrad(sampler2D(tex, smp), cond ? a : b, ...)`
+// cause glslang to emit OpSampledImage before the branch and OpImageSample* after the merge block, which crashes
+// NVIDIA's libnvidia-glvkspirv.so (_nv002nvvm, si_addr=0x4) when compiled at -O0!
+// Sinking each cross-block OpSampledImage immediately before its consumer instruction(s) guarantees 100% valid SPIR-V.
+static void sm_sink_op_sampled_image(std::vector<uint32_t>& spv) {
+    if (spv.size() < 5 || spv[0] != 0x07230203u) return;
+    struct Inst { uint32_t pos, wc, op; };
+    std::vector<Inst> insts;
+    insts.reserve(spv.size() / 4);
+    for (uint32_t p = 5; p < (uint32_t)spv.size(); ) {
+        uint32_t w0 = spv[p];
+        uint32_t wc = w0 >> 16;
+        uint32_t op = w0 & 0xFFFFu;
+        if (wc == 0 || p + wc > spv.size()) return; // malformed
+        insts.push_back({p, wc, op});
+        p += wc;
+    }
+
+    constexpr uint32_t kOpFunction     = 54;
+    constexpr uint32_t kOpFunctionEnd  = 56;
+    constexpr uint32_t kOpDecorate     = 71;
+    constexpr uint32_t kOpSampledImage = 86;
+    constexpr uint32_t kOpLabel        = 248;
+
+    struct SDef {
+        uint32_t inst_idx;
+        uint32_t block_id;
+        uint32_t res_type, res_id, img_id, smp_id;
+    };
+    struct SUse {
+        uint32_t inst_idx;
+        uint32_t word_k;
+        uint32_t block_id;
+    };
+
+    uint32_t id_bound = spv[3];
+    std::vector<uint8_t> skip_inst(insts.size(), 0);
+    std::unordered_map<uint32_t, std::vector<std::array<uint32_t, 5>>> insert_before;
+    std::unordered_map<uint64_t, uint32_t> rewrite_word; // (inst_idx<<32 | k) -> new_id
+    std::vector<std::pair<uint32_t, uint32_t>> cloned_ids; // (orig_id, new_id) for OpDecorate cloning
+    bool modified = false;
+
+    for (size_t i = 0; i < insts.size(); ++i) {
+        if (insts[i].op != kOpFunction) continue;
+        size_t fn_end = i + 1;
+        while (fn_end < insts.size() && insts[fn_end].op != kOpFunctionEnd) ++fn_end;
+        if (fn_end >= insts.size()) break;
+
+        std::unordered_map<uint32_t, SDef> defs;
+        uint32_t blk = 0;
+        for (size_t j = i + 1; j < fn_end; ++j) {
+            if (insts[j].op == kOpLabel) ++blk;
+            else if (insts[j].op == kOpSampledImage && insts[j].wc == 5) {
+                uint32_t p = insts[j].pos;
+                SDef d{(uint32_t)j, blk, spv[p+1], spv[p+2], spv[p+3], spv[p+4]};
+                defs[d.res_id] = d;
+            }
+        }
+        if (defs.empty()) { i = fn_end; continue; }
+
+        std::unordered_map<uint32_t, std::vector<SUse>> uses;
+        blk = 0;
+        for (size_t j = i + 1; j < fn_end; ++j) {
+            if (insts[j].op == kOpLabel) { ++blk; continue; }
+            if (insts[j].op == kOpSampledImage) continue;
+            uint32_t p = insts[j].pos, wc = insts[j].wc;
+            for (uint32_t k = 1; k < wc; ++k) {
+                uint32_t w = spv[p + k];
+                if (defs.find(w) != defs.end()) {
+                    uses[w].push_back({(uint32_t)j, k, blk});
+                }
+            }
+        }
+
+        for (const auto& kv : defs) {
+            const SDef& d = kv.second;
+            auto uit = uses.find(d.res_id);
+            if (uit == uses.end() || uit->second.empty()) continue;
+            bool cross_block = false;
+            for (const auto& u : uit->second) {
+                if (u.block_id != d.block_id) { cross_block = true; break; }
+            }
+            if (!cross_block) continue;
+
+            modified = true;
+            skip_inst[d.inst_idx] = 1;
+            // Group uses by consumer instruction index so each consumer gets its OpSampledImage right before it
+            std::unordered_map<uint32_t, uint32_t> inst_to_id;
+            bool reused_orig = false;
+            for (const auto& u : uit->second) {
+                auto it_id = inst_to_id.find(u.inst_idx);
+                uint32_t use_id = 0;
+                if (it_id != inst_to_id.end()) {
+                    use_id = it_id->second;
+                } else {
+                    if (!reused_orig) {
+                        use_id = d.res_id;
+                        reused_orig = true;
+                    } else {
+                        use_id = id_bound++;
+                        cloned_ids.push_back({d.res_id, use_id});
+                    }
+                    inst_to_id[u.inst_idx] = use_id;
+                    insert_before[u.inst_idx].push_back({(5u << 16) | kOpSampledImage, d.res_type, use_id, d.img_id, d.smp_id});
+                }
+                if (use_id != d.res_id) {
+                    rewrite_word[((uint64_t)u.inst_idx << 32) | u.word_k] = use_id;
+                }
+            }
+        }
+        i = fn_end;
+    }
+
+    if (!modified) return;
+
+    // Collect any OpDecorate instructions targeting cloned original IDs
+    std::vector<std::vector<uint32_t>> extra_decs;
+    if (!cloned_ids.empty()) {
+        for (size_t i = 0; i < insts.size(); ++i) {
+            if (insts[i].op == kOpDecorate && insts[i].wc >= 3) {
+                uint32_t tgt = spv[insts[i].pos + 1];
+                for (const auto& pr : cloned_ids) {
+                    if (pr.first == tgt) {
+                        std::vector<uint32_t> dec(spv.begin() + insts[i].pos, spv.begin() + insts[i].pos + insts[i].wc);
+                        dec[1] = pr.second;
+                        extra_decs.push_back(std::move(dec));
+                    }
+                }
+            }
+        }
+    }
+
+    // Emit cloned OpDecorate instructions inside the SPIR-V Annotations section (right before types/globals!)
+    size_t insert_decs_before = insts.size();
+    if (!extra_decs.empty()) {
+        for (size_t i = 0; i < insts.size(); ++i) {
+            uint32_t op = insts[i].op;
+            if ((op >= 19 && op <= 39) || op == kOpFunction) { // first OpType* or OpFunction
+                insert_decs_before = i;
+                break;
+            }
+        }
+    }
+
+    std::vector<uint32_t> out;
+    out.reserve(spv.size() + insert_before.size() * 5 + extra_decs.size() * 4);
+    for (uint32_t h = 0; h < 5; ++h) out.push_back(spv[h]);
+    out[3] = id_bound;
+    bool emitted_extra_decs = extra_decs.empty();
+
+    for (size_t i = 0; i < insts.size(); ++i) {
+        if (!emitted_extra_decs && i == insert_decs_before) {
+            for (const auto& dec : extra_decs) out.insert(out.end(), dec.begin(), dec.end());
+            emitted_extra_decs = true;
+        }
+        if (skip_inst[i]) continue;
+        auto iit = insert_before.find((uint32_t)i);
+        if (iit != insert_before.end()) {
+            for (const auto& ins5 : iit->second) out.insert(out.end(), ins5.begin(), ins5.end());
+        }
+        uint32_t p = insts[i].pos, wc = insts[i].wc;
+        for (uint32_t k = 0; k < wc; ++k) {
+            uint32_t w = spv[p + k];
+            if (k >= 1) {
+                auto rit = rewrite_word.find(((uint64_t)i << 32) | k);
+                if (rit != rewrite_word.end()) w = rit->second;
+            }
+            out.push_back(w);
+        }
+    }
+    spv.swap(out);
+}
+
 static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
                                 std::vector<uint32_t>& out_spv, std::string& err) {
     uint64_t h = fnv1a_64(glsl.data(), glsl.size());
@@ -75,7 +265,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v9b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v10c_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -94,10 +284,12 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
         }
     }
 
-    // 3. Fast in-process libshaderc compilation (zero fork/exec; auto-fallback to -O0 if SPIR-V opt trips on OpSampledImage!)
+    // 3. Fast in-process libshaderc compilation (zero fork/exec; auto-fallback to -O0 + sink + spirv-opt -O if
+    //    glslang emitted a cross-block OpSampledImage before shaderc's internal optimizer could run!)
     thread_local ThreadLocalShaderc sc;
     char fname[64];
     snprintf(fname, sizeof(fname), "smrast_%s_%016llx.comp", tag, (unsigned long long)h);
+    bool used_o0_fallback = false;
     shaderc_compilation_result_t res = shaderc_compile_into_spv(
         sc.compiler, glsl.data(), glsl.size(), shaderc_compute_shader, fname, "main", sc.opts);
 
@@ -105,6 +297,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
         const char* msg = shaderc_result_get_error_message(res);
         if (msg && strstr(msg, "failed to optimize") != nullptr) {
             shaderc_result_release(res);
+            used_o0_fallback = true;
             res = shaderc_compile_into_spv(
                 sc.compiler, glsl.data(), glsl.size(), shaderc_compute_shader, fname, "main", sc.opts_zero);
         }
@@ -126,6 +319,49 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
     out_spv.resize(len / 4);
     memcpy(out_spv.data(), bytes, len);
     shaderc_result_release(res);
+
+    // Ensure every OpSampledImage resides in the exact same basic block as its consumer(s)
+    sm_sink_op_sampled_image(out_spv);
+
+    // For the ~1% of shaders that fell back to -O0 due to pre-sink cross-block OpSampledImage,
+    // run spirv-opt -O AFTER sinking so all helper functions (sm_user_fs_main) are inlined and
+    // SSA-rewritten (avoids NVIDIA 535 libnvidia-glvkspirv.so _nv002nvvm crash on un-inlined bindless -O0 SPIR-V!).
+    if (used_o0_fallback) {
+        uint64_t seq = g_tmp_seq.fetch_add(1);
+        char in_p[128], out_p[128];
+        snprintf(in_p, sizeof(in_p), "/tmp/smrast_sopt_%d_%llu_in.spv", (int)getpid(), (unsigned long long)seq);
+        snprintf(out_p, sizeof(out_p), "/tmp/smrast_sopt_%d_%llu_out.spv", (int)getpid(), (unsigned long long)seq);
+        {
+            std::ofstream fin(in_p, std::ios::binary);
+            if (fin.good()) fin.write((const char*)out_spv.data(), out_spv.size() * 4);
+        }
+        char arg0[] = "spirv-opt";
+        char arg1[] = "-O";
+        char arg2[] = "-o";
+        char* argv[] = { arg0, arg1, in_p, arg2, out_p, nullptr };
+        pid_t child = -1;
+        if (posix_spawnp(&child, "spirv-opt", nullptr, nullptr, argv, environ) == 0 && child > 0) {
+            int st = 0;
+            while (waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+                std::ifstream fout(out_p, std::ios::binary | std::ios::ate);
+                if (fout.good()) {
+                    size_t osz = (size_t)fout.tellg();
+                    if (osz >= 20 && (osz % 4) == 0) {
+                        fout.seekg(0);
+                        std::vector<uint32_t> opt_spv(osz / 4);
+                        fout.read((char*)opt_spv.data(), osz);
+                        if (fout.good() && opt_spv[0] == 0x07230203u) {
+                            sm_sink_op_sampled_image(opt_spv);
+                            out_spv.swap(opt_spv);
+                        }
+                    }
+                }
+            }
+        }
+        unlink(in_p);
+        unlink(out_p);
+    }
 
     {
         char tmp_path[300];
@@ -579,7 +815,8 @@ static std::string rewrite_texture_calls(const std::string& src) {
             return "(" + coord + ")";
         };
         auto no_grad_sampler = [&](const std::string& samp) {
-            return samp.find("CubeArray") != std::string::npos || samp.find("CubeShadow") != std::string::npos;
+            return samp.find("CubeArray") != std::string::npos || samp.find("CubeShadow") != std::string::npos ||
+                   samp.find("2DArrayShadow") != std::string::npos || samp.find("1DArrayShadow") != std::string::npos;
         };
 
         if (which == 4) { // textureQueryLod
@@ -630,7 +867,9 @@ static std::string strip_version_and_stage_io(const std::string& glsl, std::stri
     std::regex re_out(R"(^\s*layout\s*\([^)]*location\s*=\s*\d+[^)]*\)\s*(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise)\s+)*out\s+(.+);)");
     std::regex re_qual_line(R"(^\s*(?:invariant|precise)\s+[A-Za-z_][A-Za-z0-9_]*\s*;)");
     std::regex re_fs_layout(R"(^\s*layout\s*\([^)]*(?:early_fragment_tests|origin_upper_left|pixel_center_integer|depth_any|depth_greater|depth_less|depth_unchanged)[^)]*\)\s*(?:in|out)\b.*;)");
-    std::regex re_perv(R"(^\s*out\s+gl_PerVertex\b.*)");
+    std::regex re_perv(R"(^\s*(?:in|out)\s+gl_PerVertex\b.*)");
+    // Strip bare built-in stage I/O redeclarations (e.g. `out float gl_ClipDistance[8];`, `in float gl_CullDistance[4];`)
+    std::regex re_builtin_io(R"(^\s*(?:layout\s*\([^)]*\)\s*)?(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise)\s+)*(?:in|out)\s+[^;{]*\bgl_[A-Za-z0-9_]+\b[^;{]*;)");
     std::regex re_ext_fs(R"(^\s*#extension\s+(?:GL_ARB_fragment_shader_interlock|GL_EXT_demote_to_helper_invocation|GL_ARB_derivative_control|GL_EXT_fragment_shader_barycentric|GL_NV_fragment_shader_barycentric|GL_EXT_post_depth_coverage)\b.*)");
     std::regex re_ext_any(R"(^\s*#extension\b.*)");
     bool skip_perv_block = false;
@@ -652,6 +891,7 @@ static std::string strip_version_and_stage_io(const std::string& glsl, std::stri
             if (line.find("};") == std::string::npos) skip_perv_block = true;
             continue;
         }
+        if (std::regex_match(line, re_builtin_io)) continue;
         std::smatch m;
         if (std::regex_match(line, m, re_in)) {
             oss << m[1].str() << "; // lowered stage input\n";
@@ -876,6 +1116,7 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            std::string& err,
                            bool* out_writes_point_size,
                            uint32_t* out_stride_vec4) {
+    SmCancelDisableGuard _cancel_guard;
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
@@ -907,10 +1148,16 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
     body = replace_ident(body, "gl_Layer", "sm_gl_Layer");
     body = replace_ident(body, "gl_ViewportIndex", "sm_gl_ViewportIndex");
     body = replace_ident(body, "gl_VertexIndex", "sm_vidx");
+    body = replace_ident(body, "gl_VertexID", "sm_vidx");
     body = replace_ident(body, "gl_InstanceIndex", "sm_iidx");
+    body = replace_ident(body, "gl_InstanceID", "sm_iidx");
     body = replace_ident(body, "gl_BaseVertex", "sm_base_vertex");
+    body = replace_ident(body, "gl_BaseVertexARB", "sm_base_vertex");
     body = replace_ident(body, "gl_BaseInstance", "sm_base_instance");
+    body = replace_ident(body, "gl_BaseInstanceARB", "sm_base_instance");
     body = replace_ident(body, "gl_DrawID", "0");
+    body = replace_ident(body, "gl_DrawIDARB", "0");
+    body = replace_ident(body, "gl_ViewIndex", "0");
     body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_vs_main()");
 
     std::ostringstream ss;
@@ -1039,6 +1286,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              bool* out_fs_batched_push_ok,
                              SmDynUboDesc* out_batched_dyn_ubo,
                              uint32_t* out_stride_vec4) {
+    SmCancelDisableGuard _cancel_guard;
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     ReflectedBlock push_blk, dyn_ubo_blk;
@@ -1075,6 +1323,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     body = replace_ident(body, "gl_Layer", "sm_gl_Layer");
     body = replace_ident(body, "gl_ViewportIndex", "sm_gl_ViewportIndex");
     body = replace_ident(body, "gl_PrimitiveID", "sm_gl_PrimitiveID");
+    body = replace_ident(body, "gl_ClipDistance", "sm_gl_ClipDistance");
+    body = replace_ident(body, "gl_CullDistance", "sm_gl_CullDistance");
+    body = replace_ident(body, "gl_PointCoord", "vec2(0.5)");
+    body = replace_ident(body, "gl_ViewIndex", "0");
     body = replace_ident(body, "dFdx", "sm_dFdx");
     body = replace_ident(body, "dFdy", "sm_dFdy");
     body = replace_ident(body, "dFdxFine", "sm_dFdx");
@@ -1183,6 +1435,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "int sm_gl_Layer = 0;\n";
     ss << "int sm_gl_ViewportIndex = 0;\n";
     ss << "int sm_gl_PrimitiveID = 0;\n";
+    ss << "float sm_gl_ClipDistance[8];\n";
+    ss << "float sm_gl_CullDistance[8];\n";
     ss << "bool sm_discarded = false;\n\n";
 
     // 1-cycle Branchless Hopper Quad Subgroup Derivatives (zero basic-block splits inside textureGrad!)
@@ -1756,6 +2010,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
 bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
                                   std::vector<uint32_t>& out_comp_spv,
                                   std::string& err) {
+    SmCancelDisableGuard _cancel_guard;
     std::ostringstream ss;
     ss << "#version 460\n"
        << "#extension GL_ARB_gpu_shader_int64 : require\n"

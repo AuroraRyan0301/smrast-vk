@@ -33,4 +33,13 @@ fi
 if [ -f bench/test_v07_features.cpp ]; then
     g++ -O3 -std=c++17 bench/test_v07_features.cpp -o build/test_v07_features -lvulkan -lm
 fi
-echo "Built SmRast-VK v0.7.0 (libvulkan_smrast.so + 8 compute shaders + benchmarks) successfully!"
+if [ -f bench/test_v08_features.cpp ]; then
+    g++ -O3 -std=c++17 bench/test_v08_features.cpp -o build/test_v08_features -lvulkan -lm
+fi
+if [ -f bench/test_v09_features.cpp ]; then
+    g++ -O3 -std=c++17 bench/test_v09_features.cpp -o build/test_v09_features -lvulkan -lm
+fi
+if [ -f bench/test_v10_features.cpp ]; then
+    g++ -O3 -std=c++17 bench/test_v10_features.cpp -o build/test_v10_features -lvulkan -lm -lpthread
+fi
+echo "Built SmRast-VK v1.0.0 (libvulkan_smrast.so + 8 compute shaders + benchmarks) successfully!"

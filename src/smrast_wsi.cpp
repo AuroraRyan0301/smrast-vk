@@ -215,10 +215,11 @@ static inline void sm_copy_rgba_to_bgra_fast(uint8_t* __restrict dst, const uint
     }
 }
 
-void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
+void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img, SmQueue* present_q,
                             uint32_t wait_sem_cnt, const VkSemaphore* wait_sems) {
     if (!sc || !sc->surface || !img || !img->host_ptr) return;
     SmDevice* dev = sc->dev;
+    SmQueue* pq = present_q ? present_q : dev->main_queue;
     uint32_t w = sc->extent.width;
     uint32_t h = sc->extent.height;
     size_t bytes = (size_t)w * h * 4;
@@ -248,14 +249,30 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
     dev->fn.CmdPipelineBarrier(sc->present_cmds[cur],
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pmb, 0, nullptr, 0, nullptr);
-    if (img->attach_buf) {
+    if (img->attach_buf && (img->attach_dirty || !img->real_img || !img->real_layout_inited)) {
         VkBufferCopy cp{0, 0, bytes};
         dev->fn.CmdCopyBuffer(sc->present_cmds[cur], img->attach_buf, img->host_buf, 1, &cp);
-    } else {
+    } else if (img->real_img) {
+        VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img->real_img,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        dev->fn.CmdPipelineBarrier(sc->present_cmds[cur],
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
         VkBufferImageCopy bic{};
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bic.imageExtent = {w, h, 1};
         dev->fn.CmdCopyImageToBuffer(sc->present_cmds[cur], img->real_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img->host_buf, 1, &bic);
+        ib.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        dev->fn.CmdPipelineBarrier(sc->present_cmds[cur],
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &ib);
     }
     dev->fn.EndCommandBuffer(sc->present_cmds[cur]);
 
@@ -266,12 +283,12 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
     if (sc->present_fences[cur]) {
         dev->fn.ResetFences(dev->real_dev, 1, &sc->present_fences[cur]);
         {
-            std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
-            dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, sc->present_fences[cur]);
+            std::lock_guard<std::mutex> qlk(pq->mtx);
+            dev->fn.QueueSubmit(pq->real_q, 1, &si, sc->present_fences[cur]);
         }
     } else {
-        std::lock_guard<std::mutex> qlk(dev->main_queue->mtx);
-        dev->fn.QueueSubmit(dev->main_queue->real_q, 1, &si, VK_NULL_HANDLE);
+        std::lock_guard<std::mutex> qlk(pq->mtx);
+        dev->fn.QueueSubmit(pq->real_q, 1, &si, VK_NULL_HANDLE);
     }
     sc->pending_present_img[cur] = img;
 
@@ -284,7 +301,7 @@ void sm_wsi_blit_to_surface(SmSwapchain* sc, SmImage* img,
         }
     } else {
         if (sc->present_fences[cur]) dev->fn.WaitForFences(dev->real_dev, 1, &sc->present_fences[cur], VK_TRUE, UINT64_MAX);
-        else                         dev->fn.QueueWaitIdle(dev->main_queue->real_q);
+        else { std::lock_guard<std::mutex> qlk(pq->mtx); dev->fn.QueueWaitIdle(pq->real_q); }
         blit_img = img;
         sc->pending_present_img[cur] = nullptr;
     }
