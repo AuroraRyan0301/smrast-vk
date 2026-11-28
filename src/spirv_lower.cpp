@@ -140,13 +140,24 @@ static void sm_sink_op_sampled_image(std::vector<uint32_t>& spv) {
         std::unordered_map<uint32_t, std::vector<SUse>> uses;
         blk = 0;
         for (size_t j = i + 1; j < fn_end; ++j) {
-            if (insts[j].op == kOpLabel) { ++blk; continue; }
-            if (insts[j].op == kOpSampledImage) continue;
+            uint32_t op = insts[j].op;
+            if (op == kOpLabel) { ++blk; continue; }
+            if (op == kOpSampledImage) continue;
             uint32_t p = insts[j].pos, wc = insts[j].wc;
-            for (uint32_t k = 1; k < wc; ++k) {
-                uint32_t w = spv[p + k];
-                if (defs.find(w) != defs.end()) {
-                    uses[w].push_back({(uint32_t)j, k, blk});
+            // ONLY inspect exact SSA SampledImage operand positions (NEVER literal bitmasks like OpImageFetch ImageOperands,
+            // OpCompositeExtract indices, OpVectorShuffle components, or OpConstant literals!).
+            bool is_sampled_img_op =
+                (op >= 87u && op <= 94u) ||   // OpImageSample{,Proj}{,Dref}{Implicit,Explicit}Lod
+                op == 100u || op == 101u ||   // OpImage, OpImageQueryLod
+                (op >= 305u && op <= 312u) || // OpImageSparseSample*
+                op == 83u;                    // OpCopyObject
+            if (is_sampled_img_op && wc >= 4u) {
+                uint32_t w = spv[p + 3u];
+                if (defs.find(w) != defs.end()) uses[w].push_back({(uint32_t)j, 3u, blk});
+            } else if (op == 57u && wc >= 5u) { // OpFunctionCall arguments at k >= 4
+                for (uint32_t k = 4u; k < wc; ++k) {
+                    uint32_t w = spv[p + k];
+                    if (defs.find(w) != defs.end()) uses[w].push_back({(uint32_t)j, k, blk});
                 }
             }
         }
@@ -266,7 +277,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v11b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v12_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -387,10 +398,13 @@ struct ReflectedIO {
     uint32_t index = 0;
     uint32_t component = 0;
     uint32_t vecsize = 4;
-    uint32_t array_size = 0; // 0 = non-array
+    uint32_t num_array_dims = 0;
+    uint32_t array_size = 0;  // dim 0 (innermost; for 1D GS inputs this is input prim vertex count!)
+    uint32_t array_size2 = 0; // dim 1 (outermost for 2D GS array inputs)
     spvc_basetype basetype = SPVC_BASETYPE_FP32;
     bool is_flat = false;
     bool is_noperspective = false;
+    bool is_patch = false;
     std::string glsl_type;
 };
 
@@ -474,10 +488,15 @@ static bool decompile_spirv(const std::vector<uint32_t>& spv,
             io.component = spvc_compiler_get_decoration(comp, list[i].id, SpvDecorationComponent);
             io.is_flat = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationFlat) == SPVC_TRUE);
             io.is_noperspective = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationNoPerspective) == SPVC_TRUE);
+            io.is_patch = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationPatch) == SPVC_TRUE);
             io.vecsize = spvc_type_get_vector_size(t);
             unsigned ndims = spvc_type_get_num_array_dimensions(t);
+            io.num_array_dims = ndims;
             if (ndims > 0) {
                 io.array_size = spvc_type_get_array_dimension(t, 0);
+            }
+            if (ndims > 1) {
+                io.array_size2 = spvc_type_get_array_dimension(t, 1);
             }
             io.glsl_type = glsl_type_str(io.basetype, io.vecsize);
             dst.push_back(io);
@@ -860,48 +879,61 @@ static std::string rewrite_texture_calls(const std::string& src) {
     return out;
 }
 
-static std::string strip_version_and_stage_io(const std::string& glsl, std::string& out_exts) {
+static std::string strip_version_and_stage_io(const std::string& glsl, std::string& out_exts,
+                                              uint32_t gs_in_verts = 0, uint32_t out_arr_len = 0, bool shared_out = false) {
     std::istringstream iss(glsl);
     std::ostringstream oss;
     std::ostringstream ext_ss;
     std::string line;
     std::regex re_ver(R"(^\s*#version\b.*)");
-    std::regex re_in(R"(^\s*layout\s*\([^)]*location\s*=\s*\d+[^)]*\)\s*(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise)\s+)*in\s+(.+);)");
-    std::regex re_out(R"(^\s*layout\s*\([^)]*location\s*=\s*\d+[^)]*\)\s*(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise)\s+)*out\s+(.+);)");
+    std::regex re_in(R"(^\s*(?:patch\s+)?layout\s*\([^)]*location\s*=\s*\d+[^)]*\)\s*(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise|patch)\s+)*in\s+(.+);)");
+    std::regex re_out(R"(^\s*(?:patch\s+)?layout\s*\([^)]*location\s*=\s*\d+[^)]*\)\s*(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise|patch)\s+)*out\s+(.+);)");
     std::regex re_qual_line(R"(^\s*(?:invariant|precise)\s+[A-Za-z_][A-Za-z0-9_]*\s*;)");
     std::regex re_fs_layout(R"(^\s*layout\s*\([^)]*(?:early_fragment_tests|origin_upper_left|pixel_center_integer|depth_any|depth_greater|depth_less|depth_unchanged)[^)]*\)\s*(?:in|out)\b.*;)");
+    std::regex re_gs_layout(R"(^\s*layout\s*\([^)]*(?:points|lines|lines_adjacency|triangles|triangles_adjacency|line_strip|triangle_strip|max_vertices|invocations|vertices|quads|isolines|equal_spacing|fractional_even_spacing|fractional_odd_spacing|cw|ccw|point_mode)[^)]*\)\s*(?:in|out)\s*;)");
     std::regex re_perv(R"(^\s*(?:in|out)\s+gl_PerVertex\b.*)");
     // Strip bare built-in stage I/O redeclarations (e.g. `out float gl_ClipDistance[8];`, `in float gl_CullDistance[4];`)
-    std::regex re_builtin_io(R"(^\s*(?:layout\s*\([^)]*\)\s*)?(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise)\s+)*(?:in|out)\s+[^;{]*\bgl_[A-Za-z0-9_]+\b[^;{]*;)");
+    std::regex re_builtin_io(R"(^\s*(?:layout\s*\([^)]*\)\s*)?(?:(?:flat|noperspective|smooth|centroid|sample|invariant|precise|patch)\s+)*(?:in|out)\s+[^;{]*\bgl_[A-Za-z0-9_]+\b[^;{]*;)");
     std::regex re_ext_fs(R"(^\s*#extension\s+(?:GL_ARB_fragment_shader_interlock|GL_EXT_demote_to_helper_invocation|GL_ARB_derivative_control|GL_EXT_fragment_shader_barycentric|GL_NV_fragment_shader_barycentric|GL_EXT_post_depth_coverage)\b.*)");
     std::regex re_ext_any(R"(^\s*#extension\b.*)");
     bool skip_perv_block = false;
 
     while (std::getline(iss, line)) {
         if (skip_perv_block) {
-            if (line.find("};") != std::string::npos) skip_perv_block = false;
+            if (line.find('}') != std::string::npos && line.find(';') != std::string::npos) skip_perv_block = false;
             continue;
         }
         if (std::regex_match(line, re_ver)) continue;
         if (std::regex_match(line, re_qual_line)) continue;
         if (std::regex_match(line, re_fs_layout)) continue;
+        if ((gs_in_verts > 0 || out_arr_len > 0) && std::regex_match(line, re_gs_layout)) continue;
         if (std::regex_match(line, re_ext_fs)) continue;
         if (std::regex_match(line, re_ext_any)) {
             ext_ss << line << "\n";
             continue;
         }
         if (std::regex_match(line, re_perv)) {
-            if (line.find("};") == std::string::npos) skip_perv_block = true;
+            if (!(line.find('}') != std::string::npos && line.find(';') != std::string::npos)) skip_perv_block = true;
             continue;
         }
         if (std::regex_match(line, re_builtin_io)) continue;
         std::smatch m;
         if (std::regex_match(line, m, re_in)) {
-            oss << m[1].str() << "; // lowered stage input\n";
+            std::string decl = m[1].str();
+            if (gs_in_verts > 0) {
+                size_t ub = decl.find("[]");
+                if (ub != std::string::npos) decl.replace(ub, 2, "[" + std::to_string(gs_in_verts) + "]");
+            }
+            oss << decl << "; // lowered stage input\n";
             continue;
         }
         if (std::regex_match(line, m, re_out)) {
-            oss << m[1].str() << "; // lowered stage output\n";
+            std::string decl = m[1].str();
+            if (out_arr_len > 0) {
+                size_t ub = decl.find("[]");
+                if (ub != std::string::npos) decl.replace(ub, 2, "[" + std::to_string(out_arr_len) + "]");
+            }
+            oss << (shared_out ? "shared " : "") << decl << "; // lowered stage output\n";
             continue;
         }
         oss << line << "\n";
@@ -1111,39 +1143,75 @@ static std::string pack_varying_to_vec4(const std::string& expr, spvc_basetype b
     return "vec4(float(" + e + "), 0.0, 0.0, 0.0)";
 }
 
+static void sm_detect_clip_cull_counts(const std::string& raw_glsl, const std::string& stripped_body,
+                                       bool& out_clip, bool& out_cull, uint32_t& out_clip_cnt, uint32_t& out_cull_cnt) {
+    out_clip = (stripped_body.find("gl_ClipDistance") != std::string::npos);
+    out_cull = (stripped_body.find("gl_CullDistance") != std::string::npos);
+    out_clip_cnt = 0;
+    out_cull_cnt = 0;
+    if (out_clip) {
+        std::smatch m;
+        if (std::regex_search(raw_glsl, m, std::regex(R"(float\s+gl_ClipDistance\s*\[\s*(\d+)\s*\])"))) {
+            uint32_t n = (uint32_t)std::strtoul(m[1].str().c_str(), nullptr, 10);
+            out_clip_cnt = std::max(1u, std::min(8u, n));
+        } else {
+            out_clip_cnt = 8u;
+        }
+    }
+    if (out_cull) {
+        std::smatch m;
+        if (std::regex_search(raw_glsl, m, std::regex(R"(float\s+gl_CullDistance\s*\[\s*(\d+)\s*\])"))) {
+            uint32_t n = (uint32_t)std::strtoul(m[1].str().c_str(), nullptr, 10);
+            out_cull_cnt = std::max(1u, std::min(4u, n));
+        } else {
+            out_cull_cnt = 4u;
+        }
+    }
+}
+
 bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            const SmVertexInputState& vtx_in,
                            const VkSpecializationInfo*,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
                            std::string& err,
-                           bool* out_writes_point_size,
-                           uint32_t* out_stride_vec4) {
+                           SmVsLowerMeta* out_meta) {
     SmCancelDisableGuard _cancel_guard;
     std::string glsl;
     std::vector<ReflectedIO> inputs, outputs;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
 
-    bool writes_ps = (glsl.find("gl_PointSize") != std::string::npos);
-    if (out_writes_point_size) *out_writes_point_size = writes_ps;
-    if (out_stride_vec4) {
-        if (writes_ps) {
-            *out_stride_vec4 = SM_VERT_STRIDE_VEC4;
-        } else {
-            uint32_t max_slot = 1u; // slot 0 = gl_Position
-            for (const auto& io : outputs) {
-                uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
-                for (uint32_t a = 0; a < elems; ++a) {
-                    uint32_t loc = io.location + a;
-                    if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
-                }
-            }
-            *out_stride_vec4 = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
-        }
-    }
-
     std::string user_exts;
     std::string body = strip_version_and_stage_io(glsl, user_exts);
+
+    bool writes_ps = (body.find("gl_PointSize") != std::string::npos);
+    bool writes_clip = false, writes_cull = false;
+    uint32_t clip_cnt = 0, cull_cnt = 0;
+    sm_detect_clip_cull_counts(glsl, body, writes_clip, writes_cull, clip_cnt, cull_cnt);
+
+    uint32_t stride_v4 = 2u;
+    if (writes_ps || writes_clip || writes_cull) {
+        stride_v4 = SM_VERT_STRIDE_VEC4;
+    } else {
+        uint32_t max_slot = 1u; // slot 0 = gl_Position
+        for (const auto& io : outputs) {
+            uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+            for (uint32_t a = 0; a < elems; ++a) {
+                uint32_t loc = io.location + a;
+                if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
+            }
+        }
+        stride_v4 = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
+    }
+    if (out_meta) {
+        out_meta->writes_point_size = writes_ps;
+        out_meta->writes_clip_dist  = writes_clip;
+        out_meta->writes_cull_dist  = writes_cull;
+        out_meta->clip_count        = clip_cnt;
+        out_meta->cull_count        = cull_cnt;
+        out_meta->stride_vec4       = stride_v4;
+    }
+
     body = replace_ident(body, "gl_Position", "sm_gl_Position");
     body = replace_ident(body, "gl_PointSize", "sm_gl_PointSize");
     body = replace_ident(body, "gl_ClipDistance", "sm_gl_ClipDistance");
@@ -1158,9 +1226,9 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
     body = replace_ident(body, "gl_BaseVertexARB", "sm_base_vertex");
     body = replace_ident(body, "gl_BaseInstance", "sm_base_instance");
     body = replace_ident(body, "gl_BaseInstanceARB", "sm_base_instance");
-    body = replace_ident(body, "gl_DrawID", "0");
-    body = replace_ident(body, "gl_DrawIDARB", "0");
-    body = replace_ident(body, "gl_ViewIndex", "0");
+    body = replace_ident(body, "gl_DrawID", "int(sm_vs.draw_id)");
+    body = replace_ident(body, "gl_DrawIDARB", "int(sm_vs.draw_id)");
+    body = replace_ident(body, "gl_ViewIndex", "int(sm_vs.view_index)");
     body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_vs_main()");
 
     std::ostringstream ss;
@@ -1189,6 +1257,9 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
        << "    uint clip_vert_base;\n"
        << "    uvec4 vtx_offsets_hi;\n"
        << "    uvec4 vtx_strides_hi;\n"
+       << "    uint view_index;\n"
+       << "    uint draw_id;\n"
+       << "    uvec2 vs_pad;\n"
        << "} sm_vs;\n\n";
 
     ss << "vec4 sm_gl_Position;\n";
@@ -1234,6 +1305,13 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
     ss << "        sm_vidx = int(idx32) + sm_vs.vertex_offset;\n";
     ss << "    }\n";
 
+    if (writes_clip) {
+        ss << "    for (int ci = 0; ci < 8; ++ci) sm_gl_ClipDistance[ci] = 0.0;\n";
+    }
+    if (writes_cull) {
+        ss << "    for (int ci = 0; ci < 8; ++ci) sm_gl_CullDistance[ci] = 0.0;\n";
+    }
+
     for (const auto& io : inputs) {
         if (io.array_size > 0) continue;
         const VkVertexInputAttributeDescription* found = nullptr;
@@ -1269,12 +1347,832 @@ bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
             }
         }
     }
+    if (writes_clip) {
+        ss << "    sm_clip_verts[base_slot + 13u] = vec4(sm_gl_ClipDistance[0], sm_gl_ClipDistance[1], sm_gl_ClipDistance[2], sm_gl_ClipDistance[3]);\n";
+        if (clip_cnt > 4u) {
+            ss << "    sm_clip_verts[base_slot + 14u] = vec4(sm_gl_ClipDistance[4], sm_gl_ClipDistance[5], sm_gl_ClipDistance[6], sm_gl_ClipDistance[7]);\n";
+        }
+    }
+    if (writes_cull && clip_cnt <= 4u) {
+        ss << "    sm_clip_verts[base_slot + 14u] = vec4(sm_gl_CullDistance[0], sm_gl_CullDistance[1], sm_gl_CullDistance[2], sm_gl_CullDistance[3]);\n";
+    }
     if (writes_ps) {
         ss << "    sm_clip_verts[base_slot + 15u].w = clamp(sm_gl_PointSize, 1.0, 64.0);\n";
     }
     ss << "}\n";
 
     return compile_glsl_to_spv(ss.str(), "vs", out_comp_spv, err);
+}
+
+// =================================================================================================
+// SmRast-VK v1.2: Full Compute-Emulated Geometry Shader Lowerer (VK_SHADER_STAGE_GEOMETRY_BIT)
+// Supports: points/lines/triangles/lines_adjacency/triangles_adjacency inputs,
+//           points/line_strip/triangle_strip outputs, EmitVertex/EndPrimitive, invocations,
+//           gl_PrimitiveIDIn, gl_InvocationID, flat/integer outputs, Clip/CullDistance, PointSize!
+// =================================================================================================
+bool sm_lower_geometry_spirv(const std::vector<uint32_t>& in_spv,
+                             const VkSpecializationInfo*,
+                             uint32_t sm_set_idx,
+                             std::vector<uint32_t>& out_comp_spv,
+                             std::string& err,
+                             SmGsLowerMeta* out_meta) {
+    SmCancelDisableGuard _cancel_guard;
+    // 1. Parse SPIR-V OpExecutionMode (opcode 16) for GS input/output topology, max_vertices, invocations
+    SmGsLowerMeta meta{};
+    meta.in_verts = 3;
+    meta.out_topo = 0; // TRIANGLE_LIST
+    meta.invocations = 1;
+    meta.max_verts = 3;
+    if (in_spv.size() >= 5 && in_spv[0] == 0x07230203u) {
+        for (size_t p = 5; p < in_spv.size(); ) {
+            uint32_t w0 = in_spv[p];
+            uint32_t wc = w0 >> 16;
+            uint32_t op = w0 & 0xFFFFu;
+            if (wc == 0 || p + wc > in_spv.size()) break;
+            if (op == 16u && wc >= 3u) { // OpExecutionMode
+                uint32_t mode = in_spv[p + 2];
+                if (mode == 0u && wc >= 4u)       meta.invocations = std::max(1u, in_spv[p + 3]);
+                else if (mode == 19u)             meta.in_verts = 1u; // InputPoints
+                else if (mode == 20u)             meta.in_verts = 2u; // InputLines
+                else if (mode == 21u)             meta.in_verts = 4u; // InputLinesAdjacency
+                else if (mode == 22u)             meta.in_verts = 3u; // Triangles
+                else if (mode == 23u)             meta.in_verts = 6u; // InputTrianglesAdjacency
+                else if (mode == 26u && wc >= 4u) meta.max_verts = std::max(1u, in_spv[p + 3]);
+                else if (mode == 27u)             meta.out_topo = 5u; // OutputPoints -> POINT_LIST
+                else if (mode == 28u)             meta.out_topo = 3u; // OutputLineStrip -> LINE_LIST
+                else if (mode == 29u)             meta.out_topo = 0u; // OutputTriangleStrip -> TRIANGLE_LIST
+            }
+            p += wc;
+        }
+    }
+
+    std::string glsl;
+    std::vector<ReflectedIO> inputs, outputs;
+    if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
+
+    std::string user_exts;
+    std::string body = strip_version_and_stage_io(glsl, user_exts, meta.in_verts);
+
+    bool writes_ps = (body.find("gl_PointSize") != std::string::npos);
+    bool writes_clip = false, writes_cull = false;
+    uint32_t clip_cnt = 0, cull_cnt = 0;
+    sm_detect_clip_cull_counts(glsl, body, writes_clip, writes_cull, clip_cnt, cull_cnt);
+
+    uint32_t out_stride = 2u;
+    if (writes_ps || writes_clip || writes_cull) {
+        out_stride = SM_VERT_STRIDE_VEC4;
+    } else {
+        uint32_t max_slot = 1u;
+        for (const auto& io : outputs) {
+            uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+            for (uint32_t a = 0; a < elems; ++a) {
+                uint32_t loc = io.location + a;
+                if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
+            }
+        }
+        out_stride = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
+    }
+    meta.out_stride_vec4   = out_stride;
+    meta.writes_point_size = writes_ps;
+    meta.writes_clip_dist  = writes_clip;
+    meta.writes_cull_dist  = writes_cull;
+    meta.clip_count        = clip_cnt;
+    meta.cull_count        = cull_cnt;
+    if (out_meta) *out_meta = meta;
+
+    body = replace_ident(body, "gl_in", "sm_gl_in");
+    body = replace_ident(body, "gl_Position", "sm_gl_Position");
+    body = replace_ident(body, "gl_PointSize", "sm_gl_PointSize");
+    body = replace_ident(body, "gl_ClipDistance", "sm_gl_ClipDistance");
+    body = replace_ident(body, "gl_CullDistance", "sm_gl_CullDistance");
+    body = replace_ident(body, "gl_Layer", "sm_gl_Layer");
+    body = replace_ident(body, "gl_ViewportIndex", "sm_gl_ViewportIndex");
+    body = replace_ident(body, "gl_PrimitiveIDIn", "sm_prim_id_in");
+    body = replace_ident(body, "gl_InvocationID", "sm_invoc_id");
+    body = replace_ident(body, "gl_PrimitiveID", "sm_gl_PrimitiveID");
+    body = std::regex_replace(body, std::regex(R"(\bEmitStreamVertex\s*\(\s*\d+\s*\))"), "sm_emit_vertex()");
+    body = std::regex_replace(body, std::regex(R"(\bEndStreamPrimitive\s*\(\s*\d+\s*\))"), "sm_end_primitive()");
+    body = replace_ident(body, "EmitVertex", "sm_emit_vertex");
+    body = replace_ident(body, "EndPrimitive", "sm_end_primitive");
+    body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_gs_main()");
+
+    std::ostringstream ss;
+    ss << "#version 460\n";
+    if (!user_exts.empty()) ss << user_exts;
+    ss << "layout(local_size_x = 64) in;\n\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 0) readonly buffer SmVsVertBuf    { vec4 sm_vs_verts[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 1) writeonly buffer SmGsVertBuf   { vec4 sm_gs_verts[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 2) buffer SmDispCmdBuf            { uint sm_disp_cmds[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 3) readonly buffer SmGsParams {\n"
+       << "    uint prim_count;\n"
+       << "    uint prims_per_inst;\n"
+       << "    uint verts_per_inst;\n"
+       << "    uint topo_code;\n"
+       << "    uint vs_stride_vec4;\n"
+       << "    uint gs_stride_vec4;\n"
+       << "    uint max_out_prims;\n"
+       << "    uint invocations;\n"
+       << "    uint meta_idx;\n"
+       << "    uint clip_vert_base;\n"
+       << "    uint last_pv;\n"
+       << "    uint pad0;\n"
+       << "} sm_gs;\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 4) readonly buffer SmTileCountBuf { uint sm_tile_counts[]; };\n\n";
+
+    ss << "struct SmGsPerVertex {\n"
+       << "    vec4 sm_gl_Position;\n"
+       << "    float sm_gl_PointSize;\n"
+       << "    float sm_gl_ClipDistance[8];\n"
+       << "    float sm_gl_CullDistance[8];\n"
+       << "};\n";
+    ss << "SmGsPerVertex sm_gl_in[" << meta.in_verts << "];\n";
+    ss << "vec4 sm_gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n";
+    ss << "float sm_gl_PointSize = 1.0;\n";
+    ss << "float sm_gl_ClipDistance[8];\n";
+    ss << "float sm_gl_CullDistance[8];\n";
+    ss << "int sm_gl_Layer = 0;\n";
+    ss << "int sm_gl_ViewportIndex = 0;\n";
+    ss << "int sm_prim_id_in = 0;\n";
+    ss << "int sm_invoc_id = 0;\n";
+    ss << "int sm_gl_PrimitiveID = 0;\n";
+    ss << "const uint SM_GS_STRIDE = " << out_stride << "u;\n";
+    if (meta.out_topo == 0u) {
+        ss << "vec4 sm_strip_v0[SM_GS_STRIDE];\n";
+        ss << "vec4 sm_strip_v1[SM_GS_STRIDE];\n";
+    } else if (meta.out_topo == 3u) {
+        ss << "vec4 sm_strip_v0[SM_GS_STRIDE];\n";
+    }
+    ss << "uint sm_strip_cnt = 0u;\n";
+    ss << "void sm_emit_vertex();\n";
+    ss << "void sm_end_primitive();\n\n";
+
+    ss << body << "\n\n";
+
+    // Emit sm_emit_vertex() & sm_end_primitive() AFTER body so all lowered output globals are in scope!
+    ss << "void sm_end_primitive() { sm_strip_cnt = 0u; }\n";
+    ss << "void sm_emit_vertex() {\n";
+    ss << "    vec4 cur[SM_GS_STRIDE];\n";
+    ss << "    for (uint k = 0u; k < SM_GS_STRIDE; ++k) cur[k] = vec4(0.0);\n";
+    ss << "    cur[0u] = sm_gl_Position;\n";
+    for (const auto& io : outputs) {
+        uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+        for (uint32_t a = 0; a < elems; ++a) {
+            uint32_t loc = io.location + a;
+            if (loc >= SM_MAX_VARYINGS || (1u + loc) >= out_stride) continue;
+            std::string expr = (io.array_size > 0) ? (io.name + "[" + std::to_string(a) + "]") : io.name;
+            if (io.component == 0) {
+                ss << "    cur[" << (1u + loc) << "u] = "
+                   << pack_varying_to_vec4(expr, io.basetype, io.vecsize) << ";\n";
+            } else {
+                const char* comps = "xyzw";
+                for (uint32_t c = 0; c < io.vecsize && (io.component + c) < 4; ++c) {
+                    std::string comp_e = (io.vecsize == 1) ? expr : (expr + "." + comps[c]);
+                    if (io.basetype == SPVC_BASETYPE_INT32) comp_e = "intBitsToFloat(" + comp_e + ")";
+                    else if (io.basetype == SPVC_BASETYPE_UINT32) comp_e = "uintBitsToFloat(" + comp_e + ")";
+                    ss << "    cur[" << (1u + loc) << "u]." << comps[io.component + c] << " = " << comp_e << ";\n";
+                }
+            }
+        }
+    }
+    if (writes_clip) {
+        ss << "    cur[13u] = vec4(sm_gl_ClipDistance[0], sm_gl_ClipDistance[1], sm_gl_ClipDistance[2], sm_gl_ClipDistance[3]);\n";
+        if (clip_cnt > 4u) {
+            ss << "    cur[14u] = vec4(sm_gl_ClipDistance[4], sm_gl_ClipDistance[5], sm_gl_ClipDistance[6], sm_gl_ClipDistance[7]);\n";
+        }
+    }
+    if (writes_cull && clip_cnt <= 4u) {
+        ss << "    cur[14u] = vec4(sm_gl_CullDistance[0], sm_gl_CullDistance[1], sm_gl_CullDistance[2], sm_gl_CullDistance[3]);\n";
+    }
+    if (writes_ps) {
+        ss << "    cur[15u].w = clamp(sm_gl_PointSize, 1.0, 64.0);\n";
+    }
+
+    auto emit_write_vert = [&](const std::string& vslot_expr, const std::string& arr_name) {
+        ss << "            uint _b = (" << vslot_expr << ") * sm_gs.gs_stride_vec4;\n";
+        ss << "            for (uint k = 0u; k < SM_GS_STRIDE; ++k) sm_gs_verts[_b + k] = " << arr_name << "[k];\n";
+        ss << "            for (uint k = SM_GS_STRIDE; k < sm_gs.gs_stride_vec4; ++k) sm_gs_verts[_b + k] = vec4(0.0);\n";
+    };
+
+    if (meta.out_topo == 5u) { // OutputPoints -> POINT_LIST
+        ss << "    uint pslot = atomicAdd(sm_disp_cmds[14u], 1u);\n";
+        ss << "    if (pslot < sm_gs.max_out_prims) {\n";
+        emit_write_vert("pslot", "cur");
+        ss << "    }\n";
+    } else if (meta.out_topo == 3u) { // OutputLineStrip -> LINE_LIST
+        ss << "    if (sm_strip_cnt >= 1u) {\n";
+        ss << "        uint pslot = atomicAdd(sm_disp_cmds[14u], 1u);\n";
+        ss << "        if (pslot < sm_gs.max_out_prims) {\n";
+        ss << "            { "; emit_write_vert("pslot * 2u", "sm_strip_v0"); ss << " }\n";
+        ss << "            { "; emit_write_vert("pslot * 2u + 1u", "cur"); ss << " }\n";
+        ss << "        }\n";
+        ss << "    }\n";
+        ss << "    for (uint k = 0u; k < SM_GS_STRIDE; ++k) sm_strip_v0[k] = cur[k];\n";
+        ss << "    sm_strip_cnt++;\n";
+    } else { // OutputTriangleStrip -> TRIANGLE_LIST (exact Vulkan strip winding & provoking vertex!)
+        ss << "    if (sm_strip_cnt >= 2u) {\n";
+        ss << "        uint pslot = atomicAdd(sm_disp_cmds[14u], 1u);\n";
+        ss << "        if (pslot < sm_gs.max_out_prims) {\n";
+        ss << "            bool odd = ((sm_strip_cnt & 1u) != 0u);\n";
+        ss << "            if (!odd) {\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 0u", "sm_strip_v0"); ss << " }\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 1u", "sm_strip_v1"); ss << " }\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 2u", "cur");         ss << " }\n";
+        ss << "            } else if (sm_gs.last_pv == 0u) {\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 0u", "sm_strip_v0"); ss << " }\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 1u", "cur");         ss << " }\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 2u", "sm_strip_v1"); ss << " }\n";
+        ss << "            } else {\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 0u", "sm_strip_v1"); ss << " }\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 1u", "sm_strip_v0"); ss << " }\n";
+        ss << "                { "; emit_write_vert("pslot * 3u + 2u", "cur");         ss << " }\n";
+        ss << "            }\n";
+        ss << "        }\n";
+        ss << "    }\n";
+        ss << "    if (sm_strip_cnt == 0u) {\n";
+        ss << "        for (uint k = 0u; k < SM_GS_STRIDE; ++k) sm_strip_v0[k] = cur[k];\n";
+        ss << "    } else if (sm_strip_cnt == 1u) {\n";
+        ss << "        for (uint k = 0u; k < SM_GS_STRIDE; ++k) sm_strip_v1[k] = cur[k];\n";
+        ss << "    } else {\n";
+        ss << "        for (uint k = 0u; k < SM_GS_STRIDE; ++k) { sm_strip_v0[k] = sm_strip_v1[k]; sm_strip_v1[k] = cur[k]; }\n";
+        ss << "    }\n";
+        ss << "    sm_strip_cnt++;\n";
+    }
+    ss << "}\n\n";
+
+    ss << "void main() {\n";
+    ss << "    uint gid = gl_GlobalInvocationID.x;\n";
+    ss << "    uint n_prims = (sm_gs.prim_count == 0xFFFFFFFFu) ? sm_tile_counts[sm_gs.meta_idx + 2u] : sm_gs.prim_count;\n";
+    ss << "    uint inv = max(sm_gs.invocations, 1u);\n";
+    ss << "    if (gid >= n_prims * inv) return;\n";
+    ss << "    uint ppi = (sm_gs.prim_count == 0xFFFFFFFFu) ? max(sm_tile_counts[sm_gs.meta_idx + 3u], 1u) : max(sm_gs.prims_per_inst, 1u);\n";
+    ss << "    uint vpi = (sm_gs.prim_count == 0xFFFFFFFFu) ? max(sm_tile_counts[sm_gs.meta_idx + 4u], 1u) : max(sm_gs.verts_per_inst, 1u);\n";
+    ss << "    uint prim_gid   = gid / inv;\n";
+    ss << "    sm_invoc_id     = int(gid - prim_gid * inv);\n";
+    ss << "    uint inst_local = prim_gid / ppi;\n";
+    ss << "    uint prim_local = prim_gid - inst_local * ppi;\n";
+    ss << "    sm_prim_id_in   = int(prim_local);\n";
+    ss << "    sm_gl_PrimitiveID = int(prim_local);\n";
+    ss << "    uint vbase      = sm_gs.clip_vert_base + inst_local * vpi;\n";
+    ss << "    uint vi[6];\n";
+    ss << "    for (uint k = 0u; k < 6u; ++k) vi[k] = vbase;\n";
+    ss << "    uint tc = sm_gs.topo_code;\n";
+    ss << "    if (tc == 0u)      { vi[0]=vbase+prim_local*3u; vi[1]=vi[0]+1u; vi[2]=vi[0]+2u; }\n";
+    ss << "    else if (tc == 1u) { if ((prim_local & 1u) == 0u) { vi[0]=vbase+prim_local; vi[1]=vi[0]+1u; vi[2]=vi[0]+2u; } else { vi[0]=vbase+prim_local+1u; vi[1]=vbase+prim_local; vi[2]=vbase+prim_local+2u; } }\n";
+    ss << "    else if (tc == 2u) { vi[0]=vbase; vi[1]=vbase+prim_local+1u; vi[2]=vbase+prim_local+2u; }\n";
+    ss << "    else if (tc == 3u) { vi[0]=vbase+prim_local*2u; vi[1]=vi[0]+1u; }\n";
+    ss << "    else if (tc == 4u) { vi[0]=vbase+prim_local; vi[1]=vi[0]+1u; }\n";
+    ss << "    else if (tc == 5u) { vi[0]=vbase+prim_local; }\n";
+    ss << "    else if (tc == 6u) { for (uint k=0u; k<4u; ++k) vi[k]=vbase+prim_local*4u+k; }\n";
+    ss << "    else if (tc == 7u) { for (uint k=0u; k<4u; ++k) vi[k]=vbase+prim_local+k; }\n";
+    ss << "    else if (tc == 8u) { for (uint k=0u; k<6u; ++k) vi[k]=vbase+prim_local*6u+k; }\n";
+    ss << "    else               { for (uint k=0u; k<6u; ++k) vi[k]=vbase+prim_local*2u+k; }\n";
+
+    ss << "    for (uint k = 0u; k < " << meta.in_verts << "u; ++k) {\n";
+    ss << "        uint vb = vi[k] * sm_gs.vs_stride_vec4;\n";
+    ss << "        vec4 pos = sm_vs_verts[vb];\n";
+    ss << "        if (floatBitsToUint(pos.w) == 0x7FC0DEADu) return;\n";
+    ss << "        sm_gl_in[k].sm_gl_Position = pos;\n";
+    ss << "        sm_gl_in[k].sm_gl_PointSize = (sm_gs.vs_stride_vec4 >= 16u) ? sm_vs_verts[vb + 15u].w : 1.0;\n";
+    ss << "        if (sm_gs.vs_stride_vec4 >= 15u) {\n";
+    ss << "            vec4 cda = sm_vs_verts[vb + 13u], cdb = sm_vs_verts[vb + 14u];\n";
+    ss << "            sm_gl_in[k].sm_gl_ClipDistance[0]=cda.x; sm_gl_in[k].sm_gl_ClipDistance[1]=cda.y; sm_gl_in[k].sm_gl_ClipDistance[2]=cda.z; sm_gl_in[k].sm_gl_ClipDistance[3]=cda.w;\n";
+    ss << "            sm_gl_in[k].sm_gl_ClipDistance[4]=cdb.x; sm_gl_in[k].sm_gl_ClipDistance[5]=cdb.y; sm_gl_in[k].sm_gl_ClipDistance[6]=cdb.z; sm_gl_in[k].sm_gl_ClipDistance[7]=cdb.w;\n";
+    ss << "            sm_gl_in[k].sm_gl_CullDistance[0]=cdb.x; sm_gl_in[k].sm_gl_CullDistance[1]=cdb.y; sm_gl_in[k].sm_gl_CullDistance[2]=cdb.z; sm_gl_in[k].sm_gl_CullDistance[3]=cdb.w;\n";
+    ss << "        }\n";
+    ss << "    }\n";
+
+    const char* comps = "xyzw";
+    for (const auto& io : inputs) {
+        // 1D GS input: io.name[v] at io.location; 2D GS input: io.name[v][a] at io.location + a
+        uint32_t inner_elems = (io.num_array_dims >= 2 && io.array_size > 0) ? io.array_size : 1u;
+        bool is_2d = (io.num_array_dims >= 2);
+        std::string s;
+        if (io.component == 0) {
+            s = swiz(io.vecsize);
+        } else {
+            s = ".";
+            for (uint32_t c = 0; c < io.vecsize && (io.component + c) < 4; ++c) s += comps[io.component + c];
+        }
+        for (uint32_t v = 0; v < meta.in_verts; ++v) {
+            for (uint32_t a = 0; a < inner_elems; ++a) {
+                uint32_t loc = io.location + a;
+                if (loc >= SM_MAX_VARYINGS) continue;
+                uint32_t off = 1u + loc;
+                std::string dst = is_2d ? (io.name + "[" + std::to_string(v) + "][" + std::to_string(a) + "]")
+                                        : (io.name + "[" + std::to_string(v) + "]");
+                std::string raw = "((" + std::to_string(off) + "u < sm_gs.vs_stride_vec4) ? sm_vs_verts[vi[" + std::to_string(v) + "u] * sm_gs.vs_stride_vec4 + " + std::to_string(off) + "u] : vec4(0.0))";
+                if (io.basetype == SPVC_BASETYPE_INT32)
+                    ss << "    " << dst << " = floatBitsToInt(" << raw << s << ");\n";
+                else if (io.basetype == SPVC_BASETYPE_UINT32)
+                    ss << "    " << dst << " = floatBitsToUint(" << raw << s << ");\n";
+                else
+                    ss << "    " << dst << " = " << raw << s << ";\n";
+            }
+        }
+    }
+
+    if (writes_clip) ss << "    for (int ci = 0; ci < 8; ++ci) sm_gl_ClipDistance[ci] = 0.0;\n";
+    if (writes_cull) ss << "    for (int ci = 0; ci < 8; ++ci) sm_gl_CullDistance[ci] = 0.0;\n";
+    ss << "    sm_strip_cnt = 0u;\n";
+    ss << "    sm_user_gs_main();\n";
+    ss << "}\n";
+
+    return compile_glsl_to_spv(ss.str(), "gs", out_comp_spv, err);
+}
+
+// =================================================================================================
+// v1.2 Compute-Emulated Tessellation Control Shader (TCS -> H20 Compute Shader)
+// 1 workgroup per patch, local_size_x = out_cp (1..32), native workgroup shared memory & barrier()!
+// =================================================================================================
+bool sm_lower_tess_ctrl_spirv(const std::vector<uint32_t>& in_spv,
+                              const VkSpecializationInfo*,
+                              uint32_t sm_set_idx,
+                              std::vector<uint32_t>& out_comp_spv,
+                              std::string& err,
+                              SmTessCtrlLowerMeta* out_meta) {
+    SmCancelDisableGuard _cancel_guard;
+    SmTessCtrlLowerMeta meta{};
+    meta.out_cp = 3;
+    if (in_spv.size() >= 5 && in_spv[0] == 0x07230203u) {
+        for (size_t p = 5; p < in_spv.size(); ) {
+            uint32_t w0 = in_spv[p], wc = w0 >> 16, op = w0 & 0xFFFFu;
+            if (wc == 0 || p + wc > in_spv.size()) break;
+            if (op == 16u && wc >= 4u && in_spv[p + 2] == SpvExecutionModeOutputVertices)
+                meta.out_cp = std::clamp(in_spv[p + 3], 1u, 32u);
+            p += wc;
+        }
+    }
+
+    std::string glsl;
+    std::vector<ReflectedIO> inputs, outputs;
+    if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
+
+    std::string user_exts;
+    std::string body = strip_version_and_stage_io(glsl, user_exts, 32u, meta.out_cp, true);
+
+    uint32_t max_vslot = 2u, max_pslot = 2u;
+    for (const auto& io : outputs) {
+        if (io.is_patch) {
+            uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+            max_pslot = std::max(max_pslot, 2u + io.location + elems);
+        } else {
+            uint32_t elems = (io.num_array_dims >= 2 && io.array_size > 0) ? io.array_size : 1u;
+            max_vslot = std::max(max_vslot, 2u + io.location + elems);
+        }
+    }
+    meta.out_stride_vec4   = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, max_vslot);
+    meta.patch_stride_vec4 = std::min<uint32_t>(18u, max_pslot);
+    if (out_meta) *out_meta = meta;
+
+    body = replace_ident(body, "gl_in", "sm_gl_in");
+    body = replace_ident(body, "gl_out", "sm_gl_out");
+    body = replace_ident(body, "gl_Position", "sm_gl_Position");
+    body = replace_ident(body, "gl_PointSize", "sm_gl_PointSize");
+    body = replace_ident(body, "gl_ClipDistance", "sm_gl_ClipDistance");
+    body = replace_ident(body, "gl_CullDistance", "sm_gl_CullDistance");
+    body = replace_ident(body, "gl_TessLevelOuter", "sm_tess_outer");
+    body = replace_ident(body, "gl_TessLevelInner", "sm_tess_inner");
+    body = replace_ident(body, "gl_InvocationID", "int(gl_LocalInvocationID.x)");
+    body = replace_ident(body, "gl_PrimitiveID", "int(gl_WorkGroupID.x)");
+    body = replace_ident(body, "gl_PatchVerticesIn", "int(sm_ts.in_cp)");
+    body = replace_ident(body, "gl_MaxPatchVertices", "32");
+    body = replace_ident(body, "gl_ViewIndex", "int(sm_ts.view_index)");
+    body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_tcs_main()");
+
+    std::ostringstream ss;
+    ss << "#version 460\n";
+    if (!user_exts.empty()) ss << user_exts;
+    ss << "layout(local_size_x = " << meta.out_cp << ") in;\n\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 0) readonly buffer SmVsVertBuf { vec4 sm_vs_verts[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 3) readonly buffer SmTessParams {\n"
+       << "    uint num_patches; uint in_cp; uint out_cp; uint vs_stride_vec4;\n"
+       << "    uint tcs_vert_stride_vec4; uint tcs_patch_stride_vec4; uint tes_out_stride_vec4; uint max_out_prims;\n"
+       << "    uint clip_vert_base; uint domain; uint spacing; uint flags;\n"
+       << "    uint view_index; uint max_patch_slots; uint pad0; uint pad1;\n"
+       << "} sm_ts;\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 4) writeonly buffer SmTessPatchBuf { vec4 sm_tess_patch[]; };\n\n";
+
+    ss << "struct SmTsPerVertex { vec4 sm_gl_Position; float sm_gl_PointSize; float sm_gl_ClipDistance[8]; float sm_gl_CullDistance[8]; };\n";
+    ss << "SmTsPerVertex sm_gl_in[32];\n";
+    ss << "shared SmTsPerVertex sm_gl_out[" << meta.out_cp << "];\n";
+    ss << "shared float sm_tess_outer[4];\n";
+    ss << "shared float sm_tess_inner[2];\n\n";
+
+    ss << body << "\n\n";
+
+    const char* comps = "xyzw";
+    auto pack_vec4_expr = [&](const ReflectedIO& io, const std::string& expr) -> std::string {
+        std::string fexpr = expr;
+        if (io.basetype == SPVC_BASETYPE_INT32) fexpr = "intBitsToFloat(" + expr + ")";
+        else if (io.basetype == SPVC_BASETYPE_UINT32) fexpr = "uintBitsToFloat(" + expr + ")";
+        if (io.vecsize == 4) return fexpr;
+        if (io.vecsize == 3) return "vec4(" + fexpr + ", 0.0)";
+        if (io.vecsize == 2) return "vec4(" + fexpr + ", 0.0, 0.0)";
+        return "vec4(" + fexpr + ", 0.0, 0.0, 0.0)";
+    };
+
+    ss << "void main() {\n";
+    ss << "    uint pid = gl_WorkGroupID.x;\n";
+    ss << "    uint iid = gl_LocalInvocationID.x;\n";
+    ss << "    if (pid >= sm_ts.num_patches || pid >= sm_ts.max_patch_slots) return;\n";
+    ss << "    if (iid == 0u) {\n";
+    ss << "        sm_tess_outer[0]=1.0; sm_tess_outer[1]=1.0; sm_tess_outer[2]=1.0; sm_tess_outer[3]=1.0;\n";
+    ss << "        sm_tess_inner[0]=1.0; sm_tess_inner[1]=1.0;\n";
+    ss << "    }\n";
+    ss << "    uint icp = min(sm_ts.in_cp, 32u);\n";
+    ss << "    uint vbase = sm_ts.clip_vert_base + pid * sm_ts.in_cp;\n";
+    ss << "    for (uint k = 0u; k < icp; ++k) {\n";
+    ss << "        uint vb = (vbase + k) * sm_ts.vs_stride_vec4;\n";
+    ss << "        sm_gl_in[k].sm_gl_Position = sm_vs_verts[vb];\n";
+    ss << "        sm_gl_in[k].sm_gl_PointSize = (sm_ts.vs_stride_vec4 >= 16u) ? sm_vs_verts[vb + 15u].w : 1.0;\n";
+    for (const auto& io : inputs) {
+        uint32_t inner_elems = (io.num_array_dims >= 2 && io.array_size > 0) ? io.array_size : 1u;
+        bool is_2d = (io.num_array_dims >= 2);
+        std::string s;
+        if (io.component == 0) s = swiz(io.vecsize);
+        else { s = "."; for (uint32_t c = 0; c < io.vecsize && (io.component + c) < 4; ++c) s += comps[io.component + c]; }
+        for (uint32_t a = 0; a < inner_elems; ++a) {
+            uint32_t loc = io.location + a;
+            if (loc >= SM_MAX_VARYINGS) continue;
+            uint32_t off = 1u + loc;
+            std::string dst = is_2d ? (io.name + "[k][" + std::to_string(a) + "]") : (io.name + "[k]");
+            std::string raw = "((" + std::to_string(off) + "u < sm_ts.vs_stride_vec4) ? sm_vs_verts[vb + " + std::to_string(off) + "u] : vec4(0.0))";
+            if (io.basetype == SPVC_BASETYPE_INT32) ss << "        " << dst << " = floatBitsToInt(" << raw << s << ");\n";
+            else if (io.basetype == SPVC_BASETYPE_UINT32) ss << "        " << dst << " = floatBitsToUint(" << raw << s << ");\n";
+            else ss << "        " << dst << " = " << raw << s << ";\n";
+        }
+    }
+    ss << "    }\n";
+    ss << "    sm_gl_out[iid].sm_gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n";
+    ss << "    sm_gl_out[iid].sm_gl_PointSize = 1.0;\n";
+    ss << "    barrier();\n";
+    ss << "    sm_user_tcs_main();\n";
+    ss << "    barrier();\n";
+    ss << "    uint patch_sz = sm_ts.tcs_patch_stride_vec4 + sm_ts.out_cp * sm_ts.tcs_vert_stride_vec4;\n";
+    ss << "    uint pbase = pid * patch_sz;\n";
+    ss << "    if (iid == 0u) {\n";
+    ss << "        sm_tess_patch[pbase + 0u] = vec4(sm_tess_outer[0], sm_tess_outer[1], sm_tess_outer[2], sm_tess_outer[3]);\n";
+    ss << "        sm_tess_patch[pbase + 1u] = vec4(sm_tess_inner[0], sm_tess_inner[1], 0.0, 0.0);\n";
+    for (const auto& io : outputs) {
+        if (!io.is_patch) continue;
+        uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+        for (uint32_t a = 0; a < elems; ++a) {
+            uint32_t slot = 2u + io.location + a;
+            if (slot >= meta.patch_stride_vec4) continue;
+            std::string expr = (io.array_size > 0) ? (io.name + "[" + std::to_string(a) + "]") : io.name;
+            ss << "        sm_tess_patch[pbase + " << slot << "u] = " << pack_vec4_expr(io, expr) << ";\n";
+        }
+    }
+    ss << "    }\n";
+    ss << "    uint obase = pbase + sm_ts.tcs_patch_stride_vec4 + iid * sm_ts.tcs_vert_stride_vec4;\n";
+    ss << "    sm_tess_patch[obase + 0u] = sm_gl_out[iid].sm_gl_Position;\n";
+    for (const auto& io : outputs) {
+        if (io.is_patch) continue;
+        uint32_t inner_elems = (io.num_array_dims >= 2 && io.array_size > 0) ? io.array_size : 1u;
+        bool is_2d = (io.num_array_dims >= 2);
+        for (uint32_t a = 0; a < inner_elems; ++a) {
+            uint32_t loc = io.location + a;
+            if (loc >= SM_MAX_VARYINGS || (1u + loc) >= meta.out_stride_vec4) continue;
+            std::string expr = is_2d ? (io.name + "[iid][" + std::to_string(a) + "]") : (io.name + "[iid]");
+            ss << "    sm_tess_patch[obase + " << (1u + loc) << "u] = " << pack_vec4_expr(io, expr) << ";\n";
+        }
+    }
+    ss << "}\n";
+
+    return compile_glsl_to_spv(ss.str(), "tcs", out_comp_spv, err);
+}
+
+// =================================================================================================
+// v1.2 Compute-Emulated Tessellation Evaluation Shader + Fixed-Function GPU Patch Tessellator!
+// Supports Triangles / Quads / Isolines, Equal / FractionalEven / FractionalOdd, CW / CCW, PointMode.
+// Emits flat primitives into gs_vert_buf + atomicAdd(disp_cmds[14], 1) -> existing GS Finalize -> Bin!
+// =================================================================================================
+bool sm_lower_tess_eval_spirv(const std::vector<uint32_t>& in_spv,
+                              const VkSpecializationInfo*,
+                              uint32_t sm_set_idx,
+                              std::vector<uint32_t>& out_comp_spv,
+                              std::string& err,
+                              SmTessEvalLowerMeta* out_meta) {
+    SmCancelDisableGuard _cancel_guard;
+    SmTessEvalLowerMeta meta{};
+    meta.domain = 0; meta.spacing = 0; meta.ccw = 1; meta.point_mode = 0; meta.out_topo = 0;
+    if (in_spv.size() >= 5 && in_spv[0] == 0x07230203u) {
+        for (size_t p = 5; p < in_spv.size(); ) {
+            uint32_t w0 = in_spv[p], wc = w0 >> 16, op = w0 & 0xFFFFu;
+            if (wc == 0 || p + wc > in_spv.size()) break;
+            if (op == 16u && wc >= 3u) {
+                uint32_t mode = in_spv[p + 2];
+                if (mode == SpvExecutionModeTriangles)               meta.domain = 0u;
+                else if (mode == SpvExecutionModeQuads)              meta.domain = 1u;
+                else if (mode == SpvExecutionModeIsolines)           meta.domain = 2u;
+                else if (mode == SpvExecutionModeSpacingEqual)       meta.spacing = 0u;
+                else if (mode == SpvExecutionModeSpacingFractionalEven) meta.spacing = 1u;
+                else if (mode == SpvExecutionModeSpacingFractionalOdd)  meta.spacing = 2u;
+                else if (mode == SpvExecutionModeVertexOrderCw)      meta.ccw = 0u;
+                else if (mode == SpvExecutionModeVertexOrderCcw)     meta.ccw = 1u;
+                else if (mode == SpvExecutionModePointMode)          meta.point_mode = 1u;
+            }
+            p += wc;
+        }
+    }
+    if (meta.point_mode) meta.out_topo = 5u; // POINT_LIST
+    else if (meta.domain == 2u) meta.out_topo = 3u; // LINE_LIST
+    else meta.out_topo = 0u; // TRIANGLE_LIST
+
+    std::string glsl;
+    std::vector<ReflectedIO> inputs, outputs;
+    if (!decompile_spirv(in_spv, glsl, inputs, outputs, err)) return false;
+
+    std::string user_exts;
+    std::string body = strip_version_and_stage_io(glsl, user_exts, 32u, 0u, false);
+
+    bool writes_ps = (body.find("gl_PointSize") != std::string::npos);
+    bool writes_clip = false, writes_cull = false;
+    uint32_t clip_cnt = 0, cull_cnt = 0;
+    sm_detect_clip_cull_counts(glsl, body, writes_clip, writes_cull, clip_cnt, cull_cnt);
+
+    uint32_t out_stride = 2u;
+    if (writes_ps || writes_clip || writes_cull) {
+        out_stride = SM_VERT_STRIDE_VEC4;
+    } else {
+        uint32_t max_slot = 1u;
+        for (const auto& io : outputs) {
+            uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+            for (uint32_t a = 0; a < elems; ++a)
+                if (io.location + a < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + io.location + a);
+        }
+        out_stride = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
+    }
+    meta.out_stride_vec4   = out_stride;
+    meta.writes_point_size = writes_ps;
+    meta.writes_clip_dist  = writes_clip;
+    meta.writes_cull_dist  = writes_cull;
+    meta.clip_count        = clip_cnt;
+    meta.cull_count        = cull_cnt;
+    if (out_meta) *out_meta = meta;
+
+    body = replace_ident(body, "gl_in", "sm_gl_in");
+    body = replace_ident(body, "gl_Position", "sm_gl_Position");
+    body = replace_ident(body, "gl_PointSize", "sm_gl_PointSize");
+    body = replace_ident(body, "gl_ClipDistance", "sm_gl_ClipDistance");
+    body = replace_ident(body, "gl_CullDistance", "sm_gl_CullDistance");
+    body = replace_ident(body, "gl_TessCoord", "sm_gl_TessCoord");
+    body = replace_ident(body, "gl_TessLevelOuter", "sm_tess_outer");
+    body = replace_ident(body, "gl_TessLevelInner", "sm_tess_inner");
+    body = replace_ident(body, "gl_PrimitiveID", "sm_prim_id");
+    body = replace_ident(body, "gl_PatchVerticesIn", "int(sm_ts.out_cp)");
+    body = replace_ident(body, "gl_MaxPatchVertices", "32");
+    body = replace_ident(body, "gl_ViewIndex", "int(sm_ts.view_index)");
+    body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_tes_main()");
+
+    std::ostringstream ss;
+    ss << "#version 460\n";
+    if (!user_exts.empty()) ss << user_exts;
+    ss << "layout(local_size_x = 64) in;\n\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 0) readonly buffer SmVsVertBuf { vec4 sm_vs_verts[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 1) writeonly buffer SmGsVertBuf { vec4 sm_out_verts[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 2) buffer SmDispCmdBuf { uint sm_disp_cmds[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 3) readonly buffer SmTessParams {\n"
+       << "    uint num_patches; uint in_cp; uint out_cp; uint vs_stride_vec4;\n"
+       << "    uint tcs_vert_stride_vec4; uint tcs_patch_stride_vec4; uint tes_out_stride_vec4; uint max_out_prims;\n"
+       << "    uint clip_vert_base; uint domain; uint spacing; uint flags;\n"
+       << "    uint view_index; uint max_patch_slots; uint pad0; uint pad1;\n"
+       << "} sm_ts;\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 4) readonly buffer SmTessPatchBuf { vec4 sm_tess_patch[]; };\n\n";
+
+    ss << "struct SmTsPerVertex { vec4 sm_gl_Position; float sm_gl_PointSize; float sm_gl_ClipDistance[8]; float sm_gl_CullDistance[8]; };\n";
+    ss << "SmTsPerVertex sm_gl_in[32];\n";
+    ss << "float sm_tess_outer[4];\n";
+    ss << "float sm_tess_inner[2];\n";
+    ss << "vec3 sm_gl_TessCoord = vec3(0.0);\n";
+    ss << "vec4 sm_gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n";
+    ss << "float sm_gl_PointSize = 1.0;\n";
+    ss << "float sm_gl_ClipDistance[8];\n";
+    ss << "float sm_gl_CullDistance[8];\n";
+    ss << "int sm_prim_id = 0;\n\n";
+
+    ss << body << "\n\n";
+
+    const char* comps = "xyzw";
+    ss << "void sm_eval_and_store(vec3 tc, uint dst_v) {\n";
+    ss << "    sm_gl_TessCoord = tc;\n";
+    ss << "    sm_gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n";
+    ss << "    sm_gl_PointSize = 1.0;\n";
+    if (writes_clip) ss << "    for (int ci = 0; ci < 8; ++ci) sm_gl_ClipDistance[ci] = 0.0;\n";
+    if (writes_cull) ss << "    for (int ci = 0; ci < 8; ++ci) sm_gl_CullDistance[ci] = 0.0;\n";
+    ss << "    sm_user_tes_main();\n";
+    ss << "    uint ob = dst_v * sm_ts.tes_out_stride_vec4;\n";
+    ss << "    sm_out_verts[ob + 0u] = sm_gl_Position;\n";
+    std::unordered_map<uint32_t, std::vector<const ReflectedIO*>> loc_map;
+    for (const auto& io : outputs) {
+        if (io.array_size == 0) {
+            if (io.location < SM_MAX_VARYINGS) loc_map[io.location].push_back(&io);
+        } else {
+            for (uint32_t a = 0; a < io.array_size; ++a) {
+                uint32_t loc = io.location + a;
+                if (loc >= SM_MAX_VARYINGS || (1u + loc) >= out_stride) continue;
+                std::string expr = io.name + "[" + std::to_string(a) + "]";
+                if (io.basetype == SPVC_BASETYPE_INT32) expr = "intBitsToFloat(" + expr + ")";
+                else if (io.basetype == SPVC_BASETYPE_UINT32) expr = "uintBitsToFloat(" + expr + ")";
+                if (io.vecsize == 4)      ss << "    sm_out_verts[ob + " << (1u + loc) << "u] = " << expr << ";\n";
+                else if (io.vecsize == 3) ss << "    sm_out_verts[ob + " << (1u + loc) << "u] = vec4(" << expr << ", 0.0);\n";
+                else if (io.vecsize == 2) ss << "    sm_out_verts[ob + " << (1u + loc) << "u] = vec4(" << expr << ", 0.0, 0.0);\n";
+                else                      ss << "    sm_out_verts[ob + " << (1u + loc) << "u] = vec4(" << expr << ", 0.0, 0.0, 0.0);\n";
+            }
+        }
+    }
+    for (const auto& kv : loc_map) {
+        uint32_t loc = kv.first;
+        if ((1u + loc) >= out_stride) continue;
+        ss << "    {\n        vec4 _v = vec4(0.0);\n";
+        for (const ReflectedIO* p : kv.second) {
+            std::string expr = p->name;
+            if (p->basetype == SPVC_BASETYPE_INT32) expr = "intBitsToFloat(" + expr + ")";
+            else if (p->basetype == SPVC_BASETYPE_UINT32) expr = "uintBitsToFloat(" + expr + ")";
+            std::string s = ".";
+            for (uint32_t c = 0; c < p->vecsize && (p->component + c) < 4; ++c) s += comps[p->component + c];
+            ss << "        _v" << s << " = " << expr << ";\n";
+        }
+        ss << "        sm_out_verts[ob + " << (1u + loc) << "u] = _v;\n    }\n";
+    }
+    if (writes_clip) {
+        ss << "    if (sm_ts.tes_out_stride_vec4 >= 16u) {\n";
+        ss << "        sm_out_verts[ob + 13u] = vec4(sm_gl_ClipDistance[0], sm_gl_ClipDistance[1], sm_gl_ClipDistance[2], sm_gl_ClipDistance[3]);\n";
+        ss << "        sm_out_verts[ob + 14u] = vec4(sm_gl_ClipDistance[4], sm_gl_ClipDistance[5], sm_gl_ClipDistance[6], sm_gl_ClipDistance[7]);\n";
+        ss << "    }\n";
+    }
+    if (writes_cull || writes_ps) {
+        ss << "    if (sm_ts.tes_out_stride_vec4 >= 16u) {\n";
+        if (writes_cull)
+            ss << "        sm_out_verts[ob + 15u] = vec4(sm_gl_CullDistance[0], sm_gl_CullDistance[1], sm_gl_CullDistance[2], "
+               << (writes_ps ? "sm_gl_PointSize" : "sm_gl_CullDistance[3]") << ");\n";
+        else
+            ss << "        sm_out_verts[ob + 15u] = vec4(0.0, 0.0, 0.0, sm_gl_PointSize);\n";
+        ss << "    }\n";
+    }
+    ss << "}\n\n";
+
+    ss << "int sm_quant_tess(float lvl) {\n";
+    ss << "    float c = clamp(lvl, 1.0, 16.0);\n";
+    ss << "    if (sm_ts.spacing == 1u) { int n = int(ceil(c)); if (n > 1 && (n & 1) != 0) n++; return min(n, 16); }\n";
+    ss << "    if (sm_ts.spacing == 2u) { int n = int(ceil(c)); if ((n & 1) == 0) n++; return min(n, 15); }\n";
+    ss << "    return clamp(int(ceil(c)), 1, 16);\n";
+    ss << "}\n";
+
+    if (meta.out_topo == 0u) {
+        ss << "void sm_emit_tri(vec3 a, vec3 b, vec3 c) {\n";
+        ss << "    uint pslot = atomicAdd(sm_disp_cmds[14u], 1u);\n";
+        ss << "    if (pslot >= sm_ts.max_out_prims) return;\n";
+        ss << "    if ((sm_ts.flags & 1u) != 0u) {\n";
+        ss << "        sm_eval_and_store(a, pslot * 3u + 0u); sm_eval_and_store(b, pslot * 3u + 1u); sm_eval_and_store(c, pslot * 3u + 2u);\n";
+        ss << "    } else {\n";
+        ss << "        sm_eval_and_store(a, pslot * 3u + 0u); sm_eval_and_store(c, pslot * 3u + 1u); sm_eval_and_store(b, pslot * 3u + 2u);\n";
+        ss << "    }\n";
+        ss << "}\n";
+    } else if (meta.out_topo == 3u) {
+        ss << "void sm_emit_line(vec3 a, vec3 b) {\n";
+        ss << "    uint pslot = atomicAdd(sm_disp_cmds[14u], 1u);\n";
+        ss << "    if (pslot >= sm_ts.max_out_prims) return;\n";
+        ss << "    sm_eval_and_store(a, pslot * 2u + 0u); sm_eval_and_store(b, pslot * 2u + 1u);\n";
+        ss << "}\n";
+    } else {
+        ss << "void sm_emit_pt(vec3 a) {\n";
+        ss << "    uint pslot = atomicAdd(sm_disp_cmds[14u], 1u);\n";
+        ss << "    if (pslot >= sm_ts.max_out_prims) return;\n";
+        ss << "    sm_eval_and_store(a, pslot);\n";
+        ss << "}\n";
+    }
+
+    ss << "void main() {\n";
+    ss << "    uint pid = gl_GlobalInvocationID.x;\n";
+    ss << "    if (pid >= sm_ts.num_patches || pid >= sm_ts.max_patch_slots) return;\n";
+    ss << "    sm_prim_id = int(pid);\n";
+    ss << "    bool has_tcs = ((sm_ts.flags & 4u) != 0u);\n";
+    ss << "    uint ocp = min(sm_ts.out_cp, 32u);\n";
+    ss << "    uint patch_sz = sm_ts.tcs_patch_stride_vec4 + sm_ts.out_cp * sm_ts.tcs_vert_stride_vec4;\n";
+    ss << "    uint pbase = pid * patch_sz;\n";
+    ss << "    if (has_tcs) {\n";
+    ss << "        vec4 ol = sm_tess_patch[pbase + 0u];\n";
+    ss << "        vec4 il = sm_tess_patch[pbase + 1u];\n";
+    ss << "        sm_tess_outer[0]=ol.x; sm_tess_outer[1]=ol.y; sm_tess_outer[2]=ol.z; sm_tess_outer[3]=ol.w;\n";
+    ss << "        sm_tess_inner[0]=il.x; sm_tess_inner[1]=il.y;\n";
+    for (const auto& io : inputs) {
+        if (!io.is_patch) continue;
+        uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+        std::string s = (io.component == 0) ? swiz(io.vecsize) : ("." + std::string(1, comps[io.component]));
+        for (uint32_t a = 0; a < elems; ++a) {
+            uint32_t slot = 2u + io.location + a;
+            std::string dst = (io.array_size > 0) ? (io.name + "[" + std::to_string(a) + "]") : io.name;
+            std::string raw = "((" + std::to_string(slot) + "u < sm_ts.tcs_patch_stride_vec4) ? sm_tess_patch[pbase + " + std::to_string(slot) + "u] : vec4(0.0))";
+            if (io.basetype == SPVC_BASETYPE_INT32) ss << "        " << dst << " = floatBitsToInt(" << raw << s << ");\n";
+            else if (io.basetype == SPVC_BASETYPE_UINT32) ss << "        " << dst << " = floatBitsToUint(" << raw << s << ");\n";
+            else ss << "        " << dst << " = " << raw << s << ";\n";
+        }
+    }
+    ss << "        for (uint k = 0u; k < ocp; ++k) {\n";
+    ss << "            uint vb = pbase + sm_ts.tcs_patch_stride_vec4 + k * sm_ts.tcs_vert_stride_vec4;\n";
+    ss << "            sm_gl_in[k].sm_gl_Position = sm_tess_patch[vb];\n";
+    for (const auto& io : inputs) {
+        if (io.is_patch) continue;
+        uint32_t inner_elems = (io.num_array_dims >= 2 && io.array_size > 0) ? io.array_size : 1u;
+        bool is_2d = (io.num_array_dims >= 2);
+        std::string s;
+        if (io.component == 0) s = swiz(io.vecsize);
+        else { s = "."; for (uint32_t c = 0; c < io.vecsize && (io.component + c) < 4; ++c) s += comps[io.component + c]; }
+        for (uint32_t a = 0; a < inner_elems; ++a) {
+            uint32_t off = 1u + io.location + a;
+            std::string dst = is_2d ? (io.name + "[k][" + std::to_string(a) + "]") : (io.name + "[k]");
+            std::string raw = "((" + std::to_string(off) + "u < sm_ts.tcs_vert_stride_vec4) ? sm_tess_patch[vb + " + std::to_string(off) + "u] : vec4(0.0))";
+            if (io.basetype == SPVC_BASETYPE_INT32) ss << "            " << dst << " = floatBitsToInt(" << raw << s << ");\n";
+            else if (io.basetype == SPVC_BASETYPE_UINT32) ss << "            " << dst << " = floatBitsToUint(" << raw << s << ");\n";
+            else ss << "            " << dst << " = " << raw << s << ";\n";
+        }
+    }
+    ss << "        }\n";
+    ss << "    } else {\n";
+    ss << "        sm_tess_outer[0]=1.0; sm_tess_outer[1]=1.0; sm_tess_outer[2]=1.0; sm_tess_outer[3]=1.0;\n";
+    ss << "        sm_tess_inner[0]=1.0; sm_tess_inner[1]=1.0;\n";
+    ss << "        uint vbase = sm_ts.clip_vert_base + pid * sm_ts.in_cp;\n";
+    ss << "        for (uint k = 0u; k < ocp; ++k) {\n";
+    ss << "            uint vb = (vbase + k) * sm_ts.vs_stride_vec4;\n";
+    ss << "            sm_gl_in[k].sm_gl_Position = sm_vs_verts[vb];\n";
+    for (const auto& io : inputs) {
+        if (io.is_patch) continue;
+        uint32_t inner_elems = (io.num_array_dims >= 2 && io.array_size > 0) ? io.array_size : 1u;
+        bool is_2d = (io.num_array_dims >= 2);
+        std::string s;
+        if (io.component == 0) s = swiz(io.vecsize);
+        else { s = "."; for (uint32_t c = 0; c < io.vecsize && (io.component + c) < 4; ++c) s += comps[io.component + c]; }
+        for (uint32_t a = 0; a < inner_elems; ++a) {
+            uint32_t off = 1u + io.location + a;
+            std::string dst = is_2d ? (io.name + "[k][" + std::to_string(a) + "]") : (io.name + "[k]");
+            std::string raw = "((" + std::to_string(off) + "u < sm_ts.vs_stride_vec4) ? sm_vs_verts[vb + " + std::to_string(off) + "u] : vec4(0.0))";
+            if (io.basetype == SPVC_BASETYPE_INT32) ss << "            " << dst << " = floatBitsToInt(" << raw << s << ");\n";
+            else if (io.basetype == SPVC_BASETYPE_UINT32) ss << "            " << dst << " = floatBitsToUint(" << raw << s << ");\n";
+            else ss << "            " << dst << " = " << raw << s << ";\n";
+        }
+    }
+    ss << "        }\n";
+    ss << "    }\n";
+
+    // Fixed-function patch domain subdivision (Triangles / Quads / Isolines)
+    if (meta.domain == 0u) { // Triangles
+        ss << "    if (!(sm_tess_outer[0] > 0.0 && sm_tess_outer[1] > 0.0 && sm_tess_outer[2] > 0.0)) return;\n";
+        ss << "    int N = sm_quant_tess(max(max(sm_tess_outer[0], sm_tess_outer[1]), max(sm_tess_outer[2], sm_tess_inner[0])));\n";
+        ss << "    float invN = 1.0 / float(N);\n";
+        if (meta.point_mode) {
+            ss << "    for (int i = 0; i <= N; ++i) for (int j = 0; j <= N - i; ++j) {\n";
+            ss << "        float u = float(i) * invN, v = float(j) * invN;\n";
+            ss << "        sm_emit_pt(vec3(u, v, max(0.0, 1.0 - u - v)));\n";
+            ss << "    }\n";
+        } else {
+            ss << "    for (int i = 0; i < N; ++i) {\n";
+            ss << "        for (int j = 0; j < N - i; ++j) {\n";
+            ss << "            vec3 p00 = vec3(float(i)*invN, float(j)*invN, max(0.0, 1.0 - float(i+j)*invN));\n";
+            ss << "            vec3 p10 = vec3(float(i+1)*invN, float(j)*invN, max(0.0, 1.0 - float(i+1+j)*invN));\n";
+            ss << "            vec3 p01 = vec3(float(i)*invN, float(j+1)*invN, max(0.0, 1.0 - float(i+j+1)*invN));\n";
+            ss << "            sm_emit_tri(p00, p10, p01);\n";
+            ss << "            if (i + j + 2 <= N) {\n";
+            ss << "                vec3 p11 = vec3(float(i+1)*invN, float(j+1)*invN, max(0.0, 1.0 - float(i+j+2)*invN));\n";
+            ss << "                sm_emit_tri(p10, p11, p01);\n";
+            ss << "            }\n";
+            ss << "        }\n";
+            ss << "    }\n";
+        }
+    } else if (meta.domain == 1u) { // Quads
+        ss << "    if (!(sm_tess_outer[0] > 0.0 && sm_tess_outer[1] > 0.0 && sm_tess_outer[2] > 0.0 && sm_tess_outer[3] > 0.0)) return;\n";
+        ss << "    int Nu = sm_quant_tess(max(max(sm_tess_outer[1], sm_tess_outer[3]), sm_tess_inner[0]));\n";
+        ss << "    int Nv = sm_quant_tess(max(max(sm_tess_outer[0], sm_tess_outer[2]), sm_tess_inner[1]));\n";
+        ss << "    float iu = 1.0 / float(Nu), iv = 1.0 / float(Nv);\n";
+        if (meta.point_mode) {
+            ss << "    for (int j = 0; j <= Nv; ++j) for (int i = 0; i <= Nu; ++i) sm_emit_pt(vec3(float(i)*iu, float(j)*iv, 0.0));\n";
+        } else {
+            ss << "    for (int j = 0; j < Nv; ++j) for (int i = 0; i < Nu; ++i) {\n";
+            ss << "        vec3 p00 = vec3(float(i)*iu,   float(j)*iv,   0.0);\n";
+            ss << "        vec3 p10 = vec3(float(i+1)*iu, float(j)*iv,   0.0);\n";
+            ss << "        vec3 p01 = vec3(float(i)*iu,   float(j+1)*iv, 0.0);\n";
+            ss << "        vec3 p11 = vec3(float(i+1)*iu, float(j+1)*iv, 0.0);\n";
+            ss << "        sm_emit_tri(p00, p10, p11);\n";
+            ss << "        sm_emit_tri(p00, p11, p01);\n";
+            ss << "    }\n";
+        }
+    } else { // Isolines
+        ss << "    if (!(sm_tess_outer[0] > 0.0 && sm_tess_outer[1] > 0.0)) return;\n";
+        ss << "    int Nl = sm_quant_tess(sm_tess_outer[0]);\n";
+        ss << "    int Ns = sm_quant_tess(sm_tess_outer[1]);\n";
+        ss << "    float il = 1.0 / float(Nl), iseg = 1.0 / float(Ns);\n";
+        ss << "    for (int j = 0; j < Nl; ++j) {\n";
+        ss << "        float v = float(j) * il;\n";
+        if (meta.point_mode) {
+            ss << "        for (int i = 0; i <= Ns; ++i) sm_emit_pt(vec3(float(i)*iseg, v, 0.0));\n";
+        } else {
+            ss << "        for (int i = 0; i < Ns; ++i) sm_emit_line(vec3(float(i)*iseg, v, 0.0), vec3(float(i+1)*iseg, v, 0.0));\n";
+        }
+        ss << "    }\n";
+    }
+    ss << "}\n";
+
+    return compile_glsl_to_spv(ss.str(), "tes", out_comp_spv, err);
 }
 
 bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
@@ -1284,7 +2182,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err,
                              bool* out_fs_uses_push,
-                             bool* out_fs_has_discard_or_depth,
+                             bool* out_fs_has_discard,
+                             bool* out_fs_writes_depth,
                              const std::vector<SmDynUboDesc>* dyn_ubos,
                              bool* out_fs_batched_push_ok,
                              SmDynUboDesc* out_batched_dyn_ubo,
@@ -1295,25 +2194,31 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ReflectedBlock push_blk, dyn_ubo_blk;
     if (!decompile_spirv(in_spv, glsl, inputs, outputs, err, dyn_ubos, &push_blk, &dyn_ubo_blk)) return false;
 
+    std::string user_exts;
+    std::string body = strip_version_and_stage_io(glsl, user_exts);
+    bool reads_clip_dist = (body.find("gl_ClipDistance") != std::string::npos);
+    bool uses_frag_depth = (body.find("gl_FragDepth") != std::string::npos);
+
     if (out_stride_vec4) {
-        uint32_t max_slot = 1u;
-        for (const auto& io : inputs) {
-            uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
-            for (uint32_t a = 0; a < elems; ++a) {
-                uint32_t loc = io.location + a;
-                if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
+        if (reads_clip_dist) {
+            *out_stride_vec4 = SM_VERT_STRIDE_VEC4;
+        } else {
+            uint32_t max_slot = 1u;
+            for (const auto& io : inputs) {
+                uint32_t elems = (io.array_size > 0) ? io.array_size : 1u;
+                for (uint32_t a = 0; a < elems; ++a) {
+                    uint32_t loc = io.location + a;
+                    if (loc < SM_MAX_VARYINGS) max_slot = std::max(max_slot, 2u + loc);
+                }
             }
+            *out_stride_vec4 = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
         }
-        *out_stride_vec4 = std::min<uint32_t>(SM_VERT_STRIDE_VEC4, std::max<uint32_t>(2u, max_slot));
     }
 
     if (out_fs_uses_push) *out_fs_uses_push = (glsl.find("push_constant") != std::string::npos);
     if (out_fs_batched_push_ok) *out_fs_batched_push_ok = false;
     if (out_batched_dyn_ubo) out_batched_dyn_ubo->dyn_slot = 0xFFFFFFFFu;
-    bool uses_frag_depth = (glsl.find("gl_FragDepth") != std::string::npos);
 
-    std::string user_exts;
-    std::string body = strip_version_and_stage_io(glsl, user_exts);
     body = replace_ident(body, "gl_FragCoord", "sm_gl_FragCoord");
     body = replace_ident(body, "gl_FrontFacing", "sm_gl_FrontFacing");
     body = replace_ident(body, "gl_FragDepth", "sm_gl_FragDepth");
@@ -1329,7 +2234,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     body = replace_ident(body, "gl_ClipDistance", "sm_gl_ClipDistance");
     body = replace_ident(body, "gl_CullDistance", "sm_gl_CullDistance");
     body = replace_ident(body, "gl_PointCoord", "vec2(0.5)");
-    body = replace_ident(body, "gl_ViewIndex", "0");
+    body = replace_ident(body, "gl_ViewIndex", "int(sm_fs.view_index)");
     body = replace_ident(body, "dFdx", "sm_dFdx");
     body = replace_ident(body, "dFdy", "sm_dFdy");
     body = replace_ident(body, "dFdxFine", "sm_dFdx");
@@ -1342,8 +2247,9 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     body = rewrite_texture_calls(body);
     body = std::regex_replace(body, std::regex(R"(\bdemote\s*;)"), "{ sm_discarded = true; sm_gl_HelperInvocation = true; }");
     body = std::regex_replace(body, std::regex(R"(\bdiscard\s*;)"), "{ sm_discarded = true; sm_gl_HelperInvocation = true; }");
-    if (out_fs_has_discard_or_depth)
-        *out_fs_has_discard_or_depth = (uses_frag_depth || body.find("sm_discarded = true;") != std::string::npos);
+    bool has_discard = (body.find("sm_discarded = true;") != std::string::npos);
+    if (out_fs_has_discard)  *out_fs_has_discard  = has_discard;
+    if (out_fs_writes_depth) *out_fs_writes_depth = uses_frag_depth;
     body = std::regex_replace(body, std::regex(R"(\bvoid\s+main\s*\(\s*\))"), "void sm_user_fs_main()");
 
     // v0.8 Per-Draw Push-Constant & Dynamic-UBO SSBO Cross-Material Uber-Batching Lowering!
@@ -1366,6 +2272,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "#extension GL_ARB_gpu_shader_int64 : require\n";
     ss << "#extension GL_KHR_shader_subgroup_quad : require\n";
     ss << "#extension GL_KHR_shader_subgroup_vote : require\n";
+    ss << "#extension GL_KHR_shader_subgroup_ballot : require\n";
     ss << "#extension GL_EXT_texture_shadow_lod : enable\n";
     if (!user_exts.empty()) ss << user_exts;
     ss << "layout(local_size_x = 256) in;\n\n";
@@ -1374,7 +2281,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx;\n"
        << "};\n";
 
-    // SmRast v0.6 Full 8-MRT + Depth + 8-bit Stencil + Active-Tile + Self-Clearing VisBuf FS Internal Set!
+    // SmRast v1.2 Full 8-MRT + Depth + Stencil + Active-Tile + GPU Depth-Peeling + Occlusion Queries!
     ss << "layout(std430, set = " << sm_set_idx << ", binding = 0)  readonly buffer SmClipVertBuf    { vec4 sm_clip_verts[]; };\n";
     ss << "layout(std430, set = " << sm_set_idx << ", binding = 1)  readonly buffer SmTriSetupBuf    { SmTriSetup sm_tris[]; };\n";
     ss << "layout(std430, set = " << sm_set_idx << ", binding = 2)  buffer SmVisBuf                  { uint64_t sm_vis_px[]; };\n";
@@ -1409,7 +2316,14 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "    ivec4 quad_sc;\n"
        << "    vec2  quad_z;\n"
        << "    uint  quad_meta;\n"
-       << "    uint  quad_pad;\n"
+       << "    uint  peel_in_base;\n"
+       << "    uint  peel_out_base;\n"
+       << "    uint  peel_out_hdr;\n"
+       << "    uint  extra_cfg;\n"
+       << "    uint  occ_query_idx;\n"
+       << "    vec2  depth_bounds;\n"
+       << "    uint  view_index;\n"
+       << "    uint  extra_pad;\n"
        << "} sm_fs;\n";
     ss << "shared SmTriSetup sm_fq_tris[16];\n";
     ss << "shared vec3 sm_fq_u0[16];\n";
@@ -1417,13 +2331,21 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "shared vec3 sm_fq_u2[16];\n";
     ss << "shared uint sm_fq_cnt;\n";
     ss << "shared uint sm_fq_clipped;\n";
-    ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n";
+    if (has_discard) {
+        ss << "shared uint sm_peel_any;\n";
+        ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n";
+    } else {
+        ss << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n";
+    }
     if (batched_push)
         ss << "layout(std430, set = " << sm_set_idx << ", binding = 15) readonly buffer SmBatchPushBuf   { uint sm_bp_raw[]; };\n";
     if (batched_dyn_ubo) {
         ss << "layout(std430, set = " << sm_set_idx << ", binding = 16) readonly buffer SmBatchDynUboBuf { uint sm_dyn_raw[]; };\n";
         ss << "layout(std430, set = " << sm_set_idx << ", binding = 17) readonly buffer SmBatchDynOffBuf { uint sm_dyn_off[]; };\n";
     }
+    if (has_discard)
+        ss << "layout(std430, set = " << sm_set_idx << ", binding = 18) buffer SmDispCmdBuf              { uint sm_disp_cmds[]; };\n";
+    ss << "layout(std430, set = " << sm_set_idx << ", binding = 19) buffer SmOccQueryBuf             { uint sm_occ_counts[]; };\n";
     ss << "\n";
 
     ss << "uint sm_u4(uvec4 a[2], uint i) { return a[i >> 2u][i & 3u]; }\n";
@@ -1442,7 +2364,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "float sm_gl_CullDistance[8];\n";
     ss << "bool sm_discarded = false;\n\n";
 
-    // 1-cycle Branchless Hopper Quad Subgroup Derivatives (zero basic-block splits inside textureGrad!)
+    // 1-cycle Branchless Hopper Quad Subgroup Derivatives
     ss << "float sm_dFdx(float v) { return (subgroupQuadSwapHorizontal(v) - v) * (1.0 - 2.0 * float(sm_quad_lane & 1u)); }\n";
     ss << "vec2  sm_dFdx(vec2  v) { return (subgroupQuadSwapHorizontal(v) - v) * (1.0 - 2.0 * float(sm_quad_lane & 1u)); }\n";
     ss << "vec3  sm_dFdx(vec3  v) { return (subgroupQuadSwapHorizontal(v) - v) * (1.0 - 2.0 * float(sm_quad_lane & 1u)); }\n";
@@ -1456,15 +2378,16 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "vec3  sm_fwidth(vec3  v) { return abs(sm_dFdx(v)) + abs(sm_dFdy(v)); }\n";
     ss << "vec4  sm_fwidth(vec4  v) { return abs(sm_dFdx(v)) + abs(sm_dFdy(v)); }\n\n";
 
-    // Determine whether we need heavy dynamic format/blend/stencil helpers (zero register bloat for opaque RGBA8/BGRA8!)
+    // Determine helper requirements (zero register bloat for opaque RGBA8/BGRA8!)
     bool need_any_blend = false;
     bool need_any_rmw = false;
     bool need_dyn_fmt = false;
     bool need_srgb = false;
     bool need_r11g11b10 = false;
+    bool need_logic_op = hints.logic_op_en;
     for (const auto& io : outputs) {
         if (io.array_size == 0 && io.location < SM_MAX_MRT) {
-            if (hints.blend_en[io.location]) { need_any_blend = true; need_any_rmw = true; }
+            if (hints.blend_en[io.location] && !hints.logic_op_en) { need_any_blend = true; need_any_rmw = true; }
             if ((hints.write_mask[io.location] & 0xFu) != 0xFu) need_any_rmw = true;
             int fc = hints.rt_fmt[io.location];
             if (fc < 0) { need_dyn_fmt = true; need_any_rmw = true; need_srgb = true; need_r11g11b10 = true; }
@@ -1476,6 +2399,26 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     }
 
     ss << "vec4 sm_safe_f16(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), vec4(-65504.0), vec4(65504.0)); }\n";
+    if (need_logic_op) {
+        ss << "uint sm_logic_op(uint op, uint s, uint d) {\n"
+           << "    if (op == 0u)  return 0u;\n"
+           << "    if (op == 1u)  return s & d;\n"
+           << "    if (op == 2u)  return s & (~d);\n"
+           << "    if (op == 3u)  return s;\n"
+           << "    if (op == 4u)  return (~s) & d;\n"
+           << "    if (op == 5u)  return d;\n"
+           << "    if (op == 6u)  return s ^ d;\n"
+           << "    if (op == 7u)  return s | d;\n"
+           << "    if (op == 8u)  return ~(s | d);\n"
+           << "    if (op == 9u)  return ~(s ^ d);\n"
+           << "    if (op == 10u) return ~d;\n"
+           << "    if (op == 11u) return s | (~d);\n"
+           << "    if (op == 12u) return ~s;\n"
+           << "    if (op == 13u) return (~s) | d;\n"
+           << "    if (op == 14u) return ~(s & d);\n"
+           << "    return 0xFFFFFFFFu;\n"
+           << "}\n";
+    }
     if (need_srgb) {
         ss << "float sm_lin_to_srgb(float x) { return (x <= 0.0031308) ? (x * 12.92) : (1.055 * pow(max(x, 0.0), 1.0/2.4) - 0.055); }\n";
         ss << "float sm_srgb_to_lin(float x) { return (x <= 0.04045) ? (x / 12.92) : pow((max(x, 0.0) + 0.055) / 1.055, 2.4); }\n";
@@ -1589,38 +2532,77 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
         }
     }
 
-    // Per-RT write helper: compile-time specialized when format/blend/writeMask are known (max Hopper SM occupancy!)
+    // Per-RT write helper: compile-time specialized when format/blend/writeMask/logicOp are known!
     auto emit_rt_store = [&](int rt_i, const ReflectedIO& io) {
         std::string buf = "sm_col" + std::to_string(rt_i);
         std::string rts = std::to_string(rt_i) + "u";
         int kfc = hints.rt_fmt[rt_i];
-        bool ben = hints.blend_en[rt_i];
+        bool ben = hints.blend_en[rt_i] && !hints.logic_op_en;
         uint32_t kwm = hints.write_mask[rt_i] & 0xFu;
         if (kfc >= 0 && kwm == 0u) return;
 
-        ss << "    if ((sm_fs.rt_active_mask & (1u << " << rts << ")) != 0u) {\n";
-        ss << "        uint rpidx = p.y * sm_u4(sm_fs.rt_stride, " << rts << ") + p.x;\n";
-        if (kfc == 11 || io.basetype == SPVC_BASETYPE_UINT32 || io.basetype == SPVC_BASETYPE_INT32) {
-            std::string first_comp = (io.vecsize == 1) ? io.name : (io.name + ".x");
-            if (kfc == 17) {
-                ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(" << first_comp << ") & 0xFFu; "
-                   << "atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
-            } else if (kfc == 20) {
-                ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = uint(" << first_comp << ") & 0xFFFFu; "
-                   << "atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
-            } else {
-                ss << "        " << buf << "[rpidx] = uint(" << first_comp << ");\n";
-            }
-            ss << "    }\n";
+        ss << "        if ((sm_fs.rt_active_mask & (1u << " << rts << ")) != 0u) {\n";
+        ss << "            uint rpidx = p.y * sm_u4(sm_fs.rt_stride, " << rts << ") + p.x;\n";
+        bool is_int_io = (io.basetype == SPVC_BASETYPE_UINT32 || io.basetype == SPVC_BASETYPE_INT32 ||
+                          kfc == 11 || (kfc >= 24 && kfc <= 30));
+        if (is_int_io) {
+            ss << "            uvec4 iv = ";
+            if (io.vecsize == 4)      ss << "uvec4(" << io.name << ");\n";
+            else if (io.vecsize == 3) ss << "uvec4(" << io.name << ", 0u);\n";
+            else if (io.vecsize == 2) ss << "uvec4(" << io.name << ", 0u, 0u);\n";
+            else                      ss << "uvec4(uint(" << io.name << "), 0u, 0u, 0u);\n";
+            ss << "            uint ifc = " << (kfc >= 0 ? (std::to_string(kfc) + "u") : ("sm_u4(sm_fs.rt_fmt, " + rts + ")")) << ";\n";
+            auto lop_w = [&](const std::string& sw, const std::string& dw) -> std::string {
+                if (!hints.logic_op_en) return sw;
+                return "sm_logic_op(" + std::to_string(hints.logic_op) + "u, " + sw + ", " + dw + ")";
+            };
+            ss << "            if (ifc == 17u) {\n"
+               << "                uint sh = (rpidx & 3u) << 3u; uint dw = (" << buf << "[rpidx >> 2u] >> sh) & 0xFFu;\n"
+               << "                uint v8 = (" << lop_w("iv.x & 0xFFu", "dw") << ") & 0xFFu;\n"
+               << "                atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh);\n"
+               << "            } else if (ifc == 20u) {\n"
+               << "                uint sh = (rpidx & 1u) << 4u; uint dw = (" << buf << "[rpidx >> 1u] >> sh) & 0xFFFFu;\n"
+               << "                uint v16 = (" << lop_w("iv.x & 0xFFFFu", "dw") << ") & 0xFFFFu;\n"
+               << "                atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh);\n"
+               << "            } else if (ifc == 24u) {\n"
+               << "                uint sh = (rpidx & 1u) << 4u; uint dw = (" << buf << "[rpidx >> 1u] >> sh) & 0xFFFFu;\n"
+               << "                uint sw = (iv.x & 0xFFu) | ((iv.y & 0xFFu) << 8u);\n"
+               << "                uint v16 = (" << lop_w("sw", "dw") << ") & 0xFFFFu;\n"
+               << "                atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh);\n"
+               << "            } else if (ifc == 25u) {\n"
+               << "                uint sw = (iv.x & 0xFFu) | ((iv.y & 0xFFu) << 8u) | ((iv.z & 0xFFu) << 16u) | ((iv.w & 0xFFu) << 24u);\n"
+               << "                " << buf << "[rpidx] = " << lop_w("sw", buf + "[rpidx]") << ";\n"
+               << "            } else if (ifc == 26u) {\n"
+               << "                uint sw = (iv.x & 0xFFFFu) | ((iv.y & 0xFFFFu) << 16u);\n"
+               << "                " << buf << "[rpidx] = " << lop_w("sw", buf + "[rpidx]") << ";\n"
+               << "            } else if (ifc == 30u) {\n"
+               << "                uint sw = (iv.x & 1023u) | ((iv.y & 1023u) << 10u) | ((iv.z & 1023u) << 20u) | ((iv.w & 3u) << 30u);\n"
+               << "                " << buf << "[rpidx] = " << lop_w("sw", buf + "[rpidx]") << ";\n"
+               << "            } else if (ifc == 27u) {\n"
+               << "                uint sw0 = (iv.x & 0xFFFFu) | ((iv.y & 0xFFFFu) << 16u), sw1 = (iv.z & 0xFFFFu) | ((iv.w & 0xFFFFu) << 16u);\n"
+               << "                " << buf << "[rpidx*2u] = " << lop_w("sw0", buf + "[rpidx*2u]") << ";\n"
+               << "                " << buf << "[rpidx*2u+1u] = " << lop_w("sw1", buf + "[rpidx*2u+1u]") << ";\n"
+               << "            } else if (ifc == 28u) {\n"
+               << "                " << buf << "[rpidx*2u] = " << lop_w("iv.x", buf + "[rpidx*2u]") << ";\n"
+               << "                " << buf << "[rpidx*2u+1u] = " << lop_w("iv.y", buf + "[rpidx*2u+1u]") << ";\n"
+               << "            } else if (ifc == 29u) {\n"
+               << "                " << buf << "[rpidx*4u+0u] = " << lop_w("iv.x", buf + "[rpidx*4u+0u]") << ";\n"
+               << "                " << buf << "[rpidx*4u+1u] = " << lop_w("iv.y", buf + "[rpidx*4u+1u]") << ";\n"
+               << "                " << buf << "[rpidx*4u+2u] = " << lop_w("iv.z", buf + "[rpidx*4u+2u]") << ";\n"
+               << "                " << buf << "[rpidx*4u+3u] = " << lop_w("iv.w", buf + "[rpidx*4u+3u]") << ";\n"
+               << "            } else {\n"
+               << "                " << buf << "[rpidx] = " << lop_w("iv.x", buf + "[rpidx]") << ";\n"
+               << "            }\n";
+            ss << "        }\n";
             return;
         }
-        ss << "        vec4 out_c = ";
+        ss << "            vec4 out_c = ";
         if (io.vecsize == 4) ss << "vec4(" << io.name << ");\n";
         else if (io.vecsize == 3) ss << "vec4(" << io.name << ", 1.0);\n";
         else if (io.vecsize == 2) ss << "vec4(" << io.name << ", 0.0, 1.0);\n";
         else ss << "vec4(float(" << io.name << "), 0.0, 0.0, 1.0);\n";
         if (ben) {
-            ss << "        vec4 src1_c = ";
+            ss << "            vec4 src1_c = ";
             if (rt_i == 0 && dual_src1) {
                 if (dual_src1->vecsize == 4)      ss << "vec4(" << dual_src1->name << ");\n";
                 else if (dual_src1->vecsize == 3) ss << "vec4(" << dual_src1->name << ", 1.0);\n";
@@ -1633,112 +2615,164 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
 
         if (kfc >= 0) {
             bool need_wm = (kwm != 0xFu);
-            bool need_rmw = ben || need_wm;
+            bool need_rmw = ben || (need_wm && !hints.logic_op_en);
             if (need_rmw) {
-                ss << "        vec4 dst_c;\n";
-                if (kfc == 4)       ss << "        dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx*2u]), unpackHalf2x16(" << buf << "[rpidx*2u+1u]));\n";
-                else if (kfc == 10) ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*2u]), uintBitsToFloat(" << buf << "[rpidx*2u+1u]), 0.0, 1.0);\n";
-                else if (kfc == 15) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx*2u]), unpackUnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
-                else if (kfc == 16) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
-                else if (kfc == 8)  ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
-                else if (kfc == 5)  ss << "        { uint pk = " << buf << "[rpidx]; dst_c = vec4(sm_uf11_to_f32(pk&0x7FFu), sm_uf11_to_f32((pk>>11u)&0x7FFu), sm_uf10_to_f32((pk>>22u)&0x3FFu), 1.0); }\n";
-                else if (kfc == 6)  ss << "        dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx]), 0.0, 0.0, 1.0);\n";
-                else if (kfc == 7)  ss << "        dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
-                else if (kfc == 9)  ss << "        { uint pk = " << buf << "[rpidx]; dst_c = vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0); }\n";
-                else if (kfc == 12) ss << "        dst_c = unpackSnorm4x8(" << buf << "[rpidx]);\n";
-                else if (kfc == 13) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
-                else if (kfc == 14) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
-                else if (kfc == 17) ss << "        { uint b8 = (" << buf << "[rpidx >> 2u] >> ((rpidx & 3u) << 3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 21) ss << "        { int s8 = bitfieldExtract(int(" << buf << "[rpidx >> 2u]), int((rpidx & 3u) << 3u), 8); dst_c = vec4(max(float(s8)/127.0, -1.0), 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 18) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
-                else if (kfc == 19) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 20) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
-                else if (kfc == 1) ss << "        dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra;\n";
-                else if (kfc == 2) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[rpidx]); dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
-                else if (kfc == 3) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra; dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
-                else                ss << "        dst_c = unpackUnorm4x8(" << buf << "[rpidx]);\n";
+                ss << "            vec4 dst_c;\n";
+                if (kfc == 4)       ss << "            dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx*2u]), unpackHalf2x16(" << buf << "[rpidx*2u+1u]));\n";
+                else if (kfc == 10) ss << "            dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*2u]), uintBitsToFloat(" << buf << "[rpidx*2u+1u]), 0.0, 1.0);\n";
+                else if (kfc == 15) ss << "            dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx*2u]), unpackUnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+                else if (kfc == 16) ss << "            dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+                else if (kfc == 8)  ss << "            dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
+                else if (kfc == 5)  ss << "            { uint pk = " << buf << "[rpidx]; dst_c = vec4(sm_uf11_to_f32(pk&0x7FFu), sm_uf11_to_f32((pk>>11u)&0x7FFu), sm_uf10_to_f32((pk>>22u)&0x3FFu), 1.0); }\n";
+                else if (kfc == 6)  ss << "            dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx]), 0.0, 0.0, 1.0);\n";
+                else if (kfc == 7)  ss << "            dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
+                else if (kfc == 9)  ss << "            { uint pk = " << buf << "[rpidx]; dst_c = vec4(float(pk&1023u)/1023.0, float((pk>>10u)&1023u)/1023.0, float((pk>>20u)&1023u)/1023.0, float((pk>>30u)&3u)/3.0); }\n";
+                else if (kfc == 12) ss << "            dst_c = unpackSnorm4x8(" << buf << "[rpidx]);\n";
+                else if (kfc == 13) ss << "            dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
+                else if (kfc == 14) ss << "            dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
+                else if (kfc == 17) ss << "            { uint b8 = (" << buf << "[rpidx >> 2u] >> ((rpidx & 3u) << 3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 21) ss << "            { int s8 = bitfieldExtract(int(" << buf << "[rpidx >> 2u]), int((rpidx & 3u) << 3u), 8); dst_c = vec4(max(float(s8)/127.0, -1.0), 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 18) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
+                else if (kfc == 22) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(max(float(bitfieldExtract(int(w16),0,8))/127.0,-1.0), max(float(bitfieldExtract(int(w16),8,8))/127.0,-1.0), 0.0, 1.0); }\n";
+                else if (kfc == 19) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 20) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 23) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(max(float(bitfieldExtract(int(w16),0,16))/32767.0,-1.0), 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 31) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float((w16>>11u)&31u)/31.0, float((w16>>5u)&63u)/63.0, float(w16&31u)/31.0, 1.0); }\n";
+                else if (kfc == 32) ss << "            { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float((w16>>12u)&15u)/15.0, float((w16>>8u)&15u)/15.0, float((w16>>4u)&15u)/15.0, float(w16&15u)/15.0); }\n";
+                else if (kfc == 1)  ss << "            dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra;\n";
+                else if (kfc == 2)  ss << "            { dst_c = unpackUnorm4x8(" << buf << "[rpidx]); dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
+                else if (kfc == 3)  ss << "            { dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra; dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
+                else                ss << "            dst_c = unpackUnorm4x8(" << buf << "[rpidx]);\n";
                 if (ben) {
-                    ss << "        vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
-                    ss << "        vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
-                    ss << "        float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
-                    ss << "        float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
-                    ss << "        out_c = vec4(sm_blend_combine3(sm_u4(sm_fs.rt_blend_op, " << rts << "), out_c.rgb, dst_c.rgb, sf_rgb, df_rgb), "
+                    ss << "            vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                    ss << "            vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                    ss << "            float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
+                    ss << "            float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
+                    ss << "            out_c = vec4(sm_blend_combine3(sm_u4(sm_fs.rt_blend_op, " << rts << "), out_c.rgb, dst_c.rgb, sf_rgb, df_rgb), "
                        << "sm_blend_combine1(sm_u4(sm_fs.rt_alpha_op, " << rts << "), out_c.a, dst_c.a, sf_a, df_a));\n";
                 }
-                if (need_wm) {
-                    ss << "        out_c = mix(dst_c, out_c, bvec4("
+                if (need_wm && !hints.logic_op_en) {
+                    ss << "            out_c = mix(dst_c, out_c, bvec4("
                        << ((kwm & 1u) ? "true" : "false") << ", "
                        << ((kwm & 2u) ? "true" : "false") << ", "
                        << ((kwm & 4u) ? "true" : "false") << ", "
                        << ((kwm & 8u) ? "true" : "false") << "));\n";
                 }
             }
-            if (kfc == 0)      ss << "        " << buf << "[rpidx] = packUnorm4x8(clamp(out_c, 0.0, 1.0));\n";
-            else if (kfc == 1) ss << "        " << buf << "[rpidx] = packUnorm4x8(clamp(out_c, 0.0, 1.0).bgra);\n";
-            else if (kfc == 2) ss << "        { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b)); " << buf << "[rpidx] = packUnorm4x8(c); }\n";
-            else if (kfc == 3) ss << "        { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b)); " << buf << "[rpidx] = packUnorm4x8(c.bgra); }\n";
-            else if (kfc == 4) ss << "        { vec4 s16 = sm_safe_f16(out_c); " << buf << "[rpidx*2u] = packHalf2x16(s16.rg); " << buf << "[rpidx*2u+1u] = packHalf2x16(s16.ba); }\n";
-            else if (kfc == 5) ss << "        " << buf << "[rpidx] = sm_f32_to_uf11(out_c.r) | (sm_f32_to_uf11(out_c.g) << 11u) | (sm_f32_to_uf10(out_c.b) << 22u);\n";
-            else if (kfc == 6) ss << "        " << buf << "[rpidx] = floatBitsToUint(isnan(out_c.r) ? 0.0 : out_c.r);\n";
-            else if (kfc == 7) ss << "        " << buf << "[rpidx] = packHalf2x16(sm_safe_f16(out_c).rg);\n";
-            else if (kfc == 8) ss << "        " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a);\n";
-            else if (kfc == 9) ss << "        { vec4 cl = clamp(out_c, 0.0, 1.0); " << buf << "[rpidx] = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u); }\n";
-            else if (kfc == 10) ss << "        " << buf << "[rpidx*2u] = floatBitsToUint(out_c.r); " << buf << "[rpidx*2u+1u] = floatBitsToUint(out_c.g);\n";
-            else if (kfc == 11) ss << "        " << buf << "[rpidx] = uint(out_c.r);\n";
-            else if (kfc == 12) ss << "        " << buf << "[rpidx] = packSnorm4x8(clamp(out_c, -1.0, 1.0));\n";
-            else if (kfc == 13) ss << "        " << buf << "[rpidx] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0));\n";
-            else if (kfc == 14) ss << "        " << buf << "[rpidx] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0));\n";
-            else if (kfc == 15) ss << "        " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba, 0.0, 1.0));\n";
-            else if (kfc == 16) ss << "        " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba, -1.0, 1.0));\n";
-            else if (kfc == 17) ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(round(clamp(out_c.r, 0.0, 1.0) * 255.0)) & 0xFFu; atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
-            else if (kfc == 21) ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(int(round(clamp(out_c.r, -1.0, 1.0) * 127.0))) & 0xFFu; atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
-            else if (kfc == 18) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = (uint(round(clamp(out_c.r, 0.0, 1.0)*255.0))&0xFFu) | ((uint(round(clamp(out_c.g, 0.0, 1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
-            else if (kfc == 19) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = packHalf2x16(vec2(sm_safe_f16(out_c).r, 0.0)) & 0xFFFFu; atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
-            else if (kfc == 20) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = uint(round(clamp(out_c.r, 0.0, 1.0) * 65535.0)) & 0xFFFFu; atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
+            auto apply_u32_lop = [&](const std::string& sw_expr, bool bgra_order) {
+                if (!hints.logic_op_en) {
+                    ss << "            " << buf << "[rpidx] = " << sw_expr << ";\n";
+                } else {
+                    uint32_t bmask = 0;
+                    if (!bgra_order) {
+                        if (kwm & 1u) bmask |= 0x000000FFu;
+                        if (kwm & 2u) bmask |= 0x0000FF00u;
+                        if (kwm & 4u) bmask |= 0x00FF0000u;
+                        if (kwm & 8u) bmask |= 0xFF000000u;
+                    } else {
+                        if (kwm & 4u) bmask |= 0x000000FFu;
+                        if (kwm & 2u) bmask |= 0x0000FF00u;
+                        if (kwm & 1u) bmask |= 0x00FF0000u;
+                        if (kwm & 8u) bmask |= 0xFF000000u;
+                    }
+                    ss << "            { uint sw = " << sw_expr << "; uint dw = " << buf << "[rpidx]; uint lw = sm_logic_op(" << hints.logic_op << "u, sw, dw); "
+                       << buf << "[rpidx] = (dw & ~" << bmask << "u) | (lw & " << bmask << "u); }\n";
+                }
+            };
+            if (kfc == 0)      apply_u32_lop("packUnorm4x8(clamp(out_c, 0.0, 1.0))", false);
+            else if (kfc == 1) apply_u32_lop("packUnorm4x8(clamp(out_c, 0.0, 1.0).bgra)", true);
+            else if (kfc == 2) { ss << "            { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b));\n"; apply_u32_lop("packUnorm4x8(c)", false); ss << "            }\n"; }
+            else if (kfc == 3) { ss << "            { vec4 c = clamp(out_c, 0.0, 1.0); c.rgb = vec3(sm_lin_to_srgb(c.r), sm_lin_to_srgb(c.g), sm_lin_to_srgb(c.b));\n"; apply_u32_lop("packUnorm4x8(c.bgra)", true); ss << "            }\n"; }
+            else if (kfc == 4) ss << "            { vec4 s16 = sm_safe_f16(out_c); " << buf << "[rpidx*2u] = packHalf2x16(s16.rg); " << buf << "[rpidx*2u+1u] = packHalf2x16(s16.ba); }\n";
+            else if (kfc == 5) ss << "            " << buf << "[rpidx] = sm_f32_to_uf11(out_c.r) | (sm_f32_to_uf11(out_c.g) << 11u) | (sm_f32_to_uf10(out_c.b) << 22u);\n";
+            else if (kfc == 6) ss << "            " << buf << "[rpidx] = floatBitsToUint(isnan(out_c.r) ? 0.0 : out_c.r);\n";
+            else if (kfc == 7) ss << "            " << buf << "[rpidx] = packHalf2x16(sm_safe_f16(out_c).rg);\n";
+            else if (kfc == 8) ss << "            " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a);\n";
+            else if (kfc == 9) { ss << "            { vec4 cl = clamp(out_c, 0.0, 1.0); uint sw9 = uint(round(cl.r*1023.0))|(uint(round(cl.g*1023.0))<<10u)|(uint(round(cl.b*1023.0))<<20u)|(uint(round(cl.a*3.0))<<30u);\n";
+                if (hints.logic_op_en) ss << "            " << buf << "[rpidx] = sm_logic_op(" << hints.logic_op << "u, sw9, " << buf << "[rpidx]); }\n";
+                else ss << "            " << buf << "[rpidx] = sw9; }\n"; }
+            else if (kfc == 10) ss << "            " << buf << "[rpidx*2u] = floatBitsToUint(out_c.r); " << buf << "[rpidx*2u+1u] = floatBitsToUint(out_c.g);\n";
+            else if (kfc == 12) apply_u32_lop("packSnorm4x8(clamp(out_c, -1.0, 1.0))", false);
+            else if (kfc == 13) { uint32_t m13 = ((kwm&1u)?0xFFFFu:0u)|((kwm&2u)?0xFFFF0000u:0u);
+                if (hints.logic_op_en) ss << "            { uint sw=packUnorm2x16(clamp(out_c.rg,0.0,1.0)); uint dw=" << buf << "[rpidx]; " << buf << "[rpidx]=(dw&~" << m13 << "u)|(sm_logic_op(" << hints.logic_op << "u,sw,dw)&" << m13 << "u); }\n";
+                else ss << "            " << buf << "[rpidx] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0));\n"; }
+            else if (kfc == 14) { uint32_t m14 = ((kwm&1u)?0xFFFFu:0u)|((kwm&2u)?0xFFFF0000u:0u);
+                if (hints.logic_op_en) ss << "            { uint sw=packSnorm2x16(clamp(out_c.rg,-1.0,1.0)); uint dw=" << buf << "[rpidx]; " << buf << "[rpidx]=(dw&~" << m14 << "u)|(sm_logic_op(" << hints.logic_op << "u,sw,dw)&" << m14 << "u); }\n";
+                else ss << "            " << buf << "[rpidx] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0));\n"; }
+            else if (kfc == 15) {
+                if (hints.logic_op_en) ss << "            " << buf << "[rpidx*2u]=sm_logic_op(" << hints.logic_op << "u,packUnorm2x16(clamp(out_c.rg,0.0,1.0))," << buf << "[rpidx*2u]); " << buf << "[rpidx*2u+1u]=sm_logic_op(" << hints.logic_op << "u,packUnorm2x16(clamp(out_c.ba,0.0,1.0))," << buf << "[rpidx*2u+1u]);\n";
+                else ss << "            " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba, 0.0, 1.0));\n"; }
+            else if (kfc == 16) {
+                if (hints.logic_op_en) ss << "            " << buf << "[rpidx*2u]=sm_logic_op(" << hints.logic_op << "u,packSnorm2x16(clamp(out_c.rg,-1.0,1.0))," << buf << "[rpidx*2u]); " << buf << "[rpidx*2u+1u]=sm_logic_op(" << hints.logic_op << "u,packSnorm2x16(clamp(out_c.ba,-1.0,1.0))," << buf << "[rpidx*2u+1u]);\n";
+                else ss << "            " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba, -1.0, 1.0));\n"; }
+            else if (kfc == 17) ss << "            { uint sh=(rpidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; " << (hints.logic_op_en ? ("v8=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v8,(" + buf + "[rpidx>>2u]>>sh)&0xFFu)&0xFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>2u],~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u],v8<<sh); }\n";
+            else if (kfc == 21) ss << "            { uint sh=(rpidx&3u)<<3u; uint v8=uint(int(round(clamp(out_c.r,-1.0,1.0)*127.0)))&0xFFu; " << (hints.logic_op_en ? ("v8=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v8,(" + buf + "[rpidx>>2u]>>sh)&0xFFu)&0xFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>2u],~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u],v8<<sh); }\n";
+            else if (kfc == 18) ss << "            { uint sh=(rpidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); " << (hints.logic_op_en ? ("v16=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v16,(" + buf + "[rpidx>>1u]>>sh)&0xFFFFu)&0xFFFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
+            else if (kfc == 22) ss << "            { uint sh=(rpidx&1u)<<4u; uint v16=(uint(int(round(clamp(out_c.r,-1.0,1.0)*127.0)))&0xFFu)|((uint(int(round(clamp(out_c.g,-1.0,1.0)*127.0)))&0xFFu)<<8u); " << (hints.logic_op_en ? ("v16=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v16,(" + buf + "[rpidx>>1u]>>sh)&0xFFFFu)&0xFFFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
+            else if (kfc == 19) ss << "            { uint sh=(rpidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
+            else if (kfc == 20) ss << "            { uint sh=(rpidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; " << (hints.logic_op_en ? ("v16=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v16,(" + buf + "[rpidx>>1u]>>sh)&0xFFFFu)&0xFFFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
+            else if (kfc == 23) ss << "            { uint sh=(rpidx&1u)<<4u; uint v16=uint(int(round(clamp(out_c.r,-1.0,1.0)*32767.0)))&0xFFFFu; " << (hints.logic_op_en ? ("v16=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v16,(" + buf + "[rpidx>>1u]>>sh)&0xFFFFu)&0xFFFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
+            else if (kfc == 31) ss << "            { uint sh=(rpidx&1u)<<4u; vec3 c=clamp(out_c.rgb,0.0,1.0); uint v16=(uint(round(c.r*31.0))<<11u)|(uint(round(c.g*63.0))<<5u)|uint(round(c.b*31.0)); " << (hints.logic_op_en ? ("v16=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v16,(" + buf + "[rpidx>>1u]>>sh)&0xFFFFu)&0xFFFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
+            else if (kfc == 32) ss << "            { uint sh=(rpidx&1u)<<4u; vec4 c=clamp(out_c,0.0,1.0); uint v16=(uint(round(c.r*15.0))<<12u)|(uint(round(c.g*15.0))<<8u)|(uint(round(c.b*15.0))<<4u)|uint(round(c.a*15.0)); " << (hints.logic_op_en ? ("v16=sm_logic_op(" + std::to_string(hints.logic_op) + "u,v16,(" + buf + "[rpidx>>1u]>>sh)&0xFFFFu)&0xFFFFu; ") : "") << "atomicAnd(" << buf << "[rpidx>>1u],~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u],v16<<sh); }\n";
         } else {
-            ss << "        uint fc = sm_u4(sm_fs.rt_fmt, " << rts << ");\n";
-            ss << "        uint wm = sm_u4(sm_fs.rt_write_mask, " << rts << ") & 0xFu;\n";
-            ss << "        if (wm != 0u) {\n";
-            ss << "            bool do_bl = (sm_u4(sm_fs.rt_blend_en, " << rts << ") != 0u);\n";
-            ss << "            if (do_bl || wm != 0xFu) {\n";
-            ss << "                vec4 dst_c;\n";
-            ss << "                if (fc == 4u)       dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx*2u]), unpackHalf2x16(" << buf << "[rpidx*2u+1u]));\n";
-            ss << "                else if (fc == 10u) dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*2u]), uintBitsToFloat(" << buf << "[rpidx*2u+1u]), 0.0, 1.0);\n";
-            ss << "                else if (fc == 15u) dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx*2u]), unpackUnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
-            ss << "                else if (fc == 16u) dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
-            ss << "                else if (fc == 8u)  dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
-            ss << "                else if (fc == 17u) { uint b8 = (" << buf << "[rpidx>>2u] >> ((rpidx&3u)<<3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 21u) { int s8 = bitfieldExtract(int(" << buf << "[rpidx>>2u]), int((rpidx&3u)<<3u), 8); dst_c = vec4(max(float(s8)/127.0, -1.0), 0.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 18u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 19u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
-            ss << "                else if (fc == 20u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
-            ss << "                else dst_c = sm_unpack_u32_fmt(" << buf << "[rpidx], fc);\n";
+            ss << "            uint fc = sm_u4(sm_fs.rt_fmt, " << rts << ");\n";
+            ss << "            uint wm = sm_u4(sm_fs.rt_write_mask, " << rts << ") & 0xFu;\n";
+            ss << "            if (wm != 0u) {\n";
+            ss << "                bool do_bl = (sm_u4(sm_fs.rt_blend_en, " << rts << ") != 0u)" << (hints.logic_op_en ? " && false" : "") << ";\n";
+            ss << "                if (do_bl || wm != 0xFu) {\n";
+            ss << "                    vec4 dst_c;\n";
+            ss << "                    if (fc == 4u)       dst_c = vec4(unpackHalf2x16(" << buf << "[rpidx*2u]), unpackHalf2x16(" << buf << "[rpidx*2u+1u]));\n";
+            ss << "                    else if (fc == 10u) dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*2u]), uintBitsToFloat(" << buf << "[rpidx*2u+1u]), 0.0, 1.0);\n";
+            ss << "                    else if (fc == 15u) dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx*2u]), unpackUnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+            ss << "                    else if (fc == 16u) dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
+            ss << "                    else if (fc == 8u)  dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
+            ss << "                    else if (fc == 17u) { uint b8 = (" << buf << "[rpidx>>2u] >> ((rpidx&3u)<<3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 21u) { int s8 = bitfieldExtract(int(" << buf << "[rpidx>>2u]), int((rpidx&3u)<<3u), 8); dst_c = vec4(max(float(s8)/127.0, -1.0), 0.0, 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 18u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 22u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(max(float(bitfieldExtract(int(w16),0,8))/127.0,-1.0), max(float(bitfieldExtract(int(w16),8,8))/127.0,-1.0), 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 19u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 20u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 23u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(max(float(bitfieldExtract(int(w16),0,16))/32767.0,-1.0), 0.0, 0.0, 1.0); }\n";
+            ss << "                    else if (fc == 31u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float((w16>>11u)&31u)/31.0, float((w16>>5u)&63u)/63.0, float(w16&31u)/31.0, 1.0); }\n";
+            ss << "                    else if (fc == 32u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float((w16>>12u)&15u)/15.0, float((w16>>8u)&15u)/15.0, float((w16>>4u)&15u)/15.0, float(w16&15u)/15.0); }\n";
+            ss << "                    else dst_c = sm_unpack_u32_fmt(" << buf << "[rpidx], fc);\n";
             if (ben) {
-                ss << "                if (do_bl) {\n";
-                ss << "                    vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
-                ss << "                    vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
-                ss << "                    float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
-                ss << "                    float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
-                ss << "                    out_c = vec4(sm_blend_combine3(sm_u4(sm_fs.rt_blend_op, " << rts << "), out_c.rgb, dst_c.rgb, sf_rgb, df_rgb), "
+                ss << "                    if (do_bl) {\n";
+                ss << "                        vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                ss << "                        vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                ss << "                        float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
+                ss << "                        float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
+                ss << "                        out_c = vec4(sm_blend_combine3(sm_u4(sm_fs.rt_blend_op, " << rts << "), out_c.rgb, dst_c.rgb, sf_rgb, df_rgb), "
                    << "sm_blend_combine1(sm_u4(sm_fs.rt_alpha_op, " << rts << "), out_c.a, dst_c.a, sf_a, df_a));\n";
-                ss << "                }\n";
+                ss << "                    }\n";
             }
-            ss << "                if (wm != 0xFu) out_c = mix(dst_c, out_c, bvec4((wm&1u)!=0u, (wm&2u)!=0u, (wm&4u)!=0u, (wm&8u)!=0u));\n";
+            if (!hints.logic_op_en)
+                ss << "                    if (wm != 0xFu) out_c = mix(dst_c, out_c, bvec4((wm&1u)!=0u, (wm&2u)!=0u, (wm&4u)!=0u, (wm&8u)!=0u));\n";
+            ss << "                }\n";
+            ss << "                if (fc == 4u)       { vec4 s16 = sm_safe_f16(out_c); " << buf << "[rpidx*2u] = packHalf2x16(s16.rg); " << buf << "[rpidx*2u+1u] = packHalf2x16(s16.ba); }\n";
+            ss << "                else if (fc == 10u) { " << buf << "[rpidx*2u] = floatBitsToUint(out_c.r); " << buf << "[rpidx*2u+1u] = floatBitsToUint(out_c.g); }\n";
+            ss << "                else if (fc == 15u) { " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg,0.0,1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba,0.0,1.0)); }\n";
+            ss << "                else if (fc == 16u) { " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg,-1.0,1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba,-1.0,1.0)); }\n";
+            ss << "                else if (fc == 8u)  { " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a); }\n";
+            ss << "                else if (fc == 17u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
+            ss << "                else if (fc == 21u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(int(round(clamp(out_c.r,-1.0,1.0)*127.0)))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
+            ss << "                else if (fc == 18u) { uint sh=(rpidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "                else if (fc == 22u) { uint sh=(rpidx&1u)<<4u; uint v16=(uint(int(round(clamp(out_c.r,-1.0,1.0)*127.0)))&0xFFu)|((uint(int(round(clamp(out_c.g,-1.0,1.0)*127.0)))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "                else if (fc == 19u) { uint sh=(rpidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "                else if (fc == 20u) { uint sh=(rpidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "                else if (fc == 23u) { uint sh=(rpidx&1u)<<4u; uint v16=uint(int(round(clamp(out_c.r,-1.0,1.0)*32767.0)))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "                else if (fc == 31u) { uint sh=(rpidx&1u)<<4u; vec3 c=clamp(out_c.rgb,0.0,1.0); uint v16=(uint(round(c.r*31.0))<<11u)|(uint(round(c.g*63.0))<<5u)|uint(round(c.b*31.0)); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            ss << "                else if (fc == 32u) { uint sh=(rpidx&1u)<<4u; vec4 c=clamp(out_c,0.0,1.0); uint v16=(uint(round(c.r*15.0))<<12u)|(uint(round(c.g*15.0))<<8u)|(uint(round(c.b*15.0))<<4u)|uint(round(c.a*15.0)); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
+            if (hints.logic_op_en) {
+                ss << "                else { uint sw = sm_pack_u32_fmt(out_c, fc); uint dw = " << buf << "[rpidx]; uint lw = sm_logic_op(" << hints.logic_op << "u, sw, dw);\n"
+                   << "                       bool bgr = (fc == 1u || fc == 3u); uint bm = (bgr ? (((wm&4u)!=0u?0xFFu:0u)|((wm&2u)!=0u?0xFF00u:0u)|((wm&1u)!=0u?0xFF0000u:0u)) : (((wm&1u)!=0u?0xFFu:0u)|((wm&2u)!=0u?0xFF00u:0u)|((wm&4u)!=0u?0xFF0000u:0u))) | ((wm&8u)!=0u?0xFF000000u:0u);\n"
+                   << "                       " << buf << "[rpidx] = (dw & ~bm) | (lw & bm); }\n";
+            } else {
+                ss << "                else { " << buf << "[rpidx] = sm_pack_u32_fmt(out_c, fc); }\n";
+            }
             ss << "            }\n";
-            ss << "            if (fc == 4u)       { vec4 s16 = sm_safe_f16(out_c); " << buf << "[rpidx*2u] = packHalf2x16(s16.rg); " << buf << "[rpidx*2u+1u] = packHalf2x16(s16.ba); }\n";
-            ss << "            else if (fc == 10u) { " << buf << "[rpidx*2u] = floatBitsToUint(out_c.r); " << buf << "[rpidx*2u+1u] = floatBitsToUint(out_c.g); }\n";
-            ss << "            else if (fc == 15u) { " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg,0.0,1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba,0.0,1.0)); }\n";
-            ss << "            else if (fc == 16u) { " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg,-1.0,1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba,-1.0,1.0)); }\n";
-            ss << "            else if (fc == 8u)  { " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a); }\n";
-            ss << "            else if (fc == 17u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
-            ss << "            else if (fc == 21u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(int(round(clamp(out_c.r,-1.0,1.0)*127.0)))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
-            ss << "            else if (fc == 18u) { uint sh=(rpidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
-            ss << "            else if (fc == 19u) { uint sh=(rpidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
-            ss << "            else if (fc == 20u) { uint sh=(rpidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
-            ss << "            else { " << buf << "[rpidx] = sm_pack_u32_fmt(out_c, fc); }\n";
-            ss << "        }\n";
         }
-        ss << "    }\n";
+        ss << "        }\n";
     };
 
     ss << "bool sm_is_top_left(vec2 d) { return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0); }\n";
@@ -1751,6 +2785,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
        << "}\n";
     ss << "void main() {\n";
     ss << "    uint tid = gl_LocalInvocationIndex;\n";
+    if (has_discard) {
+        ss << "    if (tid == 0u) sm_peel_any = 0u;\n";
+        ss << "    barrier();\n";
+    }
     ss << "    uint quad_id = tid >> 2u;\n";
     ss << "    sm_quad_lane = tid & 3u;\n";
     ss << "    uint lx = ((quad_id & 7u) << 1u) | (sm_quad_lane & 1u);\n";
@@ -1760,6 +2798,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    uint pidx;\n";
     ss << "    bool active_px;\n";
     ss << "    uint my_tri;\n";
+    ss << "    uint sm_tile_id = 0u;\n";
+    ss << "    uint64_t orig_vis = 0xFFFFFFFFFFFFFFFFul;\n";
     ss << "    if (sm_fs.direct_2d == 3u) {\n";
     ss << "        p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
     ss << "        in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
@@ -1769,10 +2809,23 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "        barrier();\n";
     ss << "        if (tid < n_in) {\n";
     ss << "            uint topo = (sm_fs.quad_meta >> 4u) & 7u;\n";
+    ss << "            bool qlast_pv = (sm_fs.quad_meta & 4096u) != 0u;\n";
     ss << "            uint qi0, qi1, qi2;\n";
-    ss << "            if (topo == 0u) { qi0 = tid * 3u; qi1 = qi0 + 1u; qi2 = qi0 + 2u; }\n";
-    ss << "            else if ((tid & 1u) == 0u) { qi0 = tid; qi1 = tid + 1u; qi2 = tid + 2u; }\n";
-    ss << "            else { qi0 = tid + 1u; qi1 = tid; qi2 = tid + 2u; }\n";
+    ss << "            if (topo == 0u) {\n";
+    ss << "                if (!qlast_pv) { qi0 = tid * 3u; qi1 = qi0 + 1u; qi2 = qi0 + 2u; }\n";
+    ss << "                else           { qi0 = tid * 3u + 2u; qi1 = tid * 3u; qi2 = tid * 3u + 1u; }\n";
+    ss << "            } else if (topo == 1u) {\n";
+    ss << "                if ((tid & 1u) == 0u) {\n";
+    ss << "                    if (!qlast_pv) { qi0 = tid; qi1 = tid + 1u; qi2 = tid + 2u; }\n";
+    ss << "                    else           { qi0 = tid + 2u; qi1 = tid; qi2 = tid + 1u; }\n";
+    ss << "                } else {\n";
+    ss << "                    if (!qlast_pv) { qi0 = tid; qi1 = tid + 2u; qi2 = tid + 1u; }\n";
+    ss << "                    else           { qi0 = tid + 2u; qi1 = tid + 1u; qi2 = tid; }\n";
+    ss << "                }\n";
+    ss << "            } else {\n";
+    ss << "                if (!qlast_pv) { qi0 = tid + 1u; qi1 = tid + 2u; qi2 = 0u; }\n";
+    ss << "                else           { qi0 = tid + 2u; qi1 = 0u; qi2 = tid + 1u; }\n";
+    ss << "            }\n";
     ss << "            vec4 c0 = sm_clip_verts[qi0 * sm_fs.vert_stride_vec4];\n";
     ss << "            vec4 c1 = sm_clip_verts[qi1 * sm_fs.vert_stride_vec4];\n";
     ss << "            vec4 c2 = sm_clip_verts[qi2 * sm_fs.vert_stride_vec4];\n";
@@ -1924,13 +2977,15 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    } else {\n";
     ss << "        if (sm_fs.direct_2d != 0u) {\n";
     ss << "            p = gl_WorkGroupID.xy * 16u + uvec2(lx, ly);\n";
+    ss << "            sm_tile_id = gl_WorkGroupID.y * sm_fs.tiles_x + gl_WorkGroupID.x;\n";
     ss << "        } else {\n";
-    ss << "            uint sm_tile_id = sm_active_tiles[gl_WorkGroupID.x];\n";
+    ss << "            sm_tile_id = sm_active_tiles[sm_fs.peel_in_base + gl_WorkGroupID.x];\n";
     ss << "            p = uvec2((sm_tile_id % sm_fs.tiles_x) * 16u + lx, (sm_tile_id / sm_fs.tiles_x) * 16u + ly);\n";
     ss << "        }\n";
     ss << "        in_bounds = (p.x < sm_fs.width && p.y < sm_fs.height);\n";
     ss << "        pidx = in_bounds ? (p.y * sm_fs.width + p.x) : 0u;\n";
     ss << "        uint64_t vis = in_bounds ? sm_vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;\n";
+    ss << "        orig_vis = vis;\n";
     ss << "        active_px = in_bounds && (vis != 0xFFFFFFFFFFFFFFFFul);\n";
     ss << "        if (active_px) sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n";
     ss << "        my_tri = active_px ? uint(vis & 0xFFFFFFFFul) : 0xFFFFFFFFu;\n";
@@ -1941,40 +2996,45 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    uint t2 = subgroupQuadBroadcast(my_tri, 2u);\n";
     ss << "    uint t3 = subgroupQuadBroadcast(my_tri, 3u);\n";
     ss << "    uint eff_tri = active_px ? my_tri : min(min(t0, t1), min(t2, t3));\n";
-    ss << "    if (eff_tri == 0xFFFFFFFFu) return;\n\n";
+    ss << "    bool sm_passed_occ = false;\n";
+    ss << "    if (eff_tri != 0xFFFFFFFFu) {\n";
 
-    ss << "    SmTriSetup ts = (sm_fs.direct_2d == 3u) ? sm_fq_tris[eff_tri] : sm_tris[eff_tri];\n";
-    ss << "    uint sm_draw_id = (ts.idx.w >> 16u) & 0xFFu;\n";
+    ss << "        SmTriSetup ts = (sm_fs.direct_2d == 3u) ? sm_fq_tris[eff_tri] : sm_tris[eff_tri];\n";
+    ss << "        uint sm_draw_id = (ts.idx.w >> 16u) & 0xFFu;\n";
     if (batched_push)    ss << push_init_code;
     if (batched_dyn_ubo) ss << dyn_ubo_init_code;
-    ss << "    sm_gl_PrimitiveID = int(eff_tri);\n";
-    ss << "    sm_gl_FrontFacing = (ts.idx.w & 0x80000000u) != 0u;\n";
-    ss << "    float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n";
-    ss << "    vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n";
-    ss << "    float l0 = sm_edge_eval(s1, s2, fx, fy) * ts.area.x;\n";
-    ss << "    float l1 = sm_edge_eval(s2, s0, fx, fy) * ts.area.x;\n";
-    ss << "    float l2 = 1.0 - l0 - l1;\n";
-    ss << "    float pz = clamp(l0 * ts.v0.z + l1 * ts.v1.z + l2 * ts.v2.z, 0.0, 1.0);\n";
-    ss << "    float w0 = l0 * ts.v0.w, w1 = l1 * ts.v1.w, w2 = l2 * ts.v2.w;\n";
-    ss << "    float wsum = w0 + w1 + w2;\n";
-    ss << "    float inv_wsum = 1.0 / max(1e-20, wsum);\n";
-    ss << "    float b0 = w0 * inv_wsum, b1 = w1 * inv_wsum, b2 = w2 * inv_wsum;\n";
-    ss << "    if (sm_fs.direct_2d == 3u && sm_fq_clipped != 0u) {\n";
-    ss << "        vec3 ob = b0 * sm_fq_u0[eff_tri] + b1 * sm_fq_u1[eff_tri] + b2 * sm_fq_u2[eff_tri];\n";
-    ss << "        b0 = ob.x; b1 = ob.y; b2 = ob.z;\n";
-    ss << "        vec3 ol = l0 * sm_fq_u0[eff_tri] + l1 * sm_fq_u1[eff_tri] + l2 * sm_fq_u2[eff_tri];\n";
-    ss << "        l0 = ol.x; l1 = ol.y; l2 = ol.z;\n";
-    ss << "    } else if (sm_fs.direct_2d == 3u) {\n";
-    ss << "        vec3 ob = b0 * sm_fq_u0[eff_tri] + b1 * sm_fq_u1[eff_tri] + b2 * sm_fq_u2[eff_tri];\n";
-    ss << "        b0 = ob.x; b1 = ob.y; b2 = ob.z;\n";
-    ss << "        vec3 ol = l0 * sm_fq_u0[eff_tri] + l1 * sm_fq_u1[eff_tri] + l2 * sm_fq_u2[eff_tri];\n";
-    ss << "        l0 = ol.x; l1 = ol.y; l2 = ol.z;\n";
-    ss << "    }\n";
-    ss << "    sm_gl_FragCoord = vec4(fx, fy, pz, wsum);\n";
-    ss << "    sm_gl_FragDepth = pz;\n";
-    ss << "    uint vi0 = ts.idx.x * sm_fs.vert_stride_vec4;\n";
-    ss << "    uint vi1 = ts.idx.y * sm_fs.vert_stride_vec4;\n";
-    ss << "    uint vi2 = ts.idx.z * sm_fs.vert_stride_vec4;\n";
+    ss << "        sm_gl_PrimitiveID = int(eff_tri);\n";
+    ss << "        sm_gl_FrontFacing = (ts.idx.w & 0x80000000u) != 0u;\n";
+    ss << "        float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n";
+    ss << "        vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n";
+    ss << "        float l0 = sm_edge_eval(s1, s2, fx, fy) * ts.area.x;\n";
+    ss << "        float l1 = sm_edge_eval(s2, s0, fx, fy) * ts.area.x;\n";
+    ss << "        float l2 = 1.0 - l0 - l1;\n";
+    ss << "        float pz = clamp(l0 * ts.v0.z + l1 * ts.v1.z + l2 * ts.v2.z, 0.0, 1.0);\n";
+    ss << "        float w0 = l0 * ts.v0.w, w1 = l1 * ts.v1.w, w2 = l2 * ts.v2.w;\n";
+    ss << "        float wsum = w0 + w1 + w2;\n";
+    ss << "        float inv_wsum = 1.0 / max(1e-20, wsum);\n";
+    ss << "        float b0 = w0 * inv_wsum, b1 = w1 * inv_wsum, b2 = w2 * inv_wsum;\n";
+    ss << "        if (sm_fs.direct_2d == 3u) {\n";
+    ss << "            vec3 ob = b0 * sm_fq_u0[eff_tri] + b1 * sm_fq_u1[eff_tri] + b2 * sm_fq_u2[eff_tri];\n";
+    ss << "            b0 = ob.x; b1 = ob.y; b2 = ob.z;\n";
+    ss << "            vec3 ol = l0 * sm_fq_u0[eff_tri] + l1 * sm_fq_u1[eff_tri] + l2 * sm_fq_u2[eff_tri];\n";
+    ss << "            l0 = ol.x; l1 = ol.y; l2 = ol.z;\n";
+    ss << "        }\n";
+    ss << "        sm_gl_FragCoord = vec4(fx, fy, pz, wsum);\n";
+    ss << "        sm_gl_FragDepth = pz;\n";
+    ss << "        uint vi0 = ts.idx.x * sm_fs.vert_stride_vec4;\n";
+    ss << "        uint vi1 = ts.idx.y * sm_fs.vert_stride_vec4;\n";
+    ss << "        uint vi2 = ts.idx.z * sm_fs.vert_stride_vec4;\n";
+
+    if (reads_clip_dist) {
+        ss << "        if (sm_fs.vert_stride_vec4 >= 15u) {\n";
+        ss << "            vec4 cda = sm_clip_verts[vi0 + 13u] * b0 + sm_clip_verts[vi1 + 13u] * b1 + sm_clip_verts[vi2 + 13u] * b2;\n";
+        ss << "            vec4 cdb = sm_clip_verts[vi0 + 14u] * b0 + sm_clip_verts[vi1 + 14u] * b1 + sm_clip_verts[vi2 + 14u] * b2;\n";
+        ss << "            sm_gl_ClipDistance[0]=cda.x; sm_gl_ClipDistance[1]=cda.y; sm_gl_ClipDistance[2]=cda.z; sm_gl_ClipDistance[3]=cda.w;\n";
+        ss << "            sm_gl_ClipDistance[4]=cdb.x; sm_gl_ClipDistance[5]=cdb.y; sm_gl_ClipDistance[6]=cdb.z; sm_gl_ClipDistance[7]=cdb.w;\n";
+        ss << "        }\n";
+    }
 
     const char* comps = "xyzw";
     for (const auto& io : inputs) {
@@ -1991,64 +3051,107 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                 s = ".";
                 for (uint32_t c = 0; c < io.vecsize && (io.component + c) < 4; ++c) s += comps[io.component + c];
             }
-            ss << "    {\n";
+            ss << "        {\n";
             if (io.basetype == SPVC_BASETYPE_INT32) {
-                ss << "        " << dst_var << " = floatBitsToInt(sm_clip_verts[vi0 + " << off << "u]" << s << ");\n";
+                ss << "            " << dst_var << " = floatBitsToInt(sm_clip_verts[vi0 + " << off << "u]" << s << ");\n";
             } else if (io.basetype == SPVC_BASETYPE_UINT32) {
-                ss << "        " << dst_var << " = floatBitsToUint(sm_clip_verts[vi0 + " << off << "u]" << s << ");\n";
+                ss << "            " << dst_var << " = floatBitsToUint(sm_clip_verts[vi0 + " << off << "u]" << s << ");\n";
             } else if (io.is_flat) {
-                ss << "        " << dst_var << " = sm_clip_verts[vi0 + " << off << "u]" << s << ";\n";
+                ss << "            " << dst_var << " = sm_clip_verts[vi0 + " << off << "u]" << s << ";\n";
             } else if (io.is_noperspective) {
-                ss << "        vec4 interp = sm_clip_verts[vi0 + " << off << "u] * l0 + "
+                ss << "            vec4 interp = sm_clip_verts[vi0 + " << off << "u] * l0 + "
                    << "sm_clip_verts[vi1 + " << off << "u] * l1 + "
                    << "sm_clip_verts[vi2 + " << off << "u] * l2;\n";
-                ss << "        " << dst_var << " = interp" << s << ";\n";
+                ss << "            " << dst_var << " = interp" << s << ";\n";
             } else {
-                ss << "        vec4 interp = sm_clip_verts[vi0 + " << off << "u] * b0 + "
+                ss << "            vec4 interp = sm_clip_verts[vi0 + " << off << "u] * b0 + "
                    << "sm_clip_verts[vi1 + " << off << "u] * b1 + "
                    << "sm_clip_verts[vi2 + " << off << "u] * b2;\n";
-                ss << "        " << dst_var << " = interp" << s << ";\n";
+                ss << "            " << dst_var << " = interp" << s << ";\n";
             }
-            ss << "    }\n";
+            ss << "        }\n";
         }
     }
 
-    ss << "    sm_discarded = false;\n";
-    ss << "    sm_user_fs_main();\n";
-    ss << "    if (!active_px || sm_discarded) return;\n";
-    if (hints.stencil_en) {
-        ss << "    if ((sm_fs.stencil_enable & 3u) == 3u) {\n";
-        ss << "        uint scfg = sm_gl_FrontFacing ? sm_fs.stencil_front_cfg : sm_fs.stencil_back_cfg;\n";
-        ss << "        uint sref = sm_gl_FrontFacing ? (sm_fs.stencil_refs & 0xFFu) : ((sm_fs.stencil_refs >> 8u) & 0xFFu);\n";
-        ss << "        uint cmask = (scfg >> 16u) & 0xFFu;\n";
-        ss << "        uint wmask = (scfg >> 24u) & 0xFFu;\n";
-        ss << "        uint old_s = sm_stencil_px[pidx] & 0xFFu;\n";
-        ss << "        bool spass = sm_stencil_cmp(scfg & 7u, sref & cmask, old_s & cmask);\n";
-        ss << "        bool dpass = true;\n";
-        ss << "        if (spass && (sm_fs.stencil_enable & 4u) != 0u) {\n";
-        ss << "            uint dop = (sm_fs.stencil_enable >> 4u) & 7u;\n";
-        ss << "            float fz = " << (uses_frag_depth ? "sm_gl_FragDepth" : "pz") << ";\n";
-        ss << "            float rz = sm_depth_px[pidx];\n";
-        ss << "            if (dop == 0u) dpass = false;\n";
-        ss << "            else if (dop == 1u) dpass = (fz <  rz);\n";
-        ss << "            else if (dop == 2u) dpass = (fz == rz);\n";
-        ss << "            else if (dop == 3u) dpass = (fz <= rz);\n";
-        ss << "            else if (dop == 4u) dpass = (fz >  rz);\n";
-        ss << "            else if (dop == 5u) dpass = (fz != rz);\n";
-        ss << "            else if (dop == 6u) dpass = (fz >= rz);\n";
-        ss << "            else dpass = true;\n";
+    ss << "        sm_discarded = false;\n";
+    ss << "        sm_user_fs_main();\n";
+    if (has_discard) {
+        ss << "        if (active_px && sm_discarded && sm_fs.peel_out_hdr != 0u) {\n";
+        ss << "            sm_vis_px[pidx] = orig_vis;\n";
+        ss << "            atomicOr(sm_peel_any, 1u);\n";
         ss << "        }\n";
-        ss << "        uint sop = !spass ? ((scfg >> 3u) & 7u) : (dpass ? ((scfg >> 6u) & 7u) : ((scfg >> 9u) & 7u));\n";
-        ss << "        uint new_s = sm_stencil_apply(sop, old_s, sref) & 0xFFu;\n";
-        ss << "        if (wmask != 0u) sm_stencil_px[pidx] = (old_s & (~wmask & 0xFFu)) | (new_s & wmask);\n";
-        ss << "        if (!spass || !dpass) return;\n";
-        ss << "    }\n";
     }
-    ss << "    if (sm_fs.depth_write != 0u) sm_depth_px[pidx] = " << (uses_frag_depth ? "sm_gl_FragDepth" : "pz") << ";\n";
-
-    // Write ALL reflected primary MRT color outputs (Location 0..7, index == 0; index == 1 feeds dual-source blending!)
+    ss << "        bool sm_keep = active_px && !sm_discarded;\n";
+    // Depth bounds test for fused-quad / late-Z paths
+    ss << "        if (sm_keep && (sm_fs.extra_cfg & 512u) != 0u) {\n";
+    ss << "            float db_z = sm_depth_px[pidx];\n";
+    ss << "            if (db_z < sm_fs.depth_bounds.x || db_z > sm_fs.depth_bounds.y) sm_keep = false;\n";
+    ss << "        }\n";
+    if (hints.stencil_en) {
+        ss << "        if (sm_keep && (sm_fs.stencil_enable & 3u) == 3u) {\n";
+        ss << "            uint scfg = sm_gl_FrontFacing ? sm_fs.stencil_front_cfg : sm_fs.stencil_back_cfg;\n";
+        ss << "            uint sref = sm_gl_FrontFacing ? (sm_fs.stencil_refs & 0xFFu) : ((sm_fs.stencil_refs >> 8u) & 0xFFu);\n";
+        ss << "            uint cmask = (scfg >> 16u) & 0xFFu;\n";
+        ss << "            uint wmask = (scfg >> 24u) & 0xFFu;\n";
+        ss << "            uint old_s = sm_stencil_px[pidx] & 0xFFu;\n";
+        ss << "            bool spass = sm_stencil_cmp(scfg & 7u, sref & cmask, old_s & cmask);\n";
+        ss << "            bool dpass = true;\n";
+        ss << "            if (spass && (sm_fs.stencil_enable & 4u) != 0u) {\n";
+        ss << "                uint dop = (sm_fs.stencil_enable >> 4u) & 7u;\n";
+        ss << "                float fz = " << (uses_frag_depth ? "clamp(sm_gl_FragDepth, 0.0, 1.0)" : "pz") << ";\n";
+        ss << "                float rz = sm_depth_px[pidx];\n";
+        ss << "                if (dop == 0u) dpass = false;\n";
+        ss << "                else if (dop == 1u) dpass = (fz <  rz);\n";
+        ss << "                else if (dop == 2u) dpass = (fz == rz);\n";
+        ss << "                else if (dop == 3u) dpass = (fz <= rz);\n";
+        ss << "                else if (dop == 4u) dpass = (fz >  rz);\n";
+        ss << "                else if (dop == 5u) dpass = (fz != rz);\n";
+        ss << "                else if (dop == 6u) dpass = (fz >= rz);\n";
+        ss << "                else dpass = true;\n";
+        ss << "            }\n";
+        ss << "            uint sop = !spass ? ((scfg >> 3u) & 7u) : (dpass ? ((scfg >> 6u) & 7u) : ((scfg >> 9u) & 7u));\n";
+        ss << "            uint new_s = sm_stencil_apply(sop, old_s, sref) & 0xFFu;\n";
+        ss << "            if (wmask != 0u) sm_stencil_px[pidx] = (old_s & (~wmask & 0xFFu)) | (new_s & wmask);\n";
+        ss << "            if (!spass || !dpass) sm_keep = false;\n";
+        ss << "        }\n";
+    }
+    if (uses_frag_depth) {
+        ss << "        if (sm_keep && (sm_fs.extra_cfg & 32u) != 0u && (sm_fs.stencil_enable & 3u) != 3u) {\n";
+        ss << "            uint ldop = (sm_fs.extra_cfg >> 6u) & 7u;\n";
+        ss << "            float fz = clamp(sm_gl_FragDepth, 0.0, 1.0);\n";
+        ss << "            float rz = sm_depth_px[pidx];\n";
+        ss << "            bool ldpass = true;\n";
+        ss << "            if (ldop == 0u) ldpass = false;\n";
+        ss << "            else if (ldop == 1u) ldpass = (fz <  rz);\n";
+        ss << "            else if (ldop == 2u) ldpass = (fz == rz);\n";
+        ss << "            else if (ldop == 3u) ldpass = (fz <= rz);\n";
+        ss << "            else if (ldop == 4u) ldpass = (fz >  rz);\n";
+        ss << "            else if (ldop == 5u) ldpass = (fz != rz);\n";
+        ss << "            else if (ldop == 6u) ldpass = (fz >= rz);\n";
+        ss << "            if (!ldpass) sm_keep = false;\n";
+        ss << "        }\n";
+    }
+    ss << "        if (sm_keep) {\n";
+    ss << "            sm_passed_occ = true;\n";
+    ss << "            if (sm_fs.depth_write != 0u) sm_depth_px[pidx] = " << (uses_frag_depth ? "clamp(sm_gl_FragDepth, 0.0, 1.0)" : "pz") << ";\n";
     for (const auto& io : outputs) {
         if (io.array_size == 0 && io.index == 0 && io.location < SM_MAX_MRT) emit_rt_store((int)io.location, io);
+    }
+    ss << "        }\n";
+    ss << "    }\n";
+    // Warp-aggregated GPU Occlusion Query counter (zero warp divergence, 1 atomic/warp!)
+    ss << "    if ((sm_fs.extra_cfg & 1024u) != 0u) {\n";
+    ss << "        uint occ_c = subgroupBallotBitCount(subgroupBallot(sm_passed_occ));\n";
+    ss << "        if (subgroupElect() && occ_c > 0u) atomicAdd(sm_occ_counts[sm_fs.occ_query_idx], occ_c);\n";
+    ss << "    }\n";
+    if (has_discard) {
+        ss << "    if (sm_fs.peel_out_hdr != 0u) {\n";
+        ss << "        barrier();\n";
+        ss << "        if (tid == 0u && sm_peel_any != 0u) {\n";
+        ss << "            uint pslot = atomicAdd(sm_disp_cmds[sm_fs.peel_out_hdr], 1u);\n";
+        ss << "            sm_active_tiles[sm_fs.peel_out_base + pslot] = sm_tile_id;\n";
+        ss << "        }\n";
+        ss << "    }\n";
     }
     ss << "}\n";
 
@@ -2062,6 +3165,7 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
     std::ostringstream ss;
     ss << "#version 460\n"
        << "#extension GL_ARB_gpu_shader_int64 : require\n"
+       << "#extension GL_KHR_shader_subgroup_ballot : require\n"
        << "layout(local_size_x = 16, local_size_y = 16) in;\n"
        << "struct SmTriSetup { vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 1)  readonly buffer SmTriSetupBuf { SmTriSetup sm_tris[]; };\n"
@@ -2070,9 +3174,17 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "layout(std430, set = " << sm_set_idx << ", binding = 12) buffer SmStencilBuf           { uint sm_stencil_px[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 13) readonly buffer SmFsParams {\n"
        << "    uint width; uint height; uint vert_stride_vec4; uint depth_write;\n"
-       << "    uint rt_active_mask; uint stencil_enable; uint stencil_front_cfg; uint stencil_back_cfg; uint stencil_refs; uint tiles_x; uint direct_2d;\n"
+       << "    uint rt_active_mask; uint stencil_enable; uint stencil_front_cfg; uint stencil_back_cfg; uint stencil_refs;\n"
+       << "    uint tiles_x; uint direct_2d; uint batch_push_base;\n"
+       << "    vec4 blend_const;\n"
+       << "    uvec4 rt_fmt[2]; uvec4 rt_blend_en[2]; uvec4 rt_src_blend[2]; uvec4 rt_dst_blend[2];\n"
+       << "    uvec4 rt_blend_op[2]; uvec4 rt_src_alpha[2]; uvec4 rt_dst_alpha[2]; uvec4 rt_alpha_op[2];\n"
+       << "    uvec4 rt_write_mask[2]; uvec4 rt_stride[2];\n"
+       << "    vec4 quad_vp; ivec4 quad_sc; vec2 quad_z; uint quad_meta; uint peel_in_base;\n"
+       << "    uint peel_out_base; uint peel_out_hdr; uint extra_cfg; uint occ_query_idx; vec2 depth_bounds; uint view_index; uint extra_pad;\n"
        << "} sm_fs;\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n"
+       << "layout(std430, set = " << sm_set_idx << ", binding = 19) buffer SmOccQueryBuf { uint sm_occ_counts[]; };\n"
        << "vec4 sm_make_edge(vec2 a, vec2 b) {\n"
        << "    if (a.y < b.y || (a.y == b.y && a.x < b.x)) { vec2 d = b - a; return vec4(a.x, a.y, d.x, d.y); }\n"
        << "    else { vec2 d = a - b; return vec4(b.x, b.y, -d.x, -d.y); }\n"
@@ -2096,41 +3208,52 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "        uint tile_id = sm_active_tiles[gl_WorkGroupID.x];\n"
        << "        p = uvec2((tile_id % sm_fs.tiles_x) * 16u + gl_LocalInvocationID.x, (tile_id / sm_fs.tiles_x) * 16u + gl_LocalInvocationID.y);\n"
        << "    }\n"
-       << "    if (p.x >= sm_fs.width || p.y >= sm_fs.height) return;\n"
-       << "    uint pidx = p.y * sm_fs.width + p.x;\n"
-       << "    uint64_t vis = sm_vis_px[pidx];\n"
-       << "    if (vis == 0xFFFFFFFFFFFFFFFFul) return;\n"
-       << "    sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n"
-       << "    uint tid = uint(vis & 0xFFFFFFFFul);\n"
-       << "    SmTriSetup ts = sm_tris[tid];\n"
-       << "    bool ff = (ts.idx.w & 0x80000000u) != 0u;\n"
-       << "    float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n"
-       << "    vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n"
-       << "    float l0 = sm_edge_eval(s1, s2, fx, fy) * ts.area.x;\n"
-       << "    float l1 = sm_edge_eval(s2, s0, fx, fy) * ts.area.x;\n"
-       << "    float l2 = 1.0 - l0 - l1;\n"
-       << "    float pz = clamp(l0*ts.v0.z + l1*ts.v1.z + l2*ts.v2.z, 0.0, 1.0);\n"
-       << "    if ((sm_fs.stencil_enable & 3u) == 3u) {\n"
-       << "        uint scfg = ff ? sm_fs.stencil_front_cfg : sm_fs.stencil_back_cfg;\n"
-       << "        uint sref = ff ? (sm_fs.stencil_refs & 0xFFu) : ((sm_fs.stencil_refs >> 8u) & 0xFFu);\n"
-       << "        uint cmask = (scfg >> 16u) & 0xFFu;\n"
-       << "        uint wmask = (scfg >> 24u) & 0xFFu;\n"
-       << "        uint old_s = sm_stencil_px[pidx] & 0xFFu;\n"
-       << "        bool spass = sm_stencil_cmp(scfg & 7u, sref & cmask, old_s & cmask);\n"
-       << "        bool dpass = true;\n"
-       << "        if (spass && (sm_fs.stencil_enable & 4u) != 0u) {\n"
-       << "            uint dop = (sm_fs.stencil_enable >> 4u) & 7u;\n"
-       << "            float rz = sm_depth_px[pidx];\n"
-       << "            if (dop == 0u) dpass = false; else if (dop == 1u) dpass = (pz < rz); else if (dop == 2u) dpass = (pz == rz);\n"
-       << "            else if (dop == 3u) dpass = (pz <= rz); else if (dop == 4u) dpass = (pz > rz); else if (dop == 5u) dpass = (pz != rz);\n"
-       << "            else if (dop == 6u) dpass = (pz >= rz); else dpass = true;\n"
+       << "    bool passed = false;\n"
+       << "    if (p.x < sm_fs.width && p.y < sm_fs.height) {\n"
+       << "        uint pidx = p.y * sm_fs.width + p.x;\n"
+       << "        uint64_t vis = sm_vis_px[pidx];\n"
+       << "        if (vis != 0xFFFFFFFFFFFFFFFFul) {\n"
+       << "            sm_vis_px[pidx] = 0xFFFFFFFFFFFFFFFFul;\n"
+       << "            uint tid = uint(vis & 0xFFFFFFFFul);\n"
+       << "            SmTriSetup ts = sm_tris[tid];\n"
+       << "            bool ff = (ts.idx.w & 0x80000000u) != 0u;\n"
+       << "            float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n"
+       << "            vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n"
+       << "            float l0 = sm_edge_eval(s1, s2, fx, fy) * ts.area.x;\n"
+       << "            float l1 = sm_edge_eval(s2, s0, fx, fy) * ts.area.x;\n"
+       << "            float l2 = 1.0 - l0 - l1;\n"
+       << "            float pz = clamp(l0*ts.v0.z + l1*ts.v1.z + l2*ts.v2.z, 0.0, 1.0);\n"
+       << "            bool keep = true;\n"
+       << "            if ((sm_fs.stencil_enable & 3u) == 3u) {\n"
+       << "                uint scfg = ff ? sm_fs.stencil_front_cfg : sm_fs.stencil_back_cfg;\n"
+       << "                uint sref = ff ? (sm_fs.stencil_refs & 0xFFu) : ((sm_fs.stencil_refs >> 8u) & 0xFFu);\n"
+       << "                uint cmask = (scfg >> 16u) & 0xFFu;\n"
+       << "                uint wmask = (scfg >> 24u) & 0xFFu;\n"
+       << "                uint old_s = sm_stencil_px[pidx] & 0xFFu;\n"
+       << "                bool spass = sm_stencil_cmp(scfg & 7u, sref & cmask, old_s & cmask);\n"
+       << "                bool dpass = true;\n"
+       << "                if (spass && (sm_fs.stencil_enable & 4u) != 0u) {\n"
+       << "                    uint dop = (sm_fs.stencil_enable >> 4u) & 7u;\n"
+       << "                    float rz = sm_depth_px[pidx];\n"
+       << "                    if (dop == 0u) dpass = false; else if (dop == 1u) dpass = (pz < rz); else if (dop == 2u) dpass = (pz == rz);\n"
+       << "                    else if (dop == 3u) dpass = (pz <= rz); else if (dop == 4u) dpass = (pz > rz); else if (dop == 5u) dpass = (pz != rz);\n"
+       << "                    else if (dop == 6u) dpass = (pz >= rz); else dpass = true;\n"
+       << "                }\n"
+       << "                uint sop = !spass ? ((scfg >> 3u) & 7u) : (dpass ? ((scfg >> 6u) & 7u) : ((scfg >> 9u) & 7u));\n"
+       << "                uint new_s = sm_stencil_apply(sop, old_s, sref) & 0xFFu;\n"
+       << "                if (wmask != 0u) sm_stencil_px[pidx] = (old_s & (~wmask & 0xFFu)) | (new_s & wmask);\n"
+       << "                if (!spass || !dpass) keep = false;\n"
+       << "            }\n"
+       << "            if (keep) {\n"
+       << "                passed = true;\n"
+       << "                if (sm_fs.depth_write != 0u) sm_depth_px[pidx] = pz;\n"
+       << "            }\n"
        << "        }\n"
-       << "        uint sop = !spass ? ((scfg >> 3u) & 7u) : (dpass ? ((scfg >> 6u) & 7u) : ((scfg >> 9u) & 7u));\n"
-       << "        uint new_s = sm_stencil_apply(sop, old_s, sref) & 0xFFu;\n"
-       << "        if (wmask != 0u) sm_stencil_px[pidx] = (old_s & (~wmask & 0xFFu)) | (new_s & wmask);\n"
-       << "        if (!spass || !dpass) return;\n"
        << "    }\n"
-       << "    if (sm_fs.depth_write != 0u) sm_depth_px[pidx] = pz;\n"
+       << "    if ((sm_fs.extra_cfg & 1024u) != 0u) {\n"
+       << "        uint occ_c = subgroupBallotBitCount(subgroupBallot(passed));\n"
+       << "        if (subgroupElect() && occ_c > 0u) atomicAdd(sm_occ_counts[sm_fs.occ_query_idx], occ_c);\n"
+       << "    }\n"
        << "}\n";
     return compile_glsl_to_spv(ss.str(), "nullfs_stn", out_comp_spv, err);
 }

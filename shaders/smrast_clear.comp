@@ -30,6 +30,7 @@ layout(std140, set = 0, binding = 11) uniform ClearUBO {
     uvec4 rt_bpp_code[2]; // 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
     uvec4 rt_clear[8];    // packed clear words (1B/2B replicated across u32 in .x)
     uvec4 rt_stride[2];   // v0.8: row stride in pixels (width or rowPitch/bpp)
+    uvec4 clear_rect;     // v1.2: x0, y0, x1, y1 (if z > x, partial-rect vkCmdClearAttachments!)
 } u;
 
 uint get_bpp(uint i)    { return u.rt_bpp_code[i >> 2u][i & 3u]; }
@@ -48,7 +49,8 @@ uint get_stride(uint i) { return u.rt_stride[i >> 2u][i & 3u]; }
     }
 
 void main() {
-    if (gl_LocalInvocationIndex == 0u && u.tiles_x > 0u) {
+    bool partial = (u.clear_rect.z > u.clear_rect.x && u.clear_rect.w > u.clear_rect.y);
+    if (!partial && gl_LocalInvocationIndex == 0u && u.tiles_x > 0u) {
         uint tile_id = gl_WorkGroupID.y * u.tiles_x + gl_WorkGroupID.x;
         if ((u.clear_mask & 256u) != 0u && u.hiz_en != 0u) {
             tile_hiz[tile_id] = vec2(u.clear_depth, u.clear_depth);
@@ -63,8 +65,9 @@ void main() {
         }
     }
 
-    uvec2 p = gl_GlobalInvocationID.xy;
+    uvec2 p = partial ? (u.clear_rect.xy + gl_GlobalInvocationID.xy) : gl_GlobalInvocationID.xy;
     if (p.x >= u.width || p.y >= u.height) return;
+    if (partial && (p.x >= u.clear_rect.z || p.y >= u.clear_rect.w)) return;
     uint idx = p.y * u.width + p.x;
     uint total_px = u.width * u.height;
 

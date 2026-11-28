@@ -184,7 +184,7 @@ bool sm_init_raster_engine(SmDevice* dev) {
         for (uint32_t i = 0; i < 7; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 7, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.fine_dsl);
-        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &R.fine_dsl, 1, &pcr};
         dev->fn.CreatePipelineLayout(dev->real_dev, &plci, nullptr, &R.fine_pl);
     }
@@ -233,11 +233,19 @@ bool sm_init_raster_engine(SmDevice* dev) {
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.vs_int_dsl);
     }
     {
-        // FS internal set: 0=ClipVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf,
-        //                  13=FsParams (DYNAMIC!), 14=ActiveTiles, 15=BatchPushBuf, 16=BatchDynUboRaw, 17=BatchDynOffBuf
-        VkDescriptorSetLayoutBinding b[18];
-        for (uint32_t i = 0; i < 18; ++i) b[i] = {i, (i == 13u) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 18, b};
+        // GS internal set: 0=VsClipVert, 1=GsOutVert, 2=DispCmdBuf, 3=GsParams (DYNAMIC SSBO!), 4=TileCountBuf
+        VkDescriptorSetLayoutBinding b[5];
+        for (uint32_t i = 0; i < 5; ++i) b[i] = {i, (i == 3u) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 5, b};
+        dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.gs_int_dsl);
+    }
+    {
+        // FS internal set: 0=ClipVert/GsVert, 1=TriSetup, 2=VisBuf, 3..10=Color0..7, 11=DepthBuf, 12=StencilBuf,
+        //                  13=FsParams (DYNAMIC!), 14=ActiveTiles, 15=BatchPushBuf, 16=BatchDynUboRaw, 17=BatchDynOffBuf,
+        //                  18=DispCmdBuf (GPU Depth-Peeling!), 19=OccQueryBuf (Occlusion Queries!)
+        VkDescriptorSetLayoutBinding b[20];
+        for (uint32_t i = 0; i < 20; ++i) b[i] = {i, (i == 13u) ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 20, b};
         dev->fn.CreateDescriptorSetLayout(dev->real_dev, &ci, nullptr, &R.fs_int_dsl);
     }
 
@@ -261,18 +269,28 @@ bool sm_init_raster_engine(SmDevice* dev) {
     R.hiz_update_pipe = make_internal_pipe(dev, p_hiz,   R.hiz_update_pl);
     if (!R.clear_pipe || !R.bin_pipe || !R.prim_bin_pipe || !R.fine_pipe || !R.ind_prep_pipe || !R.depth_only_pipe || !R.blit_pipe || !R.hiz_update_pipe) return false;
 
-    // 3. Pre-allocate 4.0M verts + 1.8M tris on H20 HBM3 (~1.16 GB < 1.2% of 96 GB) so 128-draw Indirect Uber-Batches never realloc or overflow!
+    // 3. Pre-allocate 4.0M verts + 1.8M tris + 1.5M GS-out verts on H20 HBM3 (~1.5 GB < 1.6% of 96 GB)!
     if (!sm_ensure_geom_capacity(dev, 4000000, 1800000)) return false;
 
     VkBufferUsageFlags ssbo_u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    R.cap_gs_verts = 1500000u;
+    if (!create_buf(dev, (VkDeviceSize)R.cap_gs_verts * SM_VERT_STRIDE_VEC4 * 16, ssbo_u,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.gs_vert_buf, R.gs_vert_mem)) return false;
+    R.cap_tess_patch_vec4 = 2097152u; // 32 MB intermediate TCS -> TES patch storage on H20 HBM3
+    if (!create_buf(dev, (VkDeviceSize)R.cap_tess_patch_vec4 * 16, ssbo_u,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.tess_patch_buf, R.tess_patch_mem)) return false;
     if (!create_buf(dev, 4096, ssbo_u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.dummy_buf, R.dummy_mem)) return false;
-    // 32 KB indirect dispatch + batched indirect metadata table (64B header + 256 x 64B per-draw slots!)
+    // 32 KB indirect dispatch + batched indirect metadata table (64B header + 256 x 64B per-draw slots + peel headers at [4112..4127]!)
     if (!create_buf(dev, 32768, ssbo_u | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, R.ind_disp_buf, R.ind_disp_mem)) return false;
 
     VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    // VS & FS param buffers use STORAGE_BUFFER_BIT (zero UBO bank contention at set>=5 for vkd3d-proton!)
+    // VS, GS, Tess & FS param buffers use STORAGE_BUFFER_BIT (zero UBO bank contention at set>=5 for vkd3d-proton!)
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmVsParamsUBO),
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.vs_ubo_buf, R.vs_ubo_mem, &R.vs_ubo_ptr)) return false;
+    if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmGsParamsUBO),
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.gs_ubo_buf, R.gs_ubo_mem, &R.gs_ubo_ptr)) return false;
+    if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmTessParamsUBO),
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.tess_ubo_buf, R.tess_ubo_mem, &R.tess_ubo_ptr)) return false;
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_DRAWS_IN_FLIGHT * sizeof(SmFsParamsUBO),
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.fs_ubo_buf, R.fs_ubo_mem, &R.fs_ubo_ptr)) return false;
     if (!create_buf(dev, (VkDeviceSize)SmRasterEngine::MAX_AUX_SLOTS * sizeof(SmClearUBO),
@@ -284,13 +302,13 @@ bool sm_init_raster_engine(SmDevice* dev) {
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hv, R.batch_dyn_off_buf, R.batch_dyn_off_mem, &dyn_off_p)) return false;
     R.batch_dyn_off_ptr = reinterpret_cast<uint32_t*>(dyn_off_p);
 
-    // 4. Batch-allocate cached DS ring pools (16,384 cached sets/stage w/ dynamic SSBO offsets -> 0 vkUpdateDescriptorSets/draw!)
+    // 4. Batch-allocate cached DS ring pools (32,768 cached sets/stage w/ dynamic SSBO offsets -> 0 vkUpdateDescriptorSets/draw!)
     uint32_t ND = SmRasterEngine::MAX_DS_RING;
     uint32_t NI = SmRasterEngine::MAX_IND_SLOTS;
     uint32_t NA = SmRasterEngine::MAX_AUX_SLOTS;
-    uint32_t total_sets = ND * 6 + NI + NA * 2;
-    uint32_t total_ssbo = ND * (10 + 17 + 9 + 7 + 4 + 3) + NI * 5 + NA * (13 + 2);
-    uint32_t total_dyn_ssbo = ND * 2;
+    uint32_t total_sets = ND * 7 + NI + NA * 2;
+    uint32_t total_ssbo = ND * (10 + 4 + 19 + 9 + 7 + 4 + 3) + NI * 5 + NA * (13 + 2);
+    uint32_t total_dyn_ssbo = ND * 3;
     VkDescriptorPoolSize ps[3] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, total_ssbo},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, total_dyn_ssbo},
@@ -313,6 +331,7 @@ bool sm_init_raster_engine(SmDevice* dev) {
         !alloc_batch(R.depth_only_dsl, ND, R.depth_only_ds) ||
         !alloc_batch(R.hiz_update_dsl, ND, R.hiz_update_ds) ||
         !alloc_batch(R.vs_int_dsl,     ND, R.vs_int_ds)     ||
+        !alloc_batch(R.gs_int_dsl,     ND, R.gs_int_ds)     ||
         !alloc_batch(R.fs_int_dsl,     ND, R.fs_int_ds)) return false;
 
     // Pre-size vis_buf to 2048x2048 so 1080p/2K shadow maps never reallocate mid-frame across DX12 worker threads!
@@ -335,7 +354,7 @@ bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
     if (!create_buf(dev, (VkDeviceSize)nw * nh * 8, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_vis, new_vis_m)) return false;
     if (!create_buf(dev, (VkDeviceSize)(num_tiles * 2 + 16) * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_tc, new_tc_m)) return false;
     if (!create_buf(dev, (VkDeviceSize)num_tiles * SM_MAX_TRIS_PER_TILE * 4, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_tb, new_tb_m)) return false;
-    if (!create_buf(dev, std::max<VkDeviceSize>(256, (VkDeviceSize)num_tiles * 4), u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_at, new_at_m)) return false;
+    if (!create_buf(dev, std::max<VkDeviceSize>(256, (VkDeviceSize)num_tiles * 3 * 4), u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, new_at, new_at_m)) return false;
 
     {
         std::lock_guard<std::mutex> dlk(dev->mtx);
@@ -355,9 +374,11 @@ bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h) {
         R.bin_ds_cache.clear();
         R.fine_ds_cache.clear();
         R.fs_ds_cache.clear();
+        R.gs_ds_cache.clear();
         R.dep_ds_cache.clear();
         R.hiz_ds_cache.clear();
         R.ind_prep_ds_cache.clear();
+        R.ds_cache_gen.fetch_add(1, std::memory_order_relaxed);
     }
     return true;
 }

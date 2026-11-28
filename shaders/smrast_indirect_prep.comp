@@ -24,13 +24,44 @@ layout(push_constant) uniform IndPrepPC {
 } pc;
 
 void main() {
+    // v1.2 Mode 0xFFFFFFFEu: Compute-Emulated Geometry Shader Finalize (zero CPU readback!)
+    // Reads GPU emitted primitive count from disp_cmds[14], sets Bin indirect dispatch & resets counter!
+    if (pc.batch_slot == 0xFFFFFFFEu) {
+        uint nprims = min(disp_cmds[14u], pc.max_draw_tris);
+        disp_cmds[14u] = 0u;
+        tile_counts[pc.meta_idx + 0u] = 0u;
+        tile_counts[pc.meta_idx + 1u] = 0u;
+        tile_counts[pc.meta_idx + 2u] = nprims;
+        tile_counts[pc.meta_idx + 3u] = max(nprims, 1u);
+        tile_counts[pc.meta_idx + 4u] = nprims * max(pc.indexed, 1u); // pc.indexed carries verts_per_out_prim (3/2/1)
+        disp_cmds[4u] = (nprims + 63u) / 64u;
+        disp_cmds[5u] = (nprims > 0u) ? 1u : 0u;
+        disp_cmds[6u] = (nprims > 0u) ? 1u : 0u;
+        disp_cmds[7u] = 0u;
+        disp_cmds[8u] = 0u;
+        disp_cmds[9u] = 1u;
+        disp_cmds[10u] = 1u;
+        disp_cmds[11u] = 0u;
+        return;
+    }
+
     uint count_v_or_i = 0u;
     uint inst_count   = 0u;
     uint first_v_or_i = 0u;
     int  vtx_offset   = 0;
     uint first_inst   = 0u;
 
-    bool active_draw = (pc.count_word_off == 0xFFFFFFFFu) || (pc.draw_index < draw_count_raw[pc.count_word_off]);
+    bool active_draw = true;
+    if (pc.count_word_off != 0xFFFFFFFFu) {
+        if ((pc.count_word_off & 0x80000000u) != 0u) {
+            // VK_EXT_conditional_rendering predicate check!
+            bool inv = (pc.count_word_off & 0x40000000u) != 0u;
+            uint pv = draw_count_raw[pc.count_word_off & 0x3FFFFFFFu];
+            active_draw = inv ? (pv == 0u) : (pv != 0u);
+        } else {
+            active_draw = (pc.draw_index < draw_count_raw[pc.count_word_off]);
+        }
+    }
     if (active_draw) {
         count_v_or_i = ind_raw[pc.ind_word_offset + 0u];
         inst_count   = ind_raw[pc.ind_word_offset + 1u];

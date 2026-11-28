@@ -40,7 +40,11 @@ static constexpr uint32_t SM_MAX_VTX_BINDINGS   = 8;
 // 7=RG16_SFLOAT (4B), 8=RGBA32_SFLOAT (16B), 9=A2B10G10R10_UNORM (4B),
 // 10=RG32_SFLOAT (8B), 11=R32_UINT/SINT (4B), 12=RGBA8_SNORM (4B),
 // 13=RG16_UNORM (4B), 14=RG16_SNORM (4B), 15=RGBA16_UNORM (8B), 16=RGBA16_SNORM (8B),
-// 17=R8_UNORM/UINT (1B), 18=RG8_UNORM (2B), 19=R16_SFLOAT (2B), 20=R16_UNORM/UINT (2B), 21=R8_SNORM (1B)
+// 17=R8_UNORM/UINT/SINT (1B), 18=RG8_UNORM (2B), 19=R16_SFLOAT (2B), 20=R16_UNORM/UINT/SINT (2B),
+// 21=R8_SNORM (1B), 22=RG8_SNORM (2B), 23=R16_SNORM (2B), 24=RG8_UINT/SINT (2B),
+// 25=RGBA8_UINT/SINT (4B), 26=RG16_UINT/SINT (4B), 27=RGBA16_UINT/SINT (8B),
+// 28=RG32_UINT/SINT (8B), 29=RGBA32_UINT/SINT (16B), 30=A2B10G10R10_UINT (4B),
+// 31=R5G6B5_UNORM (2B), 32=R4G4B4A4/B4G4R4A4_UNORM (2B)
 static inline uint32_t sm_format_code(VkFormat f) {
     switch (f) {
         case VK_FORMAT_B8G8R8A8_UNORM:          return 1u;
@@ -65,22 +69,77 @@ static inline uint32_t sm_format_code(VkFormat f) {
         case VK_FORMAT_R8_UINT:
         case VK_FORMAT_R8_SINT:                 return 17u;
         case VK_FORMAT_R8_SNORM:                return 21u;
-        case VK_FORMAT_R8G8_UNORM:
-        case VK_FORMAT_R8G8_SNORM:              return 18u;
+        case VK_FORMAT_R8G8_UNORM:              return 18u;
+        case VK_FORMAT_R8G8_SNORM:              return 22u;
         case VK_FORMAT_R16_SFLOAT:              return 19u;
         case VK_FORMAT_R16_UNORM:
         case VK_FORMAT_R16_UINT:
         case VK_FORMAT_R16_SINT:                return 20u;
+        case VK_FORMAT_R16_SNORM:               return 23u;
+        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8_SINT:               return 24u;
+        case VK_FORMAT_R8G8B8A8_UINT:
+        case VK_FORMAT_R8G8B8A8_SINT:           return 25u;
+        case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R16G16_SINT:             return 26u;
+        case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R16G16B16A16_SINT:       return 27u;
+        case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32_SINT:             return 28u;
+        case VK_FORMAT_R32G32B32A32_UINT:
+        case VK_FORMAT_R32G32B32A32_SINT:       return 29u;
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 30u;
+        case VK_FORMAT_R5G6B5_UNORM_PACK16:     return 31u;
+        case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+        case VK_FORMAT_A4B4G4R4_UNORM_PACK16:   return 32u;
         default:                                return 0u;
+    }
+}
+static inline bool sm_format_is_supported_color_rt(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:  case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_SRGB:
+        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16_SFLOAT:
+        case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16_SFLOAT:
+        case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT:
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32_SFLOAT:
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+        case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16: case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_A4R4G4B4_UNORM_PACK16: case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
+            return true;
+        default: return false;
+    }
+}
+static inline bool sm_format_is_integer(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+            return true;
+        default: return false;
     }
 }
 static inline uint32_t sm_format_bpp_code(VkFormat f) {
     uint32_t c = sm_format_code(f);
-    if (c == 4u || c == 10u || c == 15u || c == 16u) return 1u; // 8 bytes/px (2 u32)
-    if (c == 8u)                                     return 2u; // 16 bytes/px (4 u32)
-    if (c == 17u || c == 21u)                        return 3u; // 1 byte/px
-    if (c == 18u || c == 19u || c == 20u)            return 4u; // 2 bytes/px
-    return 0u;                                                  // 4 bytes/px (1 u32)
+    if (c == 4u || c == 10u || c == 15u || c == 16u || c == 27u || c == 28u) return 1u; // 8 bytes/px (2 u32)
+    if (c == 8u || c == 29u)                                                 return 2u; // 16 bytes/px (4 u32)
+    if (c == 17u || c == 21u)                                                return 3u; // 1 byte/px
+    if (c == 18u || c == 19u || c == 20u || c == 22u || c == 23u || c == 24u || c == 31u || c == 32u) return 4u; // 2 bytes/px
+    return 0u;                                                                          // 4 bytes/px (1 u32)
 }
 static inline uint32_t sm_format_bpp(VkFormat f) {
     uint32_t bc = sm_format_bpp_code(f);
@@ -96,7 +155,8 @@ static inline uint32_t sm_format_exact_bpp(VkFormat f) {
             return 1u;
         case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
         case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16_SFLOAT:
-        case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16: case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16: case VK_FORMAT_A4R4G4B4_UNORM_PACK16: case VK_FORMAT_A4B4G4R4_UNORM_PACK16: case VK_FORMAT_D16_UNORM:
             return 2u;
         case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: case VK_FORMAT_R16G16B16A16_UINT:
         case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R16G16B16A16_SFLOAT:
@@ -315,8 +375,17 @@ struct SmImageView {
     bool is_stencil_view = false;
 };
 
+struct SmSubpassDesc {
+    int color_attach_idxs[SM_MAX_MRT] = {-1,-1,-1,-1,-1,-1,-1,-1};
+    uint32_t color_attach_count = 0;
+    int depth_attach_idx = -1;
+    std::vector<int> input_attach_idxs;
+    uint32_t view_mask = 0;
+};
+
 struct SmRenderPass {
     std::vector<VkAttachmentDescription> attachments;
+    std::vector<SmSubpassDesc> subpasses;
     int color_attach_idxs[SM_MAX_MRT] = {-1,-1,-1,-1,-1,-1,-1,-1};
     uint32_t color_attach_count = 0;
     int depth_attach_idx = -1;
@@ -327,6 +396,7 @@ struct SmFramebuffer {
     std::vector<SmImageView*> attachments;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t layers = 1;
 };
 
 struct SmPipelineLayout {
@@ -334,6 +404,7 @@ struct SmPipelineLayout {
     std::vector<VkDescriptorSetLayout> app_dsls;
     std::vector<VkPushConstantRange> push_ranges;
     VkPipelineLayout sm_vs_layout = VK_NULL_HANDLE;
+    VkPipelineLayout sm_gs_layout = VK_NULL_HANDLE;
     VkPipelineLayout sm_fs_layout = VK_NULL_HANDLE;
     uint32_t sm_set_index = 0;
 };
@@ -350,19 +421,50 @@ struct SmPipeline {
 
     SmPipelineLayout* layout = nullptr;
     VkPipeline vs_comp_pipe = VK_NULL_HANDLE;
+    VkPipeline tcs_comp_pipe = VK_NULL_HANDLE;
+    VkPipeline tes_comp_pipe = VK_NULL_HANDLE;
+    VkPipeline gs_comp_pipe = VK_NULL_HANDLE;
     VkPipeline fs_comp_pipe = VK_NULL_HANDLE;
     SmVertexInputState vtx_input;
+    uint32_t vtx_binding_strides[SM_MAX_VTX_BINDINGS] = {16,16,16,16,16,16,16,16};
+    uint32_t vtx_inst_rate_mask = 0;
 
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
     bool prim_restart = false;
+    bool last_provoking_vertex = false;
     bool vs_writes_point_size = false;
-    uint32_t vert_stride_vec4 = SM_VERT_STRIDE_VEC4; // v0.9 dynamic ClipVertBuf stride (2..16 vec4)
+    bool vs_writes_clip_dist = false;
+    bool vs_writes_cull_dist = false;
+    uint32_t vs_clip_count = 0;
+    uint32_t vs_cull_count = 0;
+    bool has_tess = false;
+    bool has_tcs = false;
+    uint32_t patch_control_points = 3;
+    uint32_t tcs_out_cp = 3;
+    uint32_t tcs_vert_stride_vec4 = 2;
+    uint32_t tcs_patch_stride_vec4 = 4;
+    uint32_t tes_domain = 0;      // 0=triangles, 1=quads, 2=isolines
+    uint32_t tes_spacing = 0;     // 0=equal, 1=frac_even, 2=frac_odd
+    uint32_t tes_ccw = 1;
+    uint32_t tes_point_mode = 0;
+    uint32_t tes_out_topo = 0;    // 0=TRI_LIST, 3=LINE_LIST, 5=POINT_LIST
+    uint32_t tes_out_stride_vec4 = 2;
+    bool has_gs = false;
+    uint32_t gs_in_verts = 3;       // 1=points, 2=lines, 3=tris, 4=lines_adj, 6=tris_adj
+    uint32_t gs_out_topo = 0;       // 0=TRI_LIST, 3=LINE_LIST, 5=POINT_LIST
+    uint32_t gs_invocations = 1;
+    uint32_t gs_max_verts = 3;
+    uint32_t vs_out_stride_vec4 = SM_VERT_STRIDE_VEC4;
+    uint32_t vert_stride_vec4 = SM_VERT_STRIDE_VEC4; // stride consumed by Bin & FS (GS out if has_gs, else VS out)
     bool fs_uses_push_constants = true;
     bool fs_batched_push_ok = false;
     bool fs_batched_dyn_ubo_ok = false;
     uint32_t fs_dyn_ubo_set = 0;
     uint32_t fs_dyn_ubo_binding = 0;
     uint32_t fs_dyn_ubo_slot = 0;
+    bool fs_has_discard = false;
+    bool fs_writes_depth = false;
     bool fs_has_discard_or_depth = false;
     bool is_null_fs_stencil = false;
     float line_width = 1.0f;
@@ -378,9 +480,14 @@ struct SmPipeline {
     bool depth_test = false;
     bool depth_write = false;
     VkCompareOp depth_op = VK_COMPARE_OP_LESS;
+    bool depth_bounds_test = false;
+    float min_depth_bounds = 0.0f;
+    float max_depth_bounds = 1.0f;
     bool stencil_test = false;
     VkStencilOpState stencil_front{};
     VkStencilOpState stencil_back{};
+    bool logic_op_enable = false;
+    VkLogicOp logic_op = VK_LOGIC_OP_COPY;
 
     // Per-MRT blending & write-mask state (up to 8 independent RTs!)
     bool blend_enable[SM_MAX_MRT] = {false,false,false,false,false,false,false,false};
@@ -463,6 +570,42 @@ struct alignas(256) SmVsParamsUBO {
     uint32_t clip_vert_base;     // v0.7: base vertex slot in ClipVertBuf for Multi-Draw Uber-Batching!
     uint32_t vtx_offsets_hi[4];  // VB 4..7
     uint32_t vtx_strides_hi[4];  // VB 4..7
+    uint32_t view_index;         // gl_ViewIndex (VK_KHR_multiview)
+    uint32_t draw_id;            // gl_DrawID
+    uint32_t vs_pad[2];
+};
+
+struct alignas(256) SmGsParamsUBO {
+    uint32_t prim_count;         // 0xFFFFFFFFu = read from tile_counts[meta_idx + 2]
+    uint32_t prims_per_inst;
+    uint32_t verts_per_inst;
+    uint32_t topo_code;          // 0=TRI_LIST, 1=TRI_STRIP, 2=TRI_FAN, 3=LINE_LIST, 4=LINE_STRIP, 5=POINT_LIST, 6=LINE_LIST_ADJ, 7=LINE_STRIP_ADJ, 8=TRI_LIST_ADJ, 9=TRI_STRIP_ADJ
+    uint32_t vs_stride_vec4;
+    uint32_t gs_stride_vec4;
+    uint32_t max_out_prims;
+    uint32_t invocations;
+    uint32_t meta_idx;
+    uint32_t clip_vert_base;
+    uint32_t last_pv;            // 1 = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
+    uint32_t pad0;
+};
+
+struct alignas(256) SmTessParamsUBO {
+    uint32_t num_patches;        // number of input patches (total_verts / in_cp)
+    uint32_t in_cp;              // input patch control points (1..32)
+    uint32_t out_cp;             // TCS output control points (1..32; equals in_cp when no TCS)
+    uint32_t vs_stride_vec4;     // VS output stride in clip_vert_buf
+    uint32_t tcs_vert_stride_vec4;
+    uint32_t tcs_patch_stride_vec4;
+    uint32_t tes_out_stride_vec4;
+    uint32_t max_out_prims;
+    uint32_t clip_vert_base;
+    uint32_t domain;             // 0=triangles, 1=quads, 2=isolines
+    uint32_t spacing;            // 0=equal, 1=frac_even, 2=frac_odd
+    uint32_t flags;              // bit0=ccw, bit1=point_mode, bit2=has_tcs
+    uint32_t view_index;
+    uint32_t max_patch_slots;    // max patches that fit in tess_patch_buf
+    uint32_t pad0, pad1;
 };
 
 struct alignas(512) SmFsParamsUBO {
@@ -476,7 +619,7 @@ struct alignas(512) SmFsParamsUBO {
     uint32_t stencil_back_cfg;   // same layout for back faces
     uint32_t stencil_refs;       // [0..7]=frontRef, [8..15]=backRef
     uint32_t tiles_x;            // screen tile columns for Active-Tile Indirect Dispatch!
-    uint32_t direct_2d;          // 1 = coherent 2D grid (gl_WorkGroupID.xy), 0 = active_tiles[gl_WorkGroupID.x]
+    uint32_t direct_2d;          // 1 = coherent 2D grid (gl_WorkGroupID.xy), 0 = active_tiles[gl_WorkGroupID.x], 2=fused_quad, 3=fused_quad_inline
     uint32_t batch_push_base;    // v0.8: base slot in batch_push_buf & batch_dyn_off_buf (+ sm_draw_id)
     float    blend_const[4];     // vec4 blend_const
     uint32_t rt_fmt[8];          // uvec4 rt_fmt[2]
@@ -489,12 +632,20 @@ struct alignas(512) SmFsParamsUBO {
     uint32_t rt_alpha_op[8];     // uvec4 rt_alpha_op[2]
     uint32_t rt_write_mask[8];   // uvec4 rt_write_mask[2]
     uint32_t rt_stride_px[8];    // uvec4 rt_stride[2] (v0.8: rowPitch/bpp for zero-copy linear-aliased RTs!)
-    // v0.9 Zero-Bin Inline-Setup Fused Quad FS params (fits inside existing 512B alignas padding!)
+    // v0.9 Zero-Bin Inline-Setup Fused Quad FS params
     float    quad_vp[4];         // vp.x, vp.y, vp.width, vp.height
     int32_t  quad_sc[4];         // sc_x0, sc_y0, sc_x1, sc_y1
     float    quad_z[2];          // vp.minDepth, vp.maxDepth
-    uint32_t quad_meta;          // bits 0..3=total_tris, 4..6=topo, 8=cull_back, 9=cull_front, 10=front_cw, 11=no_depth_clip
-    uint32_t quad_pad;
+    uint32_t quad_meta;          // bits 0..3=total_tris, 4..6=topo, 8=cull_back, 9=cull_front, 10=front_cw, 11=no_depth_clip, 12=last_pv
+    uint32_t peel_in_base;       // v1.2: active_tiles[] slice offset to read tile_id from (0, num_tiles, or 2*num_tiles)
+    // v1.2: GPU Depth-Peeling + LogicOp + Late-Z + DepthBounds + OcclusionQuery + Multiview (480B <= 512B!)
+    uint32_t peel_out_base;      // active_tiles[] slice offset for discarded tiles (0 = no peel output)
+    uint32_t peel_out_hdr;       // word offset in disp_cmds[] for atomicAdd (4112 or 4116, 0 = disabled)
+    uint32_t extra_cfg;          // bit0=logic_op_en, bits1..4=logic_op(0..15), bit5=late_z_dtest, bits6..8=depth_op, bit9=depth_bounds_en, bit10=occ_query_en
+    uint32_t occ_query_idx;      // occlusion query slot index
+    float    depth_bounds[2];    // minDepthBounds, maxDepthBounds
+    uint32_t view_index;         // gl_ViewIndex
+    uint32_t extra_pad;
 };
 
 struct alignas(256) SmClearUBO {
@@ -509,6 +660,7 @@ struct alignas(256) SmClearUBO {
     uint32_t rt_bpp_code[8];     // uvec4[2]: 0=4B, 1=8B, 2=16B, 3=1B, 4=2B
     uint32_t rt_clear[8][4];     // uvec4[8]
     uint32_t rt_stride_px[8];    // uvec4[2] (v0.8: rowPitch/bpp for zero-copy linear-aliased RTs!)
+    uint32_t clear_rect[4];      // v1.2: x0, y0, x1, y1 (if x1 > x0, partial-rect vkCmdClearAttachments!)
 };
 
 struct SmRasterEngine {
@@ -542,12 +694,17 @@ struct SmRasterEngine {
     VkPipeline hiz_update_pipe = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout vs_int_dsl = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gs_int_dsl = VK_NULL_HANDLE;
     VkDescriptorSetLayout fs_int_dsl = VK_NULL_HANDLE;
 
     VkBuffer clip_vert_buf = VK_NULL_HANDLE;   VkDeviceMemory clip_vert_mem = VK_NULL_HANDLE;
+    VkBuffer gs_vert_buf = VK_NULL_HANDLE;     VkDeviceMemory gs_vert_mem = VK_NULL_HANDLE;
+    VkBuffer tess_patch_buf = VK_NULL_HANDLE;  VkDeviceMemory tess_patch_mem = VK_NULL_HANDLE;
     VkBuffer tri_setup_buf = VK_NULL_HANDLE;   VkDeviceMemory tri_setup_mem = VK_NULL_HANDLE;
     uint32_t cap_verts = 0;
     uint32_t cap_tris  = 0;
+    uint32_t cap_gs_verts = 0;
+    uint32_t cap_tess_patch_vec4 = 0;
 
     VkBuffer tile_count_buf = VK_NULL_HANDLE;  VkDeviceMemory tile_count_mem = VK_NULL_HANDLE;
     VkBuffer tile_bins_buf = VK_NULL_HANDLE;   VkDeviceMemory tile_bins_mem = VK_NULL_HANDLE;
@@ -561,11 +718,13 @@ struct SmRasterEngine {
     static constexpr uint32_t MAX_IND_SLOTS       = 32768;
     static constexpr uint32_t MAX_AUX_SLOTS       = 8192;
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
+    VkBuffer gs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory gs_ubo_mem = VK_NULL_HANDLE; void* gs_ubo_ptr = nullptr;
+    VkBuffer tess_ubo_buf = VK_NULL_HANDLE;    VkDeviceMemory tess_ubo_mem = VK_NULL_HANDLE; void* tess_ubo_ptr = nullptr;
     VkBuffer fs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory fs_ubo_mem = VK_NULL_HANDLE; void* fs_ubo_ptr = nullptr;
     VkBuffer clr_ubo_buf = VK_NULL_HANDLE;     VkDeviceMemory clr_ubo_mem = VK_NULL_HANDLE; void* clr_ubo_ptr = nullptr;
     VkBuffer batch_push_buf = VK_NULL_HANDLE;  VkDeviceMemory batch_push_mem = VK_NULL_HANDLE; void* batch_push_ptr = nullptr;
     VkBuffer batch_dyn_off_buf = VK_NULL_HANDLE; VkDeviceMemory batch_dyn_off_mem = VK_NULL_HANDLE; uint32_t* batch_dyn_off_ptr = nullptr;
-    uint32_t batch_meta_cursor = 0;
+    std::atomic<uint32_t> batch_meta_cursor{0};
 
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> clear_ds;
@@ -576,13 +735,16 @@ struct SmRasterEngine {
     std::vector<VkDescriptorSet> blit_ds;
     std::vector<VkDescriptorSet> hiz_update_ds;
     std::vector<VkDescriptorSet> vs_int_ds;
+    std::vector<VkDescriptorSet> gs_int_ds;
     std::vector<VkDescriptorSet> fs_int_ds;
-    uint32_t draw_cursor = 0;
+    std::atomic<uint32_t> draw_cursor{0};
     uint32_t ind_cursor = 0;
     uint32_t clear_cursor = 0;
     uint32_t blit_cursor = 0;
-    uint32_t vs_ds_cursor = 0, fs_ds_cursor = 0, bin_ds_cursor = 0, fine_ds_cursor = 0, dep_ds_cursor = 0, hiz_ds_cursor = 0;
+    uint32_t vs_ds_cursor = 0, gs_ds_cursor = 0, fs_ds_cursor = 0, bin_ds_cursor = 0, fine_ds_cursor = 0, dep_ds_cursor = 0, hiz_ds_cursor = 0;
+    std::atomic<uint64_t> ds_cache_gen{1};
     std::unordered_map<uint64_t, VkDescriptorSet> vs_ds_cache;
+    std::unordered_map<uint64_t, VkDescriptorSet> gs_ds_cache;
     std::unordered_map<uint64_t, VkDescriptorSet> fs_ds_cache;
     std::unordered_map<uint64_t, VkDescriptorSet> bin_ds_cache;
     std::unordered_map<uint64_t, VkDescriptorSet> fine_ds_cache;
@@ -607,6 +769,10 @@ struct SmQueryPool {
     VkQueryPool real_qp = VK_NULL_HANDLE;
     VkQueryType orig_type = VK_QUERY_TYPE_TIMESTAMP;
     uint32_t query_count = 0;
+    // v1.2 Real GPU Occlusion Query counter buffer (host-visible + coherent uint32_t per query!)
+    VkBuffer occ_buf = VK_NULL_HANDLE;
+    VkDeviceMemory occ_mem = VK_NULL_HANDLE;
+    uint32_t* occ_ptr = nullptr;
 };
 
 struct SmDynUboDesc {
@@ -664,6 +830,9 @@ struct SmBatchedDraw {
     uint32_t clip_vert_base = 0;
     uint32_t tri_setup_base = 0;
     uint32_t bin_rflags = 0;
+    uint32_t bin_rflags2 = 0;
+    uint32_t clip_cull_slot = 0;
+    float min_db = 0.0f, max_db = 1.0f;
     VkPipeline vs_pipe = VK_NULL_HANDLE;
     VkPipelineLayout vs_layout = VK_NULL_HANDLE;
     uint32_t sm_set_index = 0;
@@ -684,11 +853,15 @@ struct SmBatchedDraw {
 struct SmDrawBatch {
     bool active = false;
     bool is_indirect = false;
+    bool fs_has_discard = false;
     SmPipeline* fs_owner_pipe = nullptr;
     uint32_t W = 0, H = 0, tx = 0, ty = 0;
     uint32_t vert_stride_vec4 = SM_VERT_STRIDE_VEC4;
     uint32_t fs_slot = 0;
+    uint32_t fs_peel_slots[3] = {0, 0, 0};
     uint32_t fine_rflags = 0;
+    uint32_t fine_rflags2 = 0;
+    float min_db = 0.0f, max_db = 1.0f;
     uint32_t extra_v_base = 0, extra_t_base = 0;
     bool eff_dwrite = false;
     bool can_use_hiz = false;
@@ -711,15 +884,37 @@ struct SmDrawBatch {
     std::vector<SmBatchedDraw> draws;
 };
 
+struct SmSecCmd {
+    enum Type {
+        BIND_PIPE, BIND_DS, PUSH_CONST, SET_VP, SET_SC, SET_CULL, SET_FF, SET_TOPO,
+        SET_DTEST, SET_DWRITE, SET_DOP, SET_DB_EN, SET_DB, SET_STEST, SET_SOP,
+        SET_SREF, SET_SCMASK, SET_SWMASK, SET_DBIAS_EN, SET_DBIAS, SET_RDISC,
+        SET_PREST, SET_LW, SET_BCONST, BIND_VB, BIND_IB, DRAW, DRAW_IDX,
+        DRAW_IND, DRAW_IDX_IND, CLEAR_ATT, BEGIN_Q, END_Q, DISPATCH, BARRIER
+    } type;
+    uint32_t u[8] = {0};
+    int32_t  i[4] = {0};
+    float    f[4] = {0.f};
+    uint64_t h[4] = {0};
+    uint64_t off[2] = {0};
+    std::vector<uint8_t> blob;
+    std::vector<uint32_t> dyn_offs;
+};
+
 struct SmCommandBuffer {
     VK_LOADER_DATA loader_data;
     SmDevice* dev = nullptr;
     VkCommandBuffer real_cb = VK_NULL_HANDLE;
+    bool is_secondary = false;
+    std::vector<SmSecCmd> sec_cmds;
 
     bool in_render_pass = false;
     bool in_dyn_rendering = false;
     SmRenderPass* cur_rp = nullptr;
     SmFramebuffer* cur_fb = nullptr;
+    uint32_t cur_subpass = 0;
+    uint32_t cur_view_mask = 0;
+    uint32_t cur_view_index = 0;
     SmImage* dyn_col_imgs[SM_MAX_MRT] = {nullptr};
     SmImageView* dyn_col_views[SM_MAX_MRT] = {nullptr};
     SmImage* dyn_res_imgs[SM_MAX_MRT] = {nullptr};
@@ -744,6 +939,10 @@ struct SmCommandBuffer {
 
     VkViewport cur_vp{0, 0, 1920, 1080, 0.0f, 1.0f};
     VkRect2D cur_scissor{{0, 0}, {1920, 1080}};
+    VkViewport cur_vps[16] = {};
+    VkRect2D cur_scissors[16] = {};
+    uint32_t cur_vp_count = 1;
+    uint32_t cur_sc_count = 1;
     bool has_vp = false;
     bool has_scissor = false;
 
@@ -753,6 +952,8 @@ struct SmCommandBuffer {
     bool has_dyn_depth_test = false;  bool dyn_depth_test = false;
     bool has_dyn_depth_write = false; bool dyn_depth_write = false;
     bool has_dyn_depth_op = false;    VkCompareOp dyn_depth_op = VK_COMPARE_OP_LESS;
+    bool has_dyn_depth_bounds_en = false; bool dyn_depth_bounds_en = false;
+    bool has_dyn_depth_bounds = false;    float dyn_min_depth_bounds = 0.0f, dyn_max_depth_bounds = 1.0f;
     bool has_dyn_depth_bias = false;  float dyn_depth_bias_const = 0.f, dyn_depth_bias_clamp = 0.f, dyn_depth_bias_slope = 0.f;
     bool has_dyn_depth_bias_en = false; bool dyn_depth_bias_en = false;
     bool has_dyn_rast_discard = false;  bool dyn_rast_discard = false;
@@ -769,6 +970,19 @@ struct SmCommandBuffer {
     bool has_dyn_stencil_ref[2] = {false, false};  uint32_t dyn_stencil_ref[2] = {0, 0};
     bool has_dyn_stencil_cmask[2] = {false, false}; uint32_t dyn_stencil_cmask[2] = {0xFF, 0xFF};
     bool has_dyn_stencil_wmask[2] = {false, false}; uint32_t dyn_stencil_wmask[2] = {0xFF, 0xFF};
+
+    // v1.2 Active Occlusion Query & Conditional Rendering state
+    SmQueryPool* active_occ_qp = nullptr;
+    uint32_t active_occ_idx = 0;
+    bool cond_render_active = false;
+    SmBuffer* cond_render_buf = nullptr;
+    VkDeviceSize cond_render_off = 0;
+    bool cond_render_inverted = false;
+
+    // v1.2 Lock-free per-CB 1-entry MRU Descriptor Set Cache (eliminates 99.5% of per-draw dev->mtx + hash lookups!)
+    uint64_t mru_gen = 0;
+    uint64_t mru_key[8] = {0,0,0,0,0,0,0,0}; // 0=vs, 1=gs, 2=fs, 3=bin, 4=fine, 5=dep, 6=hiz, 7=ind
+    VkDescriptorSet mru_ds[8] = {VK_NULL_HANDLE};
 
     static constexpr uint32_t MAX_DYN_OFFS_PER_SET = 32;
     VkDescriptorSet gfx_sets[16] = {VK_NULL_HANDLE};
@@ -810,20 +1024,84 @@ bool sm_init_raster_engine(SmDevice* dev);
 void sm_destroy_raster_engine(SmDevice* dev);
 bool sm_ensure_vis_size(SmDevice* dev, uint32_t w, uint32_t h);
 
+struct SmVsLowerMeta {
+    bool writes_point_size = false;
+    bool writes_clip_dist = false;
+    bool writes_cull_dist = false;
+    uint32_t clip_count = 0;
+    uint32_t cull_count = 0;
+    uint32_t stride_vec4 = 2;
+};
+
 bool sm_lower_vertex_spirv(const std::vector<uint32_t>& in_spv,
                            const SmVertexInputState& vtx_in,
                            const VkSpecializationInfo* spec,
                            uint32_t sm_set_idx,
                            std::vector<uint32_t>& out_comp_spv,
                            std::string& err,
-                           bool* out_writes_point_size = nullptr,
-                           uint32_t* out_stride_vec4 = nullptr);
+                           SmVsLowerMeta* out_meta = nullptr);
+
+struct SmGsLowerMeta {
+    uint32_t in_verts = 3;      // 1, 2, 3, 4, 6
+    uint32_t out_topo = 0;      // 0=TRI_LIST, 3=LINE_LIST, 5=POINT_LIST
+    uint32_t invocations = 1;
+    uint32_t max_verts = 3;
+    uint32_t out_stride_vec4 = 2;
+    bool writes_point_size = false;
+    bool writes_clip_dist = false;
+    bool writes_cull_dist = false;
+    uint32_t clip_count = 0;
+    uint32_t cull_count = 0;
+};
+
+bool sm_lower_geometry_spirv(const std::vector<uint32_t>& in_spv,
+                             const VkSpecializationInfo* spec,
+                             uint32_t sm_set_idx,
+                             std::vector<uint32_t>& out_comp_spv,
+                             std::string& err,
+                             SmGsLowerMeta* out_meta = nullptr);
+
+struct SmTessCtrlLowerMeta {
+    uint32_t out_cp = 3;
+    uint32_t out_stride_vec4 = 2;
+    uint32_t patch_stride_vec4 = 4;
+};
+
+struct SmTessEvalLowerMeta {
+    uint32_t domain = 0;      // 0=triangles, 1=quads, 2=isolines
+    uint32_t spacing = 0;     // 0=equal, 1=frac_even, 2=frac_odd
+    uint32_t ccw = 1;
+    uint32_t point_mode = 0;
+    uint32_t out_topo = 0;    // 0=TRI_LIST, 3=LINE_LIST, 5=POINT_LIST
+    uint32_t out_stride_vec4 = 2;
+    bool writes_point_size = false;
+    bool writes_clip_dist = false;
+    bool writes_cull_dist = false;
+    uint32_t clip_count = 0;
+    uint32_t cull_count = 0;
+};
+
+bool sm_lower_tess_ctrl_spirv(const std::vector<uint32_t>& in_spv,
+                              const VkSpecializationInfo* spec,
+                              uint32_t sm_set_idx,
+                              std::vector<uint32_t>& out_comp_spv,
+                              std::string& err,
+                              SmTessCtrlLowerMeta* out_meta = nullptr);
+
+bool sm_lower_tess_eval_spirv(const std::vector<uint32_t>& in_spv,
+                              const VkSpecializationInfo* spec,
+                              uint32_t sm_set_idx,
+                              std::vector<uint32_t>& out_comp_spv,
+                              std::string& err,
+                              SmTessEvalLowerMeta* out_meta = nullptr);
 
 struct SmFsCompileHints {
     int      rt_fmt[SM_MAX_MRT]     = {-1,-1,-1,-1,-1,-1,-1,-1};
     bool     blend_en[SM_MAX_MRT]   = {true,true,true,true,true,true,true,true};
     uint32_t write_mask[SM_MAX_MRT] = {0xFu,0xFu,0xFu,0xFu,0xFu,0xFu,0xFu,0xFu};
     bool     stencil_en             = false;
+    bool     logic_op_en            = false;
+    uint32_t logic_op               = 3u; // VK_LOGIC_OP_COPY
 };
 
 bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
@@ -833,7 +1111,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                              std::vector<uint32_t>& out_comp_spv,
                              std::string& err,
                              bool* out_fs_uses_push = nullptr,
-                             bool* out_fs_has_discard_or_depth = nullptr,
+                             bool* out_fs_has_discard = nullptr,
+                             bool* out_fs_writes_depth = nullptr,
                              const std::vector<SmDynUboDesc>* dyn_ubos = nullptr,
                              bool* out_fs_batched_push_ok = nullptr,
                              SmDynUboDesc* out_batched_dyn_ubo = nullptr,

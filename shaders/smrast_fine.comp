@@ -32,8 +32,13 @@ layout(push_constant) uniform FineParams {
     uint height;
     uint tiles_x;
     uint max_tris_per_tile;
-    uint flags;   // bit3=depth_test, bits4..6=depth_op, bit13=use_prebin_hiz, bit15=direct_2d, bit16=small_tri_direct
+    uint flags;   // bit3=depth_test, bits4..6=depth_op, bit13=use_prebin_hiz, bit15=direct_2d, bit16=small_tri_direct, bit18=depth_bounds_en
     uint tiles_y;
+    uint peel_mode;   // 0=normal (self-clear), 1=peel_iter0 (keep bins), 2=peel_iterN (cand > prev_vis), 3=peel_cleanup (clear bins only!)
+    uint active_base; // slice base offset in active_tiles[] (0, num_tiles, or 2*num_tiles)
+    float min_db;
+    float max_db;
+    uint flags2;      // bit0=late_z_no_early_reject
 } pc;
 
 const uint BATCH = 64u;
@@ -101,13 +106,21 @@ void main() {
         tile_y = gl_WorkGroupID.y;
         tile_id = tile_y * pc.tiles_x + tile_x;
     } else {
-        tile_id = active_tiles[gl_WorkGroupID.x];
+        tile_id = active_tiles[pc.active_base + gl_WorkGroupID.x];
         tile_x = tile_id % pc.tiles_x;
         tile_y = tile_id / pc.tiles_x;
     }
 
     uint local_tid = gl_LocalInvocationIndex; // 0..255
     uint flag_idx = pc.tiles_x * pc.tiles_y + 8u + tile_id;
+    // Mode 3: Ultra-fast post-peel tile_counts & active flag cleanup!
+    if (pc.peel_mode == 3u) {
+        if (local_tid == 0u) {
+            tile_counts[tile_id] = 0u;
+            if (!direct_2d) tile_counts[flag_idx] = 0u;
+        }
+        return;
+    }
     float tx0 = float(tile_x * 16u), ty0 = float(tile_y * 16u);
     float tx1 = tx0 + 16.0, ty1 = ty0 + 16.0;
 
@@ -131,7 +144,7 @@ void main() {
     } else {
         total = min(tile_counts[tile_id], pc.max_tris_per_tile);
         if (total == 0u) {
-            if (!direct_2d && local_tid == 0u) tile_counts[flag_idx] = 0u;
+            if (pc.peel_mode == 0u && !direct_2d && local_tid == 0u) tile_counts[flag_idx] = 0u;
             return;
         }
     }
@@ -145,15 +158,20 @@ void main() {
     float wy_lo = subgroupMin(fy);
     float wy_hi = subgroupMax(fy);
 
-    bool dtest = (pc.flags & 8u) != 0u;
+    bool late_z = (pc.flags2 & 1u) != 0u;
+    bool db_en  = (pc.flags & 262144u) != 0u;
+    bool dtest  = ((pc.flags & 8u) != 0u) && !late_z;
     uint dop = (pc.flags >> 4u) & 7u;
     bool greater_wins = (dop == 4u || dop == 6u);
-    bool hiz_less    = dtest && (dop == 1u || dop == 3u);
-    bool hiz_greater = dtest && (dop == 4u || dop == 6u);
-    bool use_prebin_hiz = (pc.flags & 8192u) != 0u;
+    bool hiz_less    = dtest && (dop == 1u || dop == 3u) && (pc.peel_mode != 2u);
+    bool hiz_greater = dtest && (dop == 4u || dop == 6u) && (pc.peel_mode != 2u);
+    bool use_prebin_hiz = ((pc.flags & 8192u) != 0u) && !late_z && (pc.peel_mode != 2u);
 
     float ref_d = in_bounds ? depth_px[pidx] : (greater_wins ? 1.0 : 0.0);
-    uint64_t best = in_bounds ? vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul;
+    bool db_ok = (!db_en) || (ref_d >= pc.min_db && ref_d <= pc.max_db);
+    uint64_t prev_vis = (in_bounds && pc.peel_mode == 2u) ? vis_px[pidx] : 0ul;
+    bool peel_active = (pc.peel_mode != 2u) ? (in_bounds && db_ok) : (in_bounds && db_ok && prev_vis != 0xFFFFFFFFFFFFFFFFul);
+    uint64_t best = (pc.peel_mode == 2u) ? 0xFFFFFFFFFFFFFFFFul : (in_bounds ? vis_px[pidx] : 0xFFFFFFFFFFFFFFFFul);
     uint bin_base = tile_id * pc.max_tris_per_tile;
 
     // Intra-tile Early-Z best_d (accounts for existing CuRast micro-tri hit in vis_px
@@ -250,7 +268,7 @@ void main() {
             vc = s_valid_cnt;
         }
 
-        if (in_bounds) {
+        if (peel_active) {
             for (uint k = 0u; k < vc; ++k) {
                 vec4 bb = s_bbox[k];
                 if (wy_hi < bb.y || wy_lo > bb.w) continue;
@@ -294,9 +312,10 @@ void main() {
                     uint d_u32 = greater_wins ? (0x3F800000u - du) : du;
                     cand = (uint64_t(d_u32) << 32) | uint64_t(tid);
                 }
+                if (pc.peel_mode == 2u && cand <= prev_vis) continue;
                 if (cand < best) {
                     best = cand;
-                    best_d = d;
+                    if (pc.peel_mode != 2u) best_d = d;
                 }
             }
         }
@@ -333,13 +352,15 @@ void main() {
         }
     }
 
-    // Self-clear tile_counts & active flag for this tile (ZERO per-draw CmdFillBuffer!)
-    if (!small_tri_direct && local_tid == 0u) {
+    // Self-clear tile_counts & active flag for this tile (ONLY in normal peel_mode==0; peel_mode==3 cleans up after peeling!)
+    if (pc.peel_mode == 0u && !small_tri_direct && local_tid == 0u) {
         tile_counts[tile_id] = 0u;
         if (!direct_2d) tile_counts[flag_idx] = 0u;
     }
 
-    if (in_bounds && best != 0xFFFFFFFFFFFFFFFFul) {
+    if (pc.peel_mode == 2u) {
+        if (peel_active) vis_px[pidx] = best; // ALWAYS write (sets ~0ul if no behind layer -> guaranteed zero VisBuf leaks!)
+    } else if (in_bounds && best != 0xFFFFFFFFFFFFFFFFul) {
         vis_px[pidx] = best;
     }
 }

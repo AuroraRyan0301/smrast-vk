@@ -540,7 +540,8 @@ void main() {
         printf("[5] HW Timestamp + Occlusion CopyQueryPoolResults: ts0=%llu ts1=%llu (dt=%lld) occ0=%llu avail=%llu\n",
                (unsigned long long)u64[0], (unsigned long long)u64[1], (long long)(u64[1] - u64[0]),
                (unsigned long long)u64[2], (unsigned long long)u64[3]);
-        if (u64[0] == 0 || u64[1] < u64[0] || u64[2] != 1 || u64[3] != 1) {
+        // v1.2+: Real GPU occlusion counter is truthfully 0 when no fragments were drawn (v1.0 stub returned 1)
+        if (u64[0] == 0 || u64[1] < u64[0] || u64[2] != 0 || u64[3] != 1) {
             fprintf(stderr, "FAIL [5]: query pool results invalid!\n");
             return 1;
         }

@@ -621,5 +621,8 @@ int main() {
     }
 
     printf("V11_FEATURE_TEST PASS\n");
+    vkDeviceWaitIdle(dev);
+    vkDestroyDevice(dev, nullptr);
+    vkDestroyInstance(inst, nullptr);
     return 0;
 }

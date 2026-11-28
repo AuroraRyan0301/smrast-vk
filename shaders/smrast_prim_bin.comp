@@ -28,6 +28,8 @@ layout(push_constant) uniform BinParams {
     int sc_x0; int sc_y0; int sc_x1; int sc_y1;
     uint tris_per_inst; uint verts_per_inst; uint extra_vert_base; uint extra_tri_base;
     float depth_bias_const; float depth_bias_slope; float depth_bias_clamp; float line_width;
+    uint clip_vert_base; uint tri_setup_base;
+    uint flags2; float min_db; float max_db; uint clip_cull_slot;
 } pc;
 
 void mark_tile_active(uint tile_id) {
@@ -108,6 +110,62 @@ void emit_screen_quad(uint tid, uint meta_idx, uint ia, uint ib, vec4 pa, vec4 p
     if (tslot < 390000u) emit_nocull_tri(pc.extra_tri_base + tslot, nv + 0u, nv + 2u, nv + 3u, pa, pc0, pd0);
 }
 
+void emit_line_seg(uint meta_idx, uint i0, uint i1, bool depth_clamp) {
+    vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
+    vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
+    if (floatBitsToUint(c0.w) == 0x7FC0DEADu || floatBitsToUint(c1.w) == 0x7FC0DEADu) return;
+    if (depth_clamp) {
+        bool in0 = (c0.w > 1e-4), in1 = (c1.w > 1e-4);
+        if (!in0 && !in1) return;
+        if (in0 != in1) {
+            float da = c0.w - 1e-4, db = c1.w - 1e-4;
+            float t = clamp(da / (da - db), 0.0, 1.0);
+            vec4 np = mix(c0, c1, t); np.w = max(np.w, 1e-4);
+            if (!in0) c0 = np; else c1 = np;
+        }
+    } else {
+        if (c0.z < 0.0 && c1.z < 0.0) return;
+        if ((c0.z < 0.0) != (c1.z < 0.0)) {
+            float t = clamp(c0.z / (c0.z - c1.z), 0.0, 1.0);
+            vec4 np = mix(c0, c1, t); np.z = max(np.z, 0.0);
+            if (c0.z < 0.0) c0 = np; else c1 = np;
+        }
+        float d0 = c0.w - c0.z, d1 = c1.w - c1.z;
+        if (d0 < 0.0 && d1 < 0.0) return;
+        if ((d0 < 0.0) != (d1 < 0.0)) {
+            float t = clamp(d0 / (d0 - d1), 0.0, 1.0);
+            vec4 np = mix(c0, c1, t); np.w = max(np.w, 1e-4); np.z = min(np.z, np.w);
+            if (d0 < 0.0) c0 = np; else c1 = np;
+        }
+        if (c0.w <= 1e-4 || c1.w <= 1e-4) return;
+    }
+    vec2 s0 = vec2(pc.vp_x + (c0.x / c0.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y / c0.w * 0.5 + 0.5) * pc.vp_h);
+    vec2 s1 = vec2(pc.vp_x + (c1.x / c1.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y / c1.w * 0.5 + 0.5) * pc.vp_h);
+    vec2 dir = s1 - s0;
+    float len = length(dir);
+    if (len < 1e-5) return;
+    vec2 nrm = vec2(-dir.y, dir.x) * (0.5 * max(pc.line_width, 1.0) / len);
+    vec2 o0 = vec2(nrm.x * 2.0 / pc.vp_w, nrm.y * 2.0 / pc.vp_h) * c0.w;
+    vec2 o1 = vec2(nrm.x * 2.0 / pc.vp_w, nrm.y * 2.0 / pc.vp_h) * c1.w;
+    uint t0 = atomicAdd(tile_counts[meta_idx + 1u], 1u);
+    if (t0 < 390000u)
+        emit_screen_quad(pc.extra_tri_base + t0, meta_idx, i0, i1,
+                         vec4(c0.xy - o0, c0.zw), vec4(c0.xy + o0, c0.zw),
+                         vec4(c1.xy + o1, c1.zw), vec4(c1.xy - o1, c1.zw));
+}
+
+void emit_point_vert(uint meta_idx, uint i0, bool depth_clamp) {
+    vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
+    if (floatBitsToUint(c0.w) == 0x7FC0DEADu || c0.w <= 1e-5 || (!depth_clamp && (c0.z < 0.0 || c0.z > c0.w))) return;
+    float ps = ((pc.flags & 16384u) != 0u) ? clamp(clip_verts[i0 * pc.vert_stride_vec4 + 15u].w, 1.0, 64.0) : max(pc.line_width, 1.0);
+    vec2 h = vec2(ps / abs(pc.vp_w), ps / abs(pc.vp_h)) * c0.w;
+    uint t0 = atomicAdd(tile_counts[meta_idx + 1u], 1u);
+    if (t0 < 390000u)
+        emit_screen_quad(pc.extra_tri_base + t0, meta_idx, i0, i0,
+                         vec4(c0.x - h.x, c0.y - h.y, c0.zw), vec4(c0.x + h.x, c0.y - h.y, c0.zw),
+                         vec4(c0.x + h.x, c0.y + h.y, c0.zw), vec4(c0.x - h.x, c0.y + h.y, c0.zw));
+}
+
 void main() {
     uint meta_idx = pc.tiles_x * pc.tiles_y;
     uint eff_count = (pc.tri_count == 0xFFFFFFFFu) ? tile_counts[meta_idx + 2u] : pc.tri_count;
@@ -118,62 +176,50 @@ void main() {
     if (tid >= eff_count) return;
     uint inst_local = tid / max(eff_tpi, 1u);
     uint prim_local = tid - inst_local * max(eff_tpi, 1u);
-    uint vbase      = inst_local * eff_vpi;
+    uint vbase      = pc.clip_vert_base + inst_local * eff_vpi;
 
     uint topo = (pc.flags >> 8u) & 7u;
     bool depth_clamp = (pc.flags & 2048u) != 0u;
+    bool poly_line   = (pc.flags2 & 8192u) != 0u;
+    bool poly_point  = (pc.flags2 & 16384u) != 0u;
+
+    if ((poly_line || poly_point) && topo <= 2u) {
+        // VK_POLYGON_MODE_LINE / VK_POLYGON_MODE_POINT wireframe & point rasterization!
+        uint i0, i1, i2;
+        if (topo == 0u)      { i0 = vbase + prim_local * 3u; i1 = i0 + 1u; i2 = i0 + 2u; }
+        else if (topo == 1u) { if ((prim_local & 1u) == 0u) { i0 = vbase + prim_local; i1 = i0 + 1u; i2 = i0 + 2u; } else { i0 = vbase + prim_local; i1 = i0 + 2u; i2 = i0 + 1u; } }
+        else                 { i0 = vbase; i1 = vbase + prim_local + 1u; i2 = vbase + prim_local + 2u; }
+        vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
+        vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
+        vec4 c2 = clip_verts[i2 * pc.vert_stride_vec4];
+        if (floatBitsToUint(c0.w) == 0x7FC0DEADu || floatBitsToUint(c1.w) == 0x7FC0DEADu || floatBitsToUint(c2.w) == 0x7FC0DEADu) return;
+        if (c0.w > 1e-5 && c1.w > 1e-5 && c2.w > 1e-5) {
+            vec2 s0 = vec2(pc.vp_x + (c0.x / c0.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y / c0.w * 0.5 + 0.5) * pc.vp_h);
+            vec2 s1 = vec2(pc.vp_x + (c1.x / c1.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y / c1.w * 0.5 + 0.5) * pc.vp_h);
+            vec2 s2 = vec2(pc.vp_x + (c2.x / c2.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c2.y / c2.w * 0.5 + 0.5) * pc.vp_h);
+            float area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x);
+            bool front_cw = (pc.flags & 4u) != 0u;
+            bool is_front = front_cw ? (area > 0.0) : (area < 0.0);
+            if ((((pc.flags & 1u) != 0u) && !is_front) || (((pc.flags & 2u) != 0u) && is_front)) return;
+        }
+        if (poly_line) {
+            emit_line_seg(meta_idx, i0, i1, depth_clamp);
+            emit_line_seg(meta_idx, i1, i2, depth_clamp);
+            emit_line_seg(meta_idx, i2, i0, depth_clamp);
+        } else {
+            emit_point_vert(meta_idx, i0, depth_clamp);
+            emit_point_vert(meta_idx, i1, depth_clamp);
+            emit_point_vert(meta_idx, i2, depth_clamp);
+        }
+        return;
+    }
 
     if (topo == 3u || topo == 4u) {
         uint i0 = (topo == 3u) ? (vbase + prim_local * 2u) : (vbase + prim_local);
         uint i1 = i0 + 1u;
-        vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
-        vec4 c1 = clip_verts[i1 * pc.vert_stride_vec4];
-        if (floatBitsToUint(c0.w) == 0x7FC0DEADu || floatBitsToUint(c1.w) == 0x7FC0DEADu) return;
-        if (depth_clamp) {
-            bool in0 = (c0.w > 1e-4), in1 = (c1.w > 1e-4);
-            if (!in0 && !in1) return;
-            if (in0 != in1) {
-                float da = c0.w - 1e-4, db = c1.w - 1e-4;
-                float t = clamp(da / (da - db), 0.0, 1.0);
-                vec4 np = mix(c0, c1, t); np.w = max(np.w, 1e-4);
-                if (!in0) c0 = np; else c1 = np;
-            }
-        } else {
-            // Clip against both z >= 0 and w - z >= 0 (Standard-Z & Reverse-Z)
-            if (c0.z < 0.0 && c1.z < 0.0) return;
-            if ((c0.z < 0.0) != (c1.z < 0.0)) {
-                float t = clamp(c0.z / (c0.z - c1.z), 0.0, 1.0);
-                vec4 np = mix(c0, c1, t); np.z = max(np.z, 0.0);
-                if (c0.z < 0.0) c0 = np; else c1 = np;
-            }
-            float d0 = c0.w - c0.z, d1 = c1.w - c1.z;
-            if (d0 < 0.0 && d1 < 0.0) return;
-            if ((d0 < 0.0) != (d1 < 0.0)) {
-                float t = clamp(d0 / (d0 - d1), 0.0, 1.0);
-                vec4 np = mix(c0, c1, t); np.w = max(np.w, 1e-4); np.z = min(np.z, np.w);
-                if (d0 < 0.0) c0 = np; else c1 = np;
-            }
-            if (c0.w <= 1e-4 || c1.w <= 1e-4) return;
-        }
-        vec2 s0 = vec2(pc.vp_x + (c0.x / c0.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c0.y / c0.w * 0.5 + 0.5) * pc.vp_h);
-        vec2 s1 = vec2(pc.vp_x + (c1.x / c1.w * 0.5 + 0.5) * pc.vp_w, pc.vp_y + (c1.y / c1.w * 0.5 + 0.5) * pc.vp_h);
-        vec2 dir = s1 - s0;
-        float len = length(dir);
-        if (len < 1e-5) return;
-        vec2 nrm = vec2(-dir.y, dir.x) * (0.5 * max(pc.line_width, 1.0) / len);
-        vec2 o0 = vec2(nrm.x * 2.0 / pc.vp_w, nrm.y * 2.0 / pc.vp_h) * c0.w;
-        vec2 o1 = vec2(nrm.x * 2.0 / pc.vp_w, nrm.y * 2.0 / pc.vp_h) * c1.w;
-        emit_screen_quad(tid, meta_idx, i0, i1,
-                         vec4(c0.xy - o0, c0.zw), vec4(c0.xy + o0, c0.zw),
-                         vec4(c1.xy + o1, c1.zw), vec4(c1.xy - o1, c1.zw));
+        emit_line_seg(meta_idx, i0, i1, depth_clamp);
     } else {
         uint i0 = vbase + prim_local;
-        vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
-        if (c0.w <= 1e-5 || (!depth_clamp && (c0.z < 0.0 || c0.z > c0.w))) return;
-        float ps = ((pc.flags & 16384u) != 0u) ? clamp(clip_verts[i0 * pc.vert_stride_vec4 + 15u].w, 1.0, 64.0) : max(pc.line_width, 1.0);
-        vec2 h = vec2(ps / abs(pc.vp_w), ps / abs(pc.vp_h)) * c0.w;
-        emit_screen_quad(tid, meta_idx, i0, i0,
-                         vec4(c0.x - h.x, c0.y - h.y, c0.zw), vec4(c0.x + h.x, c0.y - h.y, c0.zw),
-                         vec4(c0.x + h.x, c0.y + h.y, c0.zw), vec4(c0.x - h.x, c0.y + h.y, c0.zw));
+        emit_point_vert(meta_idx, i0, depth_clamp);
     }
 }

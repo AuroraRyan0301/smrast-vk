@@ -60,6 +60,11 @@ layout(push_constant) uniform BinParams {
     float line_width;
     uint clip_vert_base;
     uint tri_setup_base;
+    uint flags2; // bit0=last_pv, bit1=prim_restart, bit2=peel_mode(no CuRast bypass), bit3=has_clip_dist,
+                 // bit4=has_cull_dist, bits5..7=clip_cnt(0..7->1..8), bits8..10=cull_cnt, bit11=depth_bounds_en, bit12=late_z
+    float min_db;
+    float max_db;
+    uint clip_cull_slot;
 } pc;
 
 // Shared state for 1-workgroup zero-atomic cooperative small-triangle binning (bit 16)
@@ -227,10 +232,13 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     uint tx1 = min(pc.tiles_x - 1u, uint(maxx) >> 4u);
     uint ty1 = min(pc.tiles_y - 1u, uint(maxy) >> 4u);
 
-    bool dtest     = (pc.flags & 8u) != 0u;
+    bool late_z    = (pc.flags2 & 4096u) != 0u;
+    bool dtest     = ((pc.flags & 8u) != 0u) && !late_z;
     uint dop       = (pc.flags >> 4u) & 7u;
-    bool use_hiz   = (pc.flags & 8192u) != 0u;
+    bool use_hiz   = ((pc.flags & 8192u) != 0u) && !late_z;
     bool direct_2d = (pc.flags & 32768u) != 0u;
+    bool peel_mode = (pc.flags2 & 4u) != 0u;
+    bool db_en     = (pc.flags2 & 2048u) != 0u;
     float tri_min_z = clamp(min(z0, min(z1, z2)), 0.0, 1.0);
     float tri_max_z = clamp(max(z0, max(z1, z2)), 0.0, 1.0);
 
@@ -270,8 +278,8 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
     vec4 e1 = make_edge(s2, s0);
     vec4 e2 = make_edge(s0, s1);
 
-    // v0.9 CuRast Micro-Triangle Fast-Path (raised <=64 -> <=128 px with branchless precomputed canonical edges!)
-    if (bw * bh <= 128) {
+    // v0.9 CuRast Micro-Triangle Fast-Path (disabled during peel_mode so ALL tris enter tile_bins for exact GPU depth peeling!)
+    if (!peel_mode && bw * bh <= 128) {
         if (use_hiz) {
             bool any_pass = false;
             for (uint ty = ty0; ty <= ty1 && !any_pass; ++ty) {
@@ -304,6 +312,10 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
                 float d = clamp(l0 * z0 + l1 * z1 + l2 * z2, 0.0, 1.0);
                 if (!(d >= 0.0 && d <= 1.0)) continue;
                 uint pidx = uint(py) * pc.width + uint(px);
+                if (db_en) {
+                    float rz = depth_px[pidx];
+                    if (rz < pc.min_db || rz > pc.max_db) continue;
+                }
                 if (dtest && !depth_pass(d, depth_px[pidx], dop)) continue;
                 uint64_t packed;
                 if (!dtest || dop == 7u) {
@@ -363,25 +375,44 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
     uint gtid       = eff_ts_base + tid;
 
     uint topo = (pc.flags >> 8u) & 7u;
+    bool last_pv = (pc.flags2 & 1u) != 0u;
     uint i0, i1, i2;
     if (topo == 0u) {
-        i0 = vbase + tri_local * 3u + 0u;
-        i1 = vbase + tri_local * 3u + 1u;
-        i2 = vbase + tri_local * 3u + 2u;
-    } else if (topo == 1u) {
-        if ((tri_local & 1u) == 0u) {
-            i0 = vbase + tri_local;
-            i1 = vbase + tri_local + 1u;
-            i2 = vbase + tri_local + 2u;
+        if (!last_pv) {
+            i0 = vbase + tri_local * 3u + 0u;
+            i1 = vbase + tri_local * 3u + 1u;
+            i2 = vbase + tri_local * 3u + 2u;
         } else {
-            i0 = vbase + tri_local + 1u;
-            i1 = vbase + tri_local;
-            i2 = vbase + tri_local + 2u;
+            i0 = vbase + tri_local * 3u + 2u;
+            i1 = vbase + tri_local * 3u + 0u;
+            i2 = vbase + tri_local * 3u + 1u;
+        }
+    } else if (topo == 1u) {
+        // Vulkan 1.3 spec-exact TRIANGLE_STRIP winding + provoking vertex (i0) + primitive-restart parity reset!
+        uint parity = tri_local & 1u;
+        if ((pc.flags2 & 2u) != 0u && tri_local > 0u) {
+            uint strip_start = 0u;
+            uint back_lim = min(tri_local, 256u);
+            for (uint bk = 1u; bk <= back_lim; ++bk) {
+                uint prev_v = vbase + tri_local - bk;
+                if (floatBitsToUint(clip_verts[prev_v * pc.vert_stride_vec4].w) == 0x7FC0DEADu) {
+                    strip_start = tri_local - bk + 1u;
+                    break;
+                }
+            }
+            parity = (tri_local - strip_start) & 1u;
+        }
+        if (parity == 0u) {
+            if (!last_pv) { i0 = vbase + tri_local;      i1 = vbase + tri_local + 1u; i2 = vbase + tri_local + 2u; }
+            else          { i0 = vbase + tri_local + 2u; i1 = vbase + tri_local;      i2 = vbase + tri_local + 1u; }
+        } else {
+            if (!last_pv) { i0 = vbase + tri_local;      i1 = vbase + tri_local + 2u; i2 = vbase + tri_local + 1u; }
+            else          { i0 = vbase + tri_local + 2u; i1 = vbase + tri_local + 1u; i2 = vbase + tri_local;      }
         }
     } else {
-        i0 = vbase;
-        i1 = vbase + tri_local + 1u;
-        i2 = vbase + tri_local + 2u;
+        // TRIANGLE_FAN: provoking vertex is tri_local+1 (FIRST) or tri_local+2 (LAST); cyclic rotation preserves exact winding!
+        if (!last_pv) { i0 = vbase + tri_local + 1u; i1 = vbase + tri_local + 2u; i2 = vbase; }
+        else          { i0 = vbase + tri_local + 2u; i1 = vbase;                  i2 = vbase + tri_local + 1u; }
     }
 
     vec4 c0 = clip_verts[i0 * pc.vert_stride_vec4];
@@ -391,6 +422,18 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
 
     if (any(isnan(c0)) || any(isnan(c1)) || any(isnan(c2)) ||
         any(isinf(c0)) || any(isinf(c1)) || any(isinf(c2))) return;
+
+    // Vulkan 1.3 User Cull Distances (gl_CullDistance[0..3] stored in clip_verts[v*stride + 14]):
+    bool has_cull_d = (pc.flags2 & 16u) != 0u;
+    if (has_cull_d) {
+        uint cull_cnt = min(((pc.flags2 >> 8u) & 7u) + 1u, 4u);
+        vec4 cd0 = clip_verts[i0 * pc.vert_stride_vec4 + 14u];
+        vec4 cd1 = clip_verts[i1 * pc.vert_stride_vec4 + 14u];
+        vec4 cd2 = clip_verts[i2 * pc.vert_stride_vec4 + 14u];
+        for (uint ci = 0u; ci < cull_cnt; ++ci) {
+            if (cd0[ci] < 0.0 && cd1[ci] < 0.0 && cd2[ci] < 0.0) return;
+        }
+    }
 
     bool no_depth_clip = (pc.flags & 2048u) != 0u;
     // Exact homogeneous 4D frustum trivial-reject (valid for ALL w, including w <= 0!)
@@ -404,6 +447,25 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
         if (c0.z > c0.w && c1.z > c1.w && c2.z > c2.w) return;
     }
 
+    bool has_clip_d = (pc.flags2 & 8u) != 0u;
+    uint clip_cnt = has_clip_d ? min(((pc.flags2 >> 5u) & 7u) + 1u, 8u) : 0u;
+    bool all_clip_in = true;
+    if (has_clip_d) {
+        vec4 cl0a = clip_verts[i0 * pc.vert_stride_vec4 + 13u];
+        vec4 cl1a = clip_verts[i1 * pc.vert_stride_vec4 + 13u];
+        vec4 cl2a = clip_verts[i2 * pc.vert_stride_vec4 + 13u];
+        vec4 cl0b = (clip_cnt > 4u) ? clip_verts[i0 * pc.vert_stride_vec4 + 14u] : vec4(0.0);
+        vec4 cl1b = (clip_cnt > 4u) ? clip_verts[i1 * pc.vert_stride_vec4 + 14u] : vec4(0.0);
+        vec4 cl2b = (clip_cnt > 4u) ? clip_verts[i2 * pc.vert_stride_vec4 + 14u] : vec4(0.0);
+        for (uint ci = 0u; ci < clip_cnt; ++ci) {
+            float d0 = (ci < 4u) ? cl0a[ci] : cl0b[ci - 4u];
+            float d1 = (ci < 4u) ? cl1a[ci] : cl1b[ci - 4u];
+            float d2 = (ci < 4u) ? cl2a[ci] : cl2b[ci - 4u];
+            if (d0 < 0.0 && d1 < 0.0 && d2 < 0.0) return;
+            if (d0 < 0.0 || d1 < 0.0 || d2 < 0.0) all_clip_in = false;
+        }
+    }
+
     // CUDARaster Guard-Band trivial-accept: |x|<=4w, |y|<=4w, w>1e-4, and (if depth_clip) 0<=z<=w
     // Keeps projected screen coords strictly within [-4*W, +5*W] -> zero FP32 edge cancellation!
     const float GB = 4.0;
@@ -411,7 +473,7 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
     bool in1 = (c1.w > 1e-4) && (abs(c1.x) <= GB * c1.w) && (abs(c1.y) <= GB * c1.w) && (no_depth_clip || (c1.z >= 0.0 && c1.z <= c1.w));
     bool in2 = (c2.w > 1e-4) && (abs(c2.x) <= GB * c2.w) && (abs(c2.y) <= GB * c2.w) && (no_depth_clip || (c2.z >= 0.0 && c2.z <= c2.w));
 
-    if (in0 && in1 && in2) {
+    if (in0 && in1 && in2 && all_clip_in) {
         process_tri(gtid, i0, i1, i2, c0, c1, c2);
         return;
     }
@@ -422,10 +484,9 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
     poly_pos[0] = c0; poly_pos[1] = c1; poly_pos[2] = c2;
     uint n_poly = 3u;
 
-    // 7-plane exact homogeneous Sutherland-Hodgman clipper:
-    //   pl=0: w >= 1e-4, pl=1: z >= 0, pl=2: w - z >= 0,
-    //   pl=3..6: guard-band x+4w>=0, 4w-x>=0, y+4w>=0, 4w-y>=0
-    for (uint pl = 0u; pl < 7u && n_poly >= 3u; ++pl) {
+    // 7-plane frustum + up to 8 user gl_ClipDistance[] Sutherland-Hodgman clipper!
+    uint total_planes = 7u + clip_cnt;
+    for (uint pl = 0u; pl < total_planes && n_poly >= 3u; ++pl) {
         if (no_depth_clip && (pl == 1u || pl == 2u)) continue;
         bool all_in = true, any_in = false;
         float dists[10];
@@ -438,7 +499,12 @@ void run_one_tri(uint tid, uint meta_idx, bool small_coop, uint eff_tpi, uint ef
             else if (pl == 3u) d = p.x + GB * p.w;
             else if (pl == 4u) d = GB * p.w - p.x;
             else if (pl == 5u) d = p.y + GB * p.w;
-            else               d = GB * p.w - p.y;
+            else if (pl == 6u) d = GB * p.w - p.y;
+            else {
+                uint ci = pl - 7u;
+                uint slot = (ci < 4u) ? 13u : 14u;
+                d = clip_verts[poly_id[e] * pc.vert_stride_vec4 + slot][ci & 3u];
+            }
             dists[e] = d;
             if (d < 0.0) all_in = false;
             else         any_in = true;
