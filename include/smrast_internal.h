@@ -40,7 +40,7 @@ static constexpr uint32_t SM_MAX_VTX_BINDINGS   = 8;
 // 7=RG16_SFLOAT (4B), 8=RGBA32_SFLOAT (16B), 9=A2B10G10R10_UNORM (4B),
 // 10=RG32_SFLOAT (8B), 11=R32_UINT/SINT (4B), 12=RGBA8_SNORM (4B),
 // 13=RG16_UNORM (4B), 14=RG16_SNORM (4B), 15=RGBA16_UNORM (8B), 16=RGBA16_SNORM (8B),
-// 17=R8_UNORM/UINT (1B), 18=RG8_UNORM (2B), 19=R16_SFLOAT (2B), 20=R16_UNORM/UINT (2B)
+// 17=R8_UNORM/UINT (1B), 18=RG8_UNORM (2B), 19=R16_SFLOAT (2B), 20=R16_UNORM/UINT (2B), 21=R8_SNORM (1B)
 static inline uint32_t sm_format_code(VkFormat f) {
     switch (f) {
         case VK_FORMAT_B8G8R8A8_UNORM:          return 1u;
@@ -64,6 +64,7 @@ static inline uint32_t sm_format_code(VkFormat f) {
         case VK_FORMAT_R8_SRGB:
         case VK_FORMAT_R8_UINT:
         case VK_FORMAT_R8_SINT:                 return 17u;
+        case VK_FORMAT_R8_SNORM:                return 21u;
         case VK_FORMAT_R8G8_UNORM:
         case VK_FORMAT_R8G8_SNORM:              return 18u;
         case VK_FORMAT_R16_SFLOAT:              return 19u;
@@ -77,7 +78,7 @@ static inline uint32_t sm_format_bpp_code(VkFormat f) {
     uint32_t c = sm_format_code(f);
     if (c == 4u || c == 10u || c == 15u || c == 16u) return 1u; // 8 bytes/px (2 u32)
     if (c == 8u)                                     return 2u; // 16 bytes/px (4 u32)
-    if (c == 17u)                                    return 3u; // 1 byte/px
+    if (c == 17u || c == 21u)                        return 3u; // 1 byte/px
     if (c == 18u || c == 19u || c == 20u)            return 4u; // 2 bytes/px
     return 0u;                                                  // 4 bytes/px (1 u32)
 }
@@ -555,10 +556,10 @@ struct SmRasterEngine {
     VkBuffer ind_disp_buf = VK_NULL_HANDLE;    VkDeviceMemory ind_disp_mem = VK_NULL_HANDLE;
     VkBuffer dummy_buf = VK_NULL_HANDLE;       VkDeviceMemory dummy_mem = VK_NULL_HANDLE;
 
-    static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 49152;
-    static constexpr uint32_t MAX_DS_RING         = 16384;
-    static constexpr uint32_t MAX_IND_SLOTS       = 16384;
-    static constexpr uint32_t MAX_AUX_SLOTS       = 4096;
+    static constexpr uint32_t MAX_DRAWS_IN_FLIGHT = 131072;
+    static constexpr uint32_t MAX_DS_RING         = 32768;
+    static constexpr uint32_t MAX_IND_SLOTS       = 32768;
+    static constexpr uint32_t MAX_AUX_SLOTS       = 8192;
     VkBuffer vs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory vs_ubo_mem = VK_NULL_HANDLE; void* vs_ubo_ptr = nullptr;
     VkBuffer fs_ubo_buf = VK_NULL_HANDLE;      VkDeviceMemory fs_ubo_mem = VK_NULL_HANDLE; void* fs_ubo_ptr = nullptr;
     VkBuffer clr_ubo_buf = VK_NULL_HANDLE;     VkDeviceMemory clr_ubo_mem = VK_NULL_HANDLE; void* clr_ubo_ptr = nullptr;
@@ -674,7 +675,7 @@ struct SmBatchedDraw {
     uint8_t push_data[128] = {0};
     uint32_t push_size = 0;
     uint32_t fs_dyn_ubo_byte_off = 0;
-    std::vector<VkPushConstantRange> push_ranges;
+    const SmPipelineLayout* vs_pl = nullptr;
     VkViewport vp{};
     int32_t sc_x0 = 0, sc_y0 = 0, sc_x1 = 0, sc_y1 = 0;
     float dbias_const = 0.f, dbias_slope = 0.f, dbias_clamp = 0.f, line_width = 1.f;

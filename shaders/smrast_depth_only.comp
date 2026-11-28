@@ -20,6 +20,11 @@ layout(push_constant) uniform DepthOnlyPC {
     uint tiles_x; // bit31 = direct_2d mode
 } pc;
 
+vec4 make_edge(vec2 a, vec2 b) {
+    if (a.y < b.y || (a.y == b.y && a.x < b.x)) { vec2 d = b - a; return vec4(a.x, a.y, d.x, d.y); }
+    else { vec2 d = a - b; return vec4(b.x, b.y, -d.x, -d.y); }
+}
+
 void main() {
     uint tx, ty;
     if ((pc.tiles_x & 0x80000000u) != 0u) {
@@ -42,8 +47,10 @@ void main() {
     SmTriSetup ts = sm_tris[tid];
     float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;
     vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;
-    float l0 = ((s2.x - s1.x) * (fy - s1.y) - (s2.y - s1.y) * (fx - s1.x)) * ts.area.x;
-    float l1 = ((s0.x - s2.x) * (fy - s2.y) - (s0.y - s2.y) * (fx - s2.x)) * ts.area.x;
+    vec4 e0 = make_edge(s1, s2);
+    vec4 e1 = make_edge(s2, s0);
+    float l0 = (e0.z * (fy - e0.y) - e0.w * (fx - e0.x)) * ts.area.x;
+    float l1 = (e1.z * (fy - e1.y) - e1.w * (fx - e1.x)) * ts.area.x;
     float l2 = 1.0 - l0 - l1;
     float pz = clamp(l0 * ts.v0.z + l1 * ts.v1.z + l2 * ts.v2.z, 0.0, 1.0);
     sm_depth_px[pidx] = pz;

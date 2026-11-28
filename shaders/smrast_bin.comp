@@ -80,19 +80,24 @@ shared vec2  s_big_z[64];
 bool depth_pass(float d, float ref_d, uint op) {
     if (op == 0u) return false;
     if (op == 1u) return d < ref_d;
-    if (op == 2u) return d == ref_d;
-    if (op == 3u) return d <= ref_d;
     if (op == 4u) return d > ref_d;
     if (op == 5u) return d != ref_d;
-    if (op == 6u) return d >= ref_d;
+    if (op == 7u) return true;
+    // Cross-pass Depth-PrePass -> G-Buffer invariance tolerance (16 ULP ~ 1.9e-6 relative)
+    // compensates for cross-shader FMA contraction between DepthOnly VS/FS and G-Buffer VS/Fine.
+    uint du = floatBitsToUint(d) & 0x7FFFFFFFu;
+    uint ru = floatBitsToUint(ref_d) & 0x7FFFFFFFu;
+    if (op == 2u) return (du >= ru ? (du - ru) : (ru - du)) <= 16u;
+    if (op == 3u) return du <= ru + 16u;
+    if (op == 6u) return du + 16u >= ru;
     return true;
 }
 
 bool hiz_tile_pass(float tri_min_z, float tri_max_z, vec2 hz, uint dop) {
     if (dop == 1u) return tri_min_z <  hz.y;
-    if (dop == 3u) return tri_min_z <= hz.y;
+    if (dop == 3u) return (floatBitsToUint(tri_min_z) & 0x7FFFFFFFu) <= (floatBitsToUint(hz.y) & 0x7FFFFFFFu) + 16u;
     if (dop == 4u) return tri_max_z >  hz.x;
-    if (dop == 6u) return tri_max_z >= hz.x;
+    if (dop == 6u) return (floatBitsToUint(tri_max_z) & 0x7FFFFFFFu) + 16u >= (floatBitsToUint(hz.x) & 0x7FFFFFFFu);
     return true;
 }
 
@@ -297,6 +302,7 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
                 float l1 = ev1 * inv_area;
                 float l2 = 1.0 - l0 - l1;
                 float d = clamp(l0 * z0 + l1 * z1 + l2 * z2, 0.0, 1.0);
+                if (!(d >= 0.0 && d <= 1.0)) continue;
                 uint pidx = uint(py) * pc.width + uint(px);
                 if (dtest && !depth_pass(d, depth_px[pidx], dop)) continue;
                 uint64_t packed;
@@ -304,7 +310,8 @@ void process_tri(uint tid, uint i0, uint i1, uint i2, vec4 c0, vec4 c1, vec4 c2)
                     // Painter's order: upper 32 bits = ~tid (larger tid wins atomicMin), low 32 bits = tid
                     packed = (uint64_t(~tid) << 32) | uint64_t(tid);
                 } else {
-                    uint d_u32 = floatBitsToUint(greater_wins ? (1.0 - d) : d);
+                    uint du = floatBitsToUint(d) & 0x7FFFFFFFu;
+                    uint d_u32 = greater_wins ? (0x3F800000u - du) : du;
                     packed = (uint64_t(d_u32) << 32) | uint64_t(tid);
                 }
                 atomicMin(vis_px[pidx], packed);

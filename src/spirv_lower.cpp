@@ -21,6 +21,7 @@
 #include <regex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <cerrno>
 #include <pthread.h>
 #include <spawn.h>
@@ -265,7 +266,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 
     // 2. Warm disk cache (<0.1 ms, written atomically via rename so 16 threads never race!)
     char spv_path[256];
-    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v10c_cache_%s_%016llx.spv", tag, (unsigned long long)h);
+    snprintf(spv_path, sizeof(spv_path), "/tmp/smrast_v11b_cache_%s_%016llx.spv", tag, (unsigned long long)h);
     {
         std::ifstream cached(spv_path, std::ios::binary | std::ios::ate);
         if (cached.good()) {
@@ -383,6 +384,7 @@ static bool compile_glsl_to_spv(const std::string& glsl, const char* tag,
 struct ReflectedIO {
     std::string name;
     uint32_t location = 0;
+    uint32_t index = 0;
     uint32_t component = 0;
     uint32_t vecsize = 4;
     uint32_t array_size = 0; // 0 = non-array
@@ -468,6 +470,7 @@ static bool decompile_spirv(const std::vector<uint32_t>& spv,
                 io.name = (nm && nm[0]) ? nm : (std::string(prefix) + std::to_string(i));
             }
             io.location = spvc_compiler_get_decoration(comp, list[i].id, SpvDecorationLocation);
+            io.index = spvc_compiler_get_decoration(comp, list[i].id, SpvDecorationIndex);
             io.component = spvc_compiler_get_decoration(comp, list[i].id, SpvDecorationComponent);
             io.is_flat = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationFlat) == SPVC_TRUE);
             io.is_noperspective = (spvc_compiler_has_decoration(comp, list[i].id, SpvDecorationNoPerspective) == SPVC_TRUE);
@@ -1515,7 +1518,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
            << "}\n";
     }
     if (need_any_blend) {
-        ss << "vec4 sm_blend_factor(uint f, vec4 src, vec4 dst) {\n"
+        ss << "vec4 sm_blend_factor(uint f, vec4 src, vec4 dst, vec4 src1) {\n"
            << "    if (f == 0u)  return vec4(0.0);\n"
            << "    if (f == 1u)  return vec4(1.0);\n"
            << "    if (f == 2u)  return src;\n"
@@ -1531,6 +1534,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
            << "    if (f == 12u) return vec4(sm_fs.blend_const.a);\n"
            << "    if (f == 13u) return vec4(1.0 - sm_fs.blend_const.a);\n"
            << "    if (f == 14u) return vec4(vec3(min(src.a, 1.0 - dst.a)), 1.0);\n"
+           << "    if (f == 15u) return src1;\n"
+           << "    if (f == 16u) return vec4(1.0) - src1;\n"
+           << "    if (f == 17u) return vec4(src1.a);\n"
+           << "    if (f == 18u) return vec4(1.0 - src1.a);\n"
            << "    return vec4(1.0);\n"
            << "}\n"
            << "vec3 sm_blend_combine3(uint op, vec3 rs, vec3 rd, vec3 sf, vec3 df) {\n"
@@ -1573,6 +1580,15 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
 
     ss << body << "\n\n";
 
+    // Locate optional Dual-Source Blending secondary color output (layout(location = 0, index = 1))
+    const ReflectedIO* dual_src1 = nullptr;
+    for (const auto& io : outputs) {
+        if (io.array_size == 0 && io.location == 0 && io.index == 1) {
+            dual_src1 = &io;
+            break;
+        }
+    }
+
     // Per-RT write helper: compile-time specialized when format/blend/writeMask are known (max Hopper SM occupancy!)
     auto emit_rt_store = [&](int rt_i, const ReflectedIO& io) {
         std::string buf = "sm_col" + std::to_string(rt_i);
@@ -1603,6 +1619,17 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
         else if (io.vecsize == 3) ss << "vec4(" << io.name << ", 1.0);\n";
         else if (io.vecsize == 2) ss << "vec4(" << io.name << ", 0.0, 1.0);\n";
         else ss << "vec4(float(" << io.name << "), 0.0, 0.0, 1.0);\n";
+        if (ben) {
+            ss << "        vec4 src1_c = ";
+            if (rt_i == 0 && dual_src1) {
+                if (dual_src1->vecsize == 4)      ss << "vec4(" << dual_src1->name << ");\n";
+                else if (dual_src1->vecsize == 3) ss << "vec4(" << dual_src1->name << ", 1.0);\n";
+                else if (dual_src1->vecsize == 2) ss << "vec4(" << dual_src1->name << ", 0.0, 1.0);\n";
+                else                              ss << "vec4(float(" << dual_src1->name << "), 0.0, 0.0, 1.0);\n";
+            } else {
+                ss << "vec4(0.0);\n";
+            }
+        }
 
         if (kfc >= 0) {
             bool need_wm = (kwm != 0xFu);
@@ -1622,6 +1649,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                 else if (kfc == 13) ss << "        dst_c = vec4(unpackUnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
                 else if (kfc == 14) ss << "        dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx]), 0.0, 1.0);\n";
                 else if (kfc == 17) ss << "        { uint b8 = (" << buf << "[rpidx >> 2u] >> ((rpidx & 3u) << 3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
+                else if (kfc == 21) ss << "        { int s8 = bitfieldExtract(int(" << buf << "[rpidx >> 2u]), int((rpidx & 3u) << 3u), 8); dst_c = vec4(max(float(s8)/127.0, -1.0), 0.0, 0.0, 1.0); }\n";
                 else if (kfc == 18) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
                 else if (kfc == 19) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
                 else if (kfc == 20) ss << "        { uint w16 = (" << buf << "[rpidx >> 1u] >> ((rpidx & 1u) << 4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
@@ -1630,10 +1658,10 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
                 else if (kfc == 3) ss << "        { dst_c = unpackUnorm4x8(" << buf << "[rpidx]).bgra; dst_c.rgb = vec3(sm_srgb_to_lin(dst_c.r), sm_srgb_to_lin(dst_c.g), sm_srgb_to_lin(dst_c.b)); }\n";
                 else                ss << "        dst_c = unpackUnorm4x8(" << buf << "[rpidx]);\n";
                 if (ben) {
-                    ss << "        vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c).rgb;\n";
-                    ss << "        vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c).rgb;\n";
-                    ss << "        float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c).a;\n";
-                    ss << "        float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c).a;\n";
+                    ss << "        vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                    ss << "        vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                    ss << "        float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
+                    ss << "        float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
                     ss << "        out_c = vec4(sm_blend_combine3(sm_u4(sm_fs.rt_blend_op, " << rts << "), out_c.rgb, dst_c.rgb, sf_rgb, df_rgb), "
                        << "sm_blend_combine1(sm_u4(sm_fs.rt_alpha_op, " << rts << "), out_c.a, dst_c.a, sf_a, df_a));\n";
                 }
@@ -1663,6 +1691,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             else if (kfc == 15) ss << "        " << buf << "[rpidx*2u] = packUnorm2x16(clamp(out_c.rg, 0.0, 1.0)); " << buf << "[rpidx*2u+1u] = packUnorm2x16(clamp(out_c.ba, 0.0, 1.0));\n";
             else if (kfc == 16) ss << "        " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg, -1.0, 1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba, -1.0, 1.0));\n";
             else if (kfc == 17) ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(round(clamp(out_c.r, 0.0, 1.0) * 255.0)) & 0xFFu; atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
+            else if (kfc == 21) ss << "        { uint sh = (rpidx & 3u) << 3u; uint v8 = uint(int(round(clamp(out_c.r, -1.0, 1.0) * 127.0))) & 0xFFu; atomicAnd(" << buf << "[rpidx >> 2u], ~(0xFFu << sh)); atomicOr(" << buf << "[rpidx >> 2u], v8 << sh); }\n";
             else if (kfc == 18) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = (uint(round(clamp(out_c.r, 0.0, 1.0)*255.0))&0xFFu) | ((uint(round(clamp(out_c.g, 0.0, 1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
             else if (kfc == 19) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = packHalf2x16(vec2(sm_safe_f16(out_c).r, 0.0)) & 0xFFFFu; atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
             else if (kfc == 20) ss << "        { uint sh = (rpidx & 1u) << 4u; uint v16 = uint(round(clamp(out_c.r, 0.0, 1.0) * 65535.0)) & 0xFFFFu; atomicAnd(" << buf << "[rpidx >> 1u], ~(0xFFFFu << sh)); atomicOr(" << buf << "[rpidx >> 1u], v16 << sh); }\n";
@@ -1679,16 +1708,17 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             ss << "                else if (fc == 16u) dst_c = vec4(unpackSnorm2x16(" << buf << "[rpidx*2u]), unpackSnorm2x16(" << buf << "[rpidx*2u+1u]));\n";
             ss << "                else if (fc == 8u)  dst_c = vec4(uintBitsToFloat(" << buf << "[rpidx*4u]), uintBitsToFloat(" << buf << "[rpidx*4u+1u]), uintBitsToFloat(" << buf << "[rpidx*4u+2u]), uintBitsToFloat(" << buf << "[rpidx*4u+3u]));\n";
             ss << "                else if (fc == 17u) { uint b8 = (" << buf << "[rpidx>>2u] >> ((rpidx&3u)<<3u)) & 0xFFu; dst_c = vec4(float(b8)/255.0, 0.0, 0.0, 1.0); }\n";
+            ss << "                else if (fc == 21u) { int s8 = bitfieldExtract(int(" << buf << "[rpidx>>2u]), int((rpidx&3u)<<3u), 8); dst_c = vec4(max(float(s8)/127.0, -1.0), 0.0, 0.0, 1.0); }\n";
             ss << "                else if (fc == 18u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16&255u)/255.0, float((w16>>8u)&255u)/255.0, 0.0, 1.0); }\n";
             ss << "                else if (fc == 19u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(unpackHalf2x16(w16).x, 0.0, 0.0, 1.0); }\n";
             ss << "                else if (fc == 20u) { uint w16 = (" << buf << "[rpidx>>1u] >> ((rpidx&1u)<<4u)) & 0xFFFFu; dst_c = vec4(float(w16)/65535.0, 0.0, 0.0, 1.0); }\n";
             ss << "                else dst_c = sm_unpack_u32_fmt(" << buf << "[rpidx], fc);\n";
             if (ben) {
                 ss << "                if (do_bl) {\n";
-                ss << "                    vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c).rgb;\n";
-                ss << "                    vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c).rgb;\n";
-                ss << "                    float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c).a;\n";
-                ss << "                    float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c).a;\n";
+                ss << "                    vec3 sf_rgb = sm_blend_factor(sm_u4(sm_fs.rt_src_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                ss << "                    vec3 df_rgb = sm_blend_factor(sm_u4(sm_fs.rt_dst_blend, " << rts << "), out_c, dst_c, src1_c).rgb;\n";
+                ss << "                    float sf_a  = sm_blend_factor(sm_u4(sm_fs.rt_src_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
+                ss << "                    float df_a  = sm_blend_factor(sm_u4(sm_fs.rt_dst_alpha, " << rts << "), out_c, dst_c, src1_c).a;\n";
                 ss << "                    out_c = vec4(sm_blend_combine3(sm_u4(sm_fs.rt_blend_op, " << rts << "), out_c.rgb, dst_c.rgb, sf_rgb, df_rgb), "
                    << "sm_blend_combine1(sm_u4(sm_fs.rt_alpha_op, " << rts << "), out_c.a, dst_c.a, sf_a, df_a));\n";
                 ss << "                }\n";
@@ -1701,6 +1731,7 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
             ss << "            else if (fc == 16u) { " << buf << "[rpidx*2u] = packSnorm2x16(clamp(out_c.rg,-1.0,1.0)); " << buf << "[rpidx*2u+1u] = packSnorm2x16(clamp(out_c.ba,-1.0,1.0)); }\n";
             ss << "            else if (fc == 8u)  { " << buf << "[rpidx*4u]=floatBitsToUint(out_c.r); " << buf << "[rpidx*4u+1u]=floatBitsToUint(out_c.g); " << buf << "[rpidx*4u+2u]=floatBitsToUint(out_c.b); " << buf << "[rpidx*4u+3u]=floatBitsToUint(out_c.a); }\n";
             ss << "            else if (fc == 17u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
+            ss << "            else if (fc == 21u) { uint sh=(rpidx&3u)<<3u; uint v8=uint(int(round(clamp(out_c.r,-1.0,1.0)*127.0)))&0xFFu; atomicAnd(" << buf << "[rpidx>>2u], ~(0xFFu<<sh)); atomicOr(" << buf << "[rpidx>>2u], v8<<sh); }\n";
             ss << "            else if (fc == 18u) { uint sh=(rpidx&1u)<<4u; uint v16=(uint(round(clamp(out_c.r,0.0,1.0)*255.0))&0xFFu)|((uint(round(clamp(out_c.g,0.0,1.0)*255.0))&0xFFu)<<8u); atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
             ss << "            else if (fc == 19u) { uint sh=(rpidx&1u)<<4u; uint v16=packHalf2x16(vec2(sm_safe_f16(out_c).r,0.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
             ss << "            else if (fc == 20u) { uint sh=(rpidx&1u)<<4u; uint v16=uint(round(clamp(out_c.r,0.0,1.0)*65535.0))&0xFFFFu; atomicAnd(" << buf << "[rpidx>>1u], ~(0xFFFFu<<sh)); atomicOr(" << buf << "[rpidx>>1u], v16<<sh); }\n";
@@ -1711,9 +1742,12 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     };
 
     ss << "bool sm_is_top_left(vec2 d) { return (d.y < 0.0) || (d.y == 0.0 && d.x > 0.0); }\n";
+    ss << "vec4 sm_make_edge(vec2 a, vec2 b) {\n"
+       << "    if (a.y < b.y || (a.y == b.y && a.x < b.x)) { vec2 d = b - a; return vec4(a.x, a.y, d.x, d.y); }\n"
+       << "    else { vec2 d = a - b; return vec4(b.x, b.y, -d.x, -d.y); }\n"
+       << "}\n";
     ss << "float sm_edge_eval(vec2 a, vec2 b, float fx, float fy) {\n"
-       << "    if (a.y < b.y || (a.y == b.y && a.x < b.x)) { vec2 d = b - a; return d.x * (fy - a.y) - d.y * (fx - a.x); }\n"
-       << "    else { vec2 d = a - b; return -(d.x * (fy - b.y) - d.y * (fx - b.x)); }\n"
+       << "    vec4 e = sm_make_edge(a, b); return e.z * (fy - e.y) - e.w * (fx - e.x);\n"
        << "}\n";
     ss << "void main() {\n";
     ss << "    uint tid = gl_LocalInvocationIndex;\n";
@@ -1917,8 +1951,8 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
     ss << "    sm_gl_FrontFacing = (ts.idx.w & 0x80000000u) != 0u;\n";
     ss << "    float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n";
     ss << "    vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n";
-    ss << "    float l0 = ((s2.x - s1.x) * (fy - s1.y) - (s2.y - s1.y) * (fx - s1.x)) * ts.area.x;\n";
-    ss << "    float l1 = ((s0.x - s2.x) * (fy - s2.y) - (s0.y - s2.y) * (fx - s2.x)) * ts.area.x;\n";
+    ss << "    float l0 = sm_edge_eval(s1, s2, fx, fy) * ts.area.x;\n";
+    ss << "    float l1 = sm_edge_eval(s2, s0, fx, fy) * ts.area.x;\n";
     ss << "    float l2 = 1.0 - l0 - l1;\n";
     ss << "    float pz = clamp(l0 * ts.v0.z + l1 * ts.v1.z + l2 * ts.v2.z, 0.0, 1.0);\n";
     ss << "    float w0 = l0 * ts.v0.w, w1 = l1 * ts.v1.w, w2 = l2 * ts.v2.w;\n";
@@ -1990,17 +2024,31 @@ bool sm_lower_fragment_spirv(const std::vector<uint32_t>& in_spv,
         ss << "        uint wmask = (scfg >> 24u) & 0xFFu;\n";
         ss << "        uint old_s = sm_stencil_px[pidx] & 0xFFu;\n";
         ss << "        bool spass = sm_stencil_cmp(scfg & 7u, sref & cmask, old_s & cmask);\n";
-        ss << "        uint sop = spass ? ((scfg >> 6u) & 7u) : ((scfg >> 3u) & 7u);\n";
+        ss << "        bool dpass = true;\n";
+        ss << "        if (spass && (sm_fs.stencil_enable & 4u) != 0u) {\n";
+        ss << "            uint dop = (sm_fs.stencil_enable >> 4u) & 7u;\n";
+        ss << "            float fz = " << (uses_frag_depth ? "sm_gl_FragDepth" : "pz") << ";\n";
+        ss << "            float rz = sm_depth_px[pidx];\n";
+        ss << "            if (dop == 0u) dpass = false;\n";
+        ss << "            else if (dop == 1u) dpass = (fz <  rz);\n";
+        ss << "            else if (dop == 2u) dpass = (fz == rz);\n";
+        ss << "            else if (dop == 3u) dpass = (fz <= rz);\n";
+        ss << "            else if (dop == 4u) dpass = (fz >  rz);\n";
+        ss << "            else if (dop == 5u) dpass = (fz != rz);\n";
+        ss << "            else if (dop == 6u) dpass = (fz >= rz);\n";
+        ss << "            else dpass = true;\n";
+        ss << "        }\n";
+        ss << "        uint sop = !spass ? ((scfg >> 3u) & 7u) : (dpass ? ((scfg >> 6u) & 7u) : ((scfg >> 9u) & 7u));\n";
         ss << "        uint new_s = sm_stencil_apply(sop, old_s, sref) & 0xFFu;\n";
         ss << "        if (wmask != 0u) sm_stencil_px[pidx] = (old_s & (~wmask & 0xFFu)) | (new_s & wmask);\n";
-        ss << "        if (!spass) return;\n";
+        ss << "        if (!spass || !dpass) return;\n";
         ss << "    }\n";
     }
     ss << "    if (sm_fs.depth_write != 0u) sm_depth_px[pidx] = " << (uses_frag_depth ? "sm_gl_FragDepth" : "pz") << ";\n";
 
-    // Write ALL reflected MRT color outputs (Location 0..7)!
+    // Write ALL reflected primary MRT color outputs (Location 0..7, index == 0; index == 1 feeds dual-source blending!)
     for (const auto& io : outputs) {
-        if (io.array_size == 0 && io.location < SM_MAX_MRT) emit_rt_store((int)io.location, io);
+        if (io.array_size == 0 && io.index == 0 && io.location < SM_MAX_MRT) emit_rt_store((int)io.location, io);
     }
     ss << "}\n";
 
@@ -2018,13 +2066,18 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "struct SmTriSetup { vec4 v0; vec4 v1; vec4 v2; vec4 area; uvec4 idx; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 1)  readonly buffer SmTriSetupBuf { SmTriSetup sm_tris[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 2)  buffer SmVisBuf               { uint64_t sm_vis_px[]; };\n"
-       << "layout(std430, set = " << sm_set_idx << ", binding = 11) writeonly buffer SmDepthBuf   { float sm_depth_px[]; };\n"
+       << "layout(std430, set = " << sm_set_idx << ", binding = 11) buffer SmDepthBuf             { float sm_depth_px[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 12) buffer SmStencilBuf           { uint sm_stencil_px[]; };\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 13) readonly buffer SmFsParams {\n"
        << "    uint width; uint height; uint vert_stride_vec4; uint depth_write;\n"
        << "    uint rt_active_mask; uint stencil_enable; uint stencil_front_cfg; uint stencil_back_cfg; uint stencil_refs; uint tiles_x; uint direct_2d;\n"
        << "} sm_fs;\n"
        << "layout(std430, set = " << sm_set_idx << ", binding = 14) readonly buffer SmActiveTilesBuf { uint sm_active_tiles[]; };\n"
+       << "vec4 sm_make_edge(vec2 a, vec2 b) {\n"
+       << "    if (a.y < b.y || (a.y == b.y && a.x < b.x)) { vec2 d = b - a; return vec4(a.x, a.y, d.x, d.y); }\n"
+       << "    else { vec2 d = a - b; return vec4(b.x, b.y, -d.x, -d.y); }\n"
+       << "}\n"
+       << "float sm_edge_eval(vec2 a, vec2 b, float fx, float fy) { vec4 e = sm_make_edge(a, b); return e.z * (fy - e.y) - e.w * (fx - e.x); }\n"
        << "bool sm_stencil_cmp(uint op, uint ref_m, uint val_m) {\n"
        << "    if (op == 0u) return false; if (op == 1u) return ref_m < val_m; if (op == 2u) return ref_m == val_m;\n"
        << "    if (op == 3u) return ref_m <= val_m; if (op == 4u) return ref_m > val_m; if (op == 5u) return ref_m != val_m;\n"
@@ -2051,6 +2104,12 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "    uint tid = uint(vis & 0xFFFFFFFFul);\n"
        << "    SmTriSetup ts = sm_tris[tid];\n"
        << "    bool ff = (ts.idx.w & 0x80000000u) != 0u;\n"
+       << "    float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n"
+       << "    vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n"
+       << "    float l0 = sm_edge_eval(s1, s2, fx, fy) * ts.area.x;\n"
+       << "    float l1 = sm_edge_eval(s2, s0, fx, fy) * ts.area.x;\n"
+       << "    float l2 = 1.0 - l0 - l1;\n"
+       << "    float pz = clamp(l0*ts.v0.z + l1*ts.v1.z + l2*ts.v2.z, 0.0, 1.0);\n"
        << "    if ((sm_fs.stencil_enable & 3u) == 3u) {\n"
        << "        uint scfg = ff ? sm_fs.stencil_front_cfg : sm_fs.stencil_back_cfg;\n"
        << "        uint sref = ff ? (sm_fs.stencil_refs & 0xFFu) : ((sm_fs.stencil_refs >> 8u) & 0xFFu);\n"
@@ -2058,19 +2117,20 @@ bool sm_build_null_fs_stencil_spv(uint32_t sm_set_idx,
        << "        uint wmask = (scfg >> 24u) & 0xFFu;\n"
        << "        uint old_s = sm_stencil_px[pidx] & 0xFFu;\n"
        << "        bool spass = sm_stencil_cmp(scfg & 7u, sref & cmask, old_s & cmask);\n"
-       << "        uint sop = spass ? ((scfg >> 6u) & 7u) : ((scfg >> 3u) & 7u);\n"
+       << "        bool dpass = true;\n"
+       << "        if (spass && (sm_fs.stencil_enable & 4u) != 0u) {\n"
+       << "            uint dop = (sm_fs.stencil_enable >> 4u) & 7u;\n"
+       << "            float rz = sm_depth_px[pidx];\n"
+       << "            if (dop == 0u) dpass = false; else if (dop == 1u) dpass = (pz < rz); else if (dop == 2u) dpass = (pz == rz);\n"
+       << "            else if (dop == 3u) dpass = (pz <= rz); else if (dop == 4u) dpass = (pz > rz); else if (dop == 5u) dpass = (pz != rz);\n"
+       << "            else if (dop == 6u) dpass = (pz >= rz); else dpass = true;\n"
+       << "        }\n"
+       << "        uint sop = !spass ? ((scfg >> 3u) & 7u) : (dpass ? ((scfg >> 6u) & 7u) : ((scfg >> 9u) & 7u));\n"
        << "        uint new_s = sm_stencil_apply(sop, old_s, sref) & 0xFFu;\n"
        << "        if (wmask != 0u) sm_stencil_px[pidx] = (old_s & (~wmask & 0xFFu)) | (new_s & wmask);\n"
-       << "        if (!spass) return;\n"
+       << "        if (!spass || !dpass) return;\n"
        << "    }\n"
-       << "    if (sm_fs.depth_write != 0u) {\n"
-       << "        float fx = float(p.x) + 0.5, fy = float(p.y) + 0.5;\n"
-       << "        vec2 s0 = ts.v0.xy, s1 = ts.v1.xy, s2 = ts.v2.xy;\n"
-       << "        float l0 = ((s2.x - s1.x)*(fy - s1.y) - (s2.y - s1.y)*(fx - s1.x)) * ts.area.x;\n"
-       << "        float l1 = ((s0.x - s2.x)*(fy - s2.y) - (s0.y - s2.y)*(fx - s2.x)) * ts.area.x;\n"
-       << "        float l2 = 1.0 - l0 - l1;\n"
-       << "        sm_depth_px[pidx] = clamp(l0*ts.v0.z + l1*ts.v1.z + l2*ts.v2.z, 0.0, 1.0);\n"
-       << "    }\n"
+       << "    if (sm_fs.depth_write != 0u) sm_depth_px[pidx] = pz;\n"
        << "}\n";
     return compile_glsl_to_spv(ss.str(), "nullfs_stn", out_comp_spv, err);
 }

@@ -1382,7 +1382,9 @@ static bool sm_can_linear_alias(SmDevice* dev, const VkImageCreateInfo* ci) {
     if (kDisableLinearAlias || !ci) return false;
     if (is_depth_format(ci->format) || is_stencil_format(ci->format)) return false;
     if (ci->imageType != VK_IMAGE_TYPE_2D || ci->mipLevels != 1 || ci->arrayLayers != 1 || ci->extent.depth != 1) return false;
-    if (ci->extent.width == 0 || ci->extent.height == 0) return false;
+    // Small RTs (<64 px in either dim, e.g. bloom pyramid tails) save negligible bandwidth and can
+    // hit strict linear-tiling rowPitch / TMU footprint hazards on sub-allocated memory heaps.
+    if (ci->extent.width < 64 || ci->extent.height < 64) return false;
     if (ci->tiling != VK_IMAGE_TILING_OPTIMAL) return false;
     if ((ci->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
                       VK_IMAGE_CREATE_SPARSE_ALIASED_BIT | VK_IMAGE_CREATE_PROTECTED_BIT)) != 0) return false;
@@ -1437,7 +1439,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL sm_CreateImage(VkDevice d, const VkImageCr
                 dev->fn.GetImageMemoryRequirements(dev->real_dev, limg, &imr);
                 uint32_t bpp = sm_format_bpp(ci->format);
                 if (sl.offset == 0 && sl.rowPitch >= (VkDeviceSize)ci->extent.width * bpp &&
-                    (sl.rowPitch % bpp) == 0 && (sl.rowPitch % 4) == 0) {
+                    (sl.rowPitch % bpp) == 0 && (sl.rowPitch % 4) == 0 &&
+                    sl.rowPitch * ci->extent.height <= imr.size) {
                     VkDeviceSize bsz = std::max<VkDeviceSize>(256, std::max(imr.size, sl.rowPitch * ci->extent.height));
                     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, bsz,
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -2998,6 +3001,9 @@ static void pack_clear_words(const VkClearColorValue& cv, VkFormat fmt, uint32_t
         uint32_t b = (fmt == VK_FORMAT_R8_UINT || fmt == VK_FORMAT_R8_SINT)
                      ? (cv.uint32[0] & 0xFFu) : ((uint32_t)(cl01(f[0]) * 255.f + 0.5f) & 0xFFu);
         out[0] = b | (b << 8) | (b << 16) | (b << 24);
+    } else if (fc == 21u) { // R8_SNORM (replicate 1B x 4)
+        uint32_t b = sn8(f[0]) & 0xFFu;
+        out[0] = b | (b << 8) | (b << 16) | (b << 24);
     } else if (fc == 18u) { // RG8_UNORM / RG8_SNORM (replicate 2B x 2)
         uint32_t w = (fmt == VK_FORMAT_R8G8_SNORM)
                      ? (sn8(f[0]) | (sn8(f[1]) << 8))
@@ -3934,8 +3940,8 @@ static void sm_flush_draw_batch(SmCommandBuffer* scb) {
         uint32_t vs_dyn_off = d.vs_slot * (uint32_t)sizeof(SmVsParamsUBO);
         dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, d.vs_layout,
                                       d.sm_set_index, 1, &d.vs_ds, 1, &vs_dyn_off);
-        if (d.push_size > 0 && !d.push_ranges.empty()) {
-            for (const auto& pr : d.push_ranges) {
+        if (d.push_size > 0 && d.vs_pl && !d.vs_pl->push_ranges.empty()) {
+            for (const auto& pr : d.vs_pl->push_ranges) {
                 if (pr.offset < d.push_size) {
                     uint32_t sz = std::min(pr.size, d.push_size - pr.offset);
                     if (sz > 0)
@@ -4152,9 +4158,6 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     if (eff_dwrite && dep_img) { dep_img->attach_dirty = true; dep_img->real_uniform_cleared = false; scb->pass_wrote_dep = true; scb->pass_drew_dep = true; }
     bool can_use_hiz = (dep_img != nullptr && dep_img->hiz_valid && dep_img->hiz_buf != VK_NULL_HANDLE &&
                         dep_img->hiz_tx == tx && dep_img->hiz_ty == ty);
-    bool use_prebin_hiz = can_use_hiz && dep_img->hiz_has_occluders && eff_dtest &&
-                          (eff_dop == VK_COMPARE_OP_LESS || eff_dop == VK_COMPARE_OP_LESS_OR_EQUAL ||
-                           eff_dop == VK_COMPARE_OP_GREATER || eff_dop == VK_COMPARE_OP_GREATER_OR_EQUAL);
     bool any_blend = false;
     for (uint32_t r = 0; r < SM_MAX_MRT; ++r) {
         if (col_imgs[r] && pipe->blend_enable[r] && pipe->color_write_mask[r] != 0u) {
@@ -4173,10 +4176,44 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         if (scb->gfx_push_descs[s].active) has_push_desc = true;
         if ((scb->gfx_set_mask & (1u << s)) && scb->gfx_dyn_counts[s] > 8u) dyn_off_fit = false;
     }
+    VkStencilOpState eff_sf  = pipe->stencil_front;
+    VkStencilOpState eff_sb  = pipe->stencil_back;
+    if (scb->has_dyn_stencil_op[0])    { eff_sf.failOp = scb->dyn_stencil_fail[0]; eff_sf.passOp = scb->dyn_stencil_pass[0]; eff_sf.depthFailOp = scb->dyn_stencil_dfail[0]; eff_sf.compareOp = scb->dyn_stencil_cmp[0]; }
+    if (scb->has_dyn_stencil_op[1])    { eff_sb.failOp = scb->dyn_stencil_fail[1]; eff_sb.passOp = scb->dyn_stencil_pass[1]; eff_sb.depthFailOp = scb->dyn_stencil_dfail[1]; eff_sb.compareOp = scb->dyn_stencil_cmp[1]; }
+    if (scb->has_dyn_stencil_ref[0])   eff_sf.reference   = scb->dyn_stencil_ref[0];
+    if (scb->has_dyn_stencil_ref[1])   eff_sb.reference   = scb->dyn_stencil_ref[1];
+    if (scb->has_dyn_stencil_cmask[0]) eff_sf.compareMask = scb->dyn_stencil_cmask[0];
+    if (scb->has_dyn_stencil_cmask[1]) eff_sb.compareMask = scb->dyn_stencil_cmask[1];
+    if (scb->has_dyn_stencil_wmask[0]) eff_sf.writeMask   = scb->dyn_stencil_wmask[0];
+    if (scb->has_dyn_stencil_wmask[1]) eff_sb.writeMask   = scb->dyn_stencil_wmask[1];
+
+    bool needs_stencil_dfail = eff_stest && dep_img != nullptr && dep_img->has_stencil && eff_dtest &&
+                               (((eff_sf.writeMask & 0xFFu) != 0u && eff_sf.depthFailOp != VK_STENCIL_OP_KEEP) ||
+                                ((eff_sb.writeMask & 0xFFu) != 0u && eff_sb.depthFailOp != VK_STENCIL_OP_KEEP));
+    bool use_prebin_hiz = !needs_stencil_dfail && can_use_hiz && dep_img->hiz_has_occluders && eff_dtest &&
+                          (eff_dop == VK_COMPARE_OP_LESS || eff_dop == VK_COMPARE_OP_LESS_OR_EQUAL ||
+                           eff_dop == VK_COMPARE_OP_GREATER || eff_dop == VK_COMPARE_OP_GREATER_OR_EQUAL);
+
+    // Exact-safe stencil batching:
+    //  (1) stencil disabled or no stencil buffer, OR
+    //  (2) G-Buffer stencil tagging (ALWAYS compare + KEEP on fail/depthFail + non-additive passOp REPLACE/KEEP/ZERO), OR
+    //  (3) Read-only identical stencil mask test (writeMask==0 and identical front/back compare state)
+    auto is_non_accum_pass_op = [](VkStencilOp op) {
+        return op == VK_STENCIL_OP_KEEP || op == VK_STENCIL_OP_ZERO || op == VK_STENCIL_OP_REPLACE;
+    };
+    bool stencil_batch_ok = (!eff_stest || dep_img == nullptr || !dep_img->has_stencil) ||
+        (eff_sf.compareOp == VK_COMPARE_OP_ALWAYS && eff_sb.compareOp == VK_COMPARE_OP_ALWAYS &&
+         eff_sf.failOp == VK_STENCIL_OP_KEEP && eff_sf.depthFailOp == VK_STENCIL_OP_KEEP &&
+         eff_sb.failOp == VK_STENCIL_OP_KEEP && eff_sb.depthFailOp == VK_STENCIL_OP_KEEP &&
+         is_non_accum_pass_op(eff_sf.passOp) && is_non_accum_pass_op(eff_sb.passOp)) ||
+        ((eff_sf.writeMask & 0xFFu) == 0u && (eff_sb.writeMask & 0xFFu) == 0u &&
+         eff_sf.compareOp == eff_sb.compareOp && eff_sf.compareMask == eff_sb.compareMask &&
+         (eff_sf.reference & 0xFFu) == (eff_sb.reference & 0xFFu));
+
     bool depth_ordered_op = eff_dtest && dep_img != nullptr &&
                             (eff_dop == VK_COMPARE_OP_LESS || eff_dop == VK_COMPARE_OP_LESS_OR_EQUAL ||
                              eff_dop == VK_COMPARE_OP_GREATER || eff_dop == VK_COMPARE_OP_GREATER_OR_EQUAL);
-    bool can_batch = (topo_code <= 2u && !any_blend && !eff_stest && depth_ordered_op &&
+    bool can_batch = (topo_code <= 2u && !any_blend && stencil_batch_ok && !needs_stencil_dfail && depth_ordered_op &&
                       !pipe->fs_has_discard_or_depth && (is_indirect || total_tris < 65536u) && dyn_off_fit && !has_push_desc);
 
     bool fused_quad     = (!is_indirect && topo_code <= 2u && total_tris <= 2u &&
@@ -4201,16 +4238,6 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         scb->last_draw_state_hash = sh;
     }
     VkBuffer hiz_buf = can_use_hiz ? dep_img->hiz_buf : dev->rast.dummy_buf;
-    VkStencilOpState eff_sf  = pipe->stencil_front;
-    VkStencilOpState eff_sb  = pipe->stencil_back;
-    if (scb->has_dyn_stencil_op[0])    { eff_sf.failOp = scb->dyn_stencil_fail[0]; eff_sf.passOp = scb->dyn_stencil_pass[0]; eff_sf.depthFailOp = scb->dyn_stencil_dfail[0]; eff_sf.compareOp = scb->dyn_stencil_cmp[0]; }
-    if (scb->has_dyn_stencil_op[1])    { eff_sb.failOp = scb->dyn_stencil_fail[1]; eff_sb.passOp = scb->dyn_stencil_pass[1]; eff_sb.depthFailOp = scb->dyn_stencil_dfail[1]; eff_sb.compareOp = scb->dyn_stencil_cmp[1]; }
-    if (scb->has_dyn_stencil_ref[0])   eff_sf.reference   = scb->dyn_stencil_ref[0];
-    if (scb->has_dyn_stencil_ref[1])   eff_sb.reference   = scb->dyn_stencil_ref[1];
-    if (scb->has_dyn_stencil_cmask[0]) eff_sf.compareMask = scb->dyn_stencil_cmask[0];
-    if (scb->has_dyn_stencil_cmask[1]) eff_sb.compareMask = scb->dyn_stencil_cmask[1];
-    if (scb->has_dyn_stencil_wmask[0]) eff_sf.writeMask   = scb->dyn_stencil_wmask[0];
-    if (scb->has_dyn_stencil_wmask[1]) eff_sb.writeMask   = scb->dyn_stencil_wmask[1];
     auto stn_can_write = [](const VkStencilOpState& s) {
         return (s.writeMask & 0xFFu) != 0u &&
                (s.failOp != VK_STENCIL_OP_KEEP || s.passOp != VK_STENCIL_OP_KEEP || s.depthFailOp != VK_STENCIL_OP_KEEP);
@@ -4298,7 +4325,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         fs_ubo->vert_stride_vec4 = pipe->vert_stride_vec4;
         fs_ubo->depth_write = (eff_dwrite && dep_img != nullptr) ? 1u : 0u;
         fs_ubo->rt_active_mask = 0;
-        fs_ubo->stencil_enable = (eff_stest ? 1u : 0u) | ((dep_img && dep_img->stencil_buf) ? 2u : 0u);
+        fs_ubo->stencil_enable = (eff_stest ? 1u : 0u) | ((dep_img && dep_img->stencil_buf) ? 2u : 0u) |
+                                 (needs_stencil_dfail ? (4u | (((uint32_t)eff_dop & 7u) << 4u)) : 0u);
         fs_ubo->stencil_front_cfg = sm_pack_stencil_cfg(eff_sf);
         fs_ubo->stencil_back_cfg  = sm_pack_stencil_cfg(eff_sb);
         fs_ubo->stencil_refs = (eff_sf.reference & 0xFFu) | ((eff_sb.reference & 0xFFu) << 8u);
@@ -4430,7 +4458,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
     if (eff_cull & VK_CULL_MODE_BACK_BIT)  rflags |= 1u;
     if (eff_cull & VK_CULL_MODE_FRONT_BIT) rflags |= 2u;
     if (eff_ff == VK_FRONT_FACE_CLOCKWISE) rflags |= 4u;
-    if (eff_dtest && dep_img != nullptr)   rflags |= 8u;
+    if (eff_dtest && !needs_stencil_dfail && dep_img != nullptr) rflags |= 8u;
     rflags |= (((uint32_t)eff_dop & 7u) << 4u);
     rflags |= ((topo_code & 7u) << 8u);
     if (!pipe->depth_clip)                 rflags |= 2048u;
@@ -4446,7 +4474,12 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         mix64((uint64_t)(uintptr_t)cur_bin_ds);
         mix64((uint64_t)(uintptr_t)cur_fine_ds);
         mix64((uint64_t)(uintptr_t)(pipe->fs_comp_pipe ? cur_fs_ds : cur_dep_ds));
-        mix64(((uint64_t)eff_dwrite << 1) | ((uint64_t)can_use_hiz << 2) | ((uint64_t)eff_dop << 3) | ((uint64_t)pipe->vert_stride_vec4 << 8));
+        mix64(((uint64_t)eff_dwrite << 1) | ((uint64_t)can_use_hiz << 2) | ((uint64_t)eff_dop << 3) | ((uint64_t)pipe->vert_stride_vec4 << 8) | ((uint64_t)eff_stest << 16));
+        if (eff_stest) {
+            mix64(sm_pack_stencil_cfg(eff_sf));
+            mix64(sm_pack_stencil_cfg(eff_sb));
+            mix64((eff_sf.reference & 0xFFu) | ((eff_sb.reference & 0xFFu) << 8u));
+        }
         if (pipe->fs_comp_pipe) {
             mix64((uint64_t)(uintptr_t)pipe->layout->sm_fs_layout);
             mix64((uint64_t)scb->gfx_set_mask);
@@ -4469,7 +4502,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             for (uint32_t r = 0; r < SM_MAX_MRT; ++r) mix64(pipe->color_write_mask[r]);
         }
         auto& B = scb->batch;
-        uint32_t max_k = is_indirect ? 128u : 256u;
+        uint32_t max_k = is_indirect ? 254u : 256u;
         if (B.active && (B.is_indirect != is_indirect || B.fs_state_hash != fhash || B.W != W || B.H != H ||
                          B.draws.size() >= max_k ||
                          (!is_indirect && (B.accum_verts + total_verts > std::min(extra_v_base, 2800000u) ||
@@ -4502,6 +4535,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             B.fs_state_hash = fhash;
             B.accum_verts = 0; B.accum_tris = 0;
             B.draws.clear();
+            if (B.draws.capacity() < 256u) B.draws.reserve(256u);
         }
         uint32_t cv_base = is_indirect ? 0u : B.accum_verts;
         uint32_t ts_base = is_indirect ? 0u : B.accum_tris;
@@ -4530,7 +4564,7 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         bd.push_size = scb->push_size;
         if (scb->push_size > 0) memcpy(bd.push_data, scb->push_data, scb->push_size);
         bd.fs_dyn_ubo_byte_off = fs_dyn_ubo_byte_off;
-        bd.push_ranges = pipe->layout->push_ranges;
+        bd.vs_pl = pipe->layout;
         bd.vp = vp; bd.sc_x0 = sc_x0; bd.sc_y0 = sc_y0; bd.sc_x1 = sc_x1; bd.sc_y1 = sc_y1;
         bd.dbias_const = eff_dbias_const; bd.dbias_slope = eff_dbias_slope;
         bd.dbias_clamp = eff_dbias_clamp; bd.line_width = eff_line_width;
@@ -4670,7 +4704,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
             if (direct_2d || fused_quad) dev->fn.CmdDispatch(scb->real_cb, tx, ty, 1);
             else                         dev->fn.CmdDispatchIndirect(scb->real_cb, dev->rast.ind_disp_buf, 32);
         }
-        if (eff_dwrite && can_use_hiz) emit_pure_compute_barrier(scb);
+        bool do_hiz_upd = eff_dwrite && can_use_hiz && !(pipe->fs_has_discard_or_depth && depth_ordered_op);
+        if (do_hiz_upd) emit_pure_compute_barrier(scb);
     } else if (eff_dwrite && dep_img != nullptr) {
         struct { uint32_t w, h, dwrite, tx; } dpc = { W, H, 1u, tx | (direct_2d ? 0x80000000u : 0u) };
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.depth_only_pipe);
@@ -4681,8 +4716,8 @@ static void sm_execute_draw_core(SmCommandBuffer* scb, uint32_t vert_or_idx_coun
         if (can_use_hiz) emit_pure_compute_barrier(scb);
     }
 
-    // --- PASS 5: Incremental Coarse Hi-Z Refresh (ONLY on depth-writing draws!) ---
-    if (eff_dwrite && can_use_hiz) {
+    // --- PASS 5: Incremental Coarse Hi-Z Refresh (skip on single monotonic-depth discard draws -> conservative & saves 3K+ barriers!) ---
+    if (eff_dwrite && can_use_hiz && !(pipe->fs_comp_pipe && pipe->fs_has_discard_or_depth && depth_ordered_op)) {
         struct { uint32_t w, h, tx, d2d; } hpc = { W, H, tx, direct_2d ? 1u : 0u };
         dev->fn.CmdBindPipeline(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.hiz_update_pipe);
         dev->fn.CmdBindDescriptorSets(scb->real_cb, VK_PIPELINE_BIND_POINT_COMPUTE, dev->rast.hiz_update_pl, 0, 1, &cur_hiz_ds, 0, nullptr);
@@ -4817,7 +4852,11 @@ static VKAPI_ATTR void VKAPI_CALL sm_CmdPushDescriptorSetKHR(
             batch_i[i].assign(w.pImageInfo, w.pImageInfo + w.descriptorCount);
             for (auto& ii : batch_i[i]) {
                 if (dt != VK_DESCRIPTOR_TYPE_SAMPLER) {
-                    if (ii.imageView) ii.imageView = from_h<SmImageView>(ii.imageView)->real_view;
+                    if (ii.imageView) {
+                        auto* iv = from_h<SmImageView>(ii.imageView);
+                        if (iv->image) iv->image->ever_bound_in_ds = true;
+                        ii.imageView = iv->real_view;
+                    }
                     ii.imageLayout = sanitize_layout(ii.imageLayout);
                 }
             }
